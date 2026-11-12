@@ -681,6 +681,10 @@ function resetNotices({ app, row }) {
   };
   b.addEventListener('click', () => {
     app.prefs.reset(['dismissedNotices']);
+    // The page does not refresh the row holding focus: turn the button off here,
+    // keeping keyboard focus on the page rather than on the disabled button.
+    sync();
+    if (b.disabled) b.closest('[role=tabpanel]')?.focus({ preventScroll: true });
     announce('Warning dialogs will show again');
   });
   sync();
@@ -1044,7 +1048,8 @@ export function preferencesDialog(app, args = {}) {
     wide: true,
     className: 'prefs-window',
     body,
-    initialFocus: '.prefs-tab[aria-selected="true"]',
+    // The page tabs, or the page picker that replaces them on phones.
+    initialFocus: ['.prefs-tab[aria-selected="true"]', '.prefs-pick'],
     footerStart: h('div.prefs-resets', h('button.btn', { type: 'button', onclick: resetPage }, 'Reset Page'), h('button.btn', { type: 'button', onclick: resetAll }, 'Reset All')),
     buttons: [
       { label: 'Cancel', value: null },

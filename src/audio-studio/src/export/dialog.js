@@ -7,7 +7,7 @@ import { h } from '../lib/dom.js';
 import { icon } from '../ui/icons.js';
 import { openDialog } from '../ui/dialog.js';
 import * as puter from '../storage/puter.js';
-import { FORMATS, getFormat, conformOptions, defaultOptions, estimateSize, formatBytesShort, describeSampleType, describeSettings, usesDither, withExtension, sanitizeFileName, channelLabel, COMMON_RATES, docBitDepth, formatForName } from './formats.js';
+import { FORMATS, getFormat, conformOptions, defaultOptions, estimateSize, formatBytesShort, describeSampleType, describeSettings, usesDither, withExtension, stripExtension, sanitizeFileName, channelLabel, COMMON_RATES, docBitDepth, formatForName } from './formats.js';
 import { DITHER_MODES } from '../audio/quantize.js';
 import { codecSupported } from './webcodecs.js';
 import { mp3Bitrates } from './mp3.js';
@@ -41,7 +41,7 @@ export function initialState(doc, { mode, frames, remembered = {}, includeMeta }
     markers: meta,
     meta,
   }).options;
-  const stem = doc.name.replace(/\.[a-z0-9]{1,5}$/i, '');
+  const stem = stripExtension(doc.name);
   const name = mode === 'selection' ? `${stem} Selection` : stem;
   return { name: withExtension(name, format), options, frames, sourceRate: doc.sampleRate };
 }
@@ -56,7 +56,10 @@ export async function exportFileDialog(app, doc, { mode = 'export', frames = doc
   const support = await webCodecsSupport();
   const sdk = Boolean(puter.sdk());
   let locationType = mode === 'download' || !sdk ? 'download' : app.prefs.get('exportLocation') === 'download' ? 'download' : 'puter';
-  let dir = app.prefs.get('exportFolder') || null;
+  // Save As and Save a Copy start in the folder of the document's own Puter file.
+  const ownPath = doc.source?.type === 'puter' ? doc.source.path : null;
+  const ownDir = (mode === 'saveAs' || mode === 'copy') && ownPath ? puter.dirname(ownPath) : null;
+  let dir = ownDir || app.prefs.get('exportFolder') || null;
   let notes = [];
 
   // ---------------------------------------------------------------- controls
@@ -265,7 +268,7 @@ export async function exportFileDialog(app, doc, { mode = 'export', frames = doc
   };
   window.addEventListener('keydown', escape, true);
   const primaryLabel = mode === 'export' ? 'Export' : mode === 'download' ? 'Download' : 'Save';
-  const result = await openDialog({
+  const shown = openDialog({
     title: TITLES[mode] || 'Export',
     className: 'io-export-dialog',
     body: () => {
@@ -290,6 +293,10 @@ export async function exportFileDialog(app, doc, { mode = 'export', frames = doc
       return true;
     },
   });
+  // Typing replaces the name, not its extension (the dialog selected the whole text).
+  const stem = stripExtension(nameInput.value).length;
+  if (document.activeElement === nameInput) nameInput.setSelectionRange(0, stem);
+  const result = await shown;
   window.removeEventListener('keydown', escape, true);
   if (result !== 'ok') return null;
   const fileName = withExtension(sanitizeFileName(nameInput.value), state.options.format);

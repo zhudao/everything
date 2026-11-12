@@ -91,6 +91,38 @@ describe('session backups (mock OPFS)', () => {
     ctl2.destroy();
   });
 
+  it('writes the media again after a failed write instead of keeping an empty file', async () => {
+    const root = new MemDir();
+    const store = new SessionBackupStore(async () => root);
+    const app = fakeApp();
+    let t = Date.now();
+    const ctl = installSessionBackup(app, { store, tab: 'tab1', now: () => t++ });
+    const doc = sessionWithClip();
+    app.documents.push(doc);
+    // The first media write runs out of storage space.
+    const write = store.writeMedia.bind(store);
+    let fail = true;
+    store.writeMedia = async (key, rate, channels) => {
+      if (!fail) return write(key, rate, channels);
+      const media = await (await root.getDirectoryHandle(BACKUP_DIR, { create: true })).getDirectoryHandle('media', { create: true });
+      const file = await media.getFileHandle(`${key}.wav`, { create: true });
+      file.createWritable = async () => ({ write: async () => Promise.reject(Object.assign(new Error('Quota'), { name: 'QuotaExceededError' })), close: async () => {}, abort: async () => {} });
+      return write(key, rate, channels);
+    };
+    await ctl.run();
+    expect(app.notify).toHaveBeenCalledTimes(1);
+    expect(await store.list()).toHaveLength(0);
+    // Space is available again: the next backup must hold the audio.
+    fail = false;
+    doc.apply('Volume', S.updateTrack(doc.state, doc.state.tracks[0].id, { volume: -3 }));
+    await ctl.run();
+    const [m] = await store.list();
+    expect((await store.readMedia(m.media[0].key)).size).toBe(44 + 4800 * 2 * 4);
+    const restored = await ctl.restore(m);
+    expect(restored.pool.get(restored.state.clips[0].sourceId).channels[0].length).toBe(4800);
+    ctl.destroy();
+  });
+
   it('keeps at most the configured number of backups and deletes unused media', async () => {
     const root = new MemDir();
     const store = new SessionBackupStore(async () => root);
@@ -141,6 +173,78 @@ describe('session backups (mock OPFS)', () => {
 });
 
 describe('session backup settings', () => {
+  it('does not offer sessions saved after their last backup or closed without saving', async () => {
+    const root = new MemDir();
+    const store = new SessionBackupStore(async () => root);
+    const app = fakeApp();
+    app.addDocument = (d) => {
+      app.documents.push(d);
+      d.on('change', (e) => app.emit('doc-change', d, e));
+      app.emit('documents');
+    };
+    let t = Date.now();
+    const ctl = installSessionBackup(app, { store, tab: 'tab1', now: () => t++ });
+    const saved = sessionWithClip(10);
+    const closed = sessionWithClip(10);
+    app.addDocument(saved);
+    app.addDocument(closed);
+    await ctl.run();
+    expect((await store.list()).map((m) => m.dirty)).toEqual([true, true]);
+    // Saved with no edit since the backup, and closed with "Don't Save".
+    saved.markSaved();
+    app.documents.splice(app.documents.indexOf(closed), 1);
+    app.emit('documents');
+    await ctl.run();
+    const ctl2 = installSessionBackup(fakeApp(), { store, tab: 'tab2' });
+    expect(await ctl2.check()).toEqual([]);
+    // Both stay available in File > Restore Session Backup.
+    expect(await ctl2.list()).toHaveLength(2);
+    ctl.destroy();
+    ctl2.destroy();
+  });
+
+  it('does not delete media another tab has written for a backup it is still finishing', async () => {
+    const root = new MemDir();
+    const store1 = new SessionBackupStore(async () => root);
+    const store2 = new SessionBackupStore(async () => root);
+    let t = Date.now();
+    const app1 = fakeApp();
+    const app2 = fakeApp();
+    const ctl1 = installSessionBackup(app1, { store: store1, tab: 'tab1', now: () => t++ });
+    const ctl2 = installSessionBackup(app2, { store: store2, tab: 'tab2', now: () => t++ });
+    const doc1 = sessionWithClip(100);
+    const doc2 = sessionWithClip(200);
+    app1.documents.push(doc1);
+    app2.documents.push(doc2);
+    // Tab 2 has written its media and is about to write the manifest when tab 1 backs up.
+    let release;
+    const gate = new Promise((r) => (release = r));
+    const writeManifest = store2.writeManifest.bind(store2);
+    store2.writeManifest = async (m) => {
+      await gate;
+      return writeManifest(m);
+    };
+    const pending = ctl2.run();
+    await new Promise((r) => setTimeout(r, 20));
+    await ctl1.run();
+    release();
+    await pending;
+    const m2 = (await store1.list()).find((m) => m.tab === 'tab2');
+    expect(await store1.hasMedia(m2.media[0].key)).toBe(true);
+    const restored = await ctl1.restore(m2);
+    expect(restored.pool.get(restored.state.clips[0].sourceId).channels[0].length).toBe(200);
+    // Media no backup uses are still removed once they are old.
+    const media = (await root.getDirectoryHandle(BACKUP_DIR)).children.get('media');
+    await store1.writeMedia('tab3-x-1', 48000, [Channel.fromSamples(new Float32Array(10))]);
+    media.children.get('tab3-x-1.wav').lastModified = Date.now() - 3600 * 1000;
+    await ctl1.run();
+    doc1.apply('Volume', S.updateTrack(doc1.state, doc1.state.tracks[0].id, { volume: -2 }));
+    await ctl1.run();
+    expect(media.children.has('tab3-x-1.wav')).toBe(false);
+    ctl1.destroy();
+    ctl2.destroy();
+  });
+
   it('has defaults, an Auto Save section and a File menu command', () => {
     expect(DEFAULTS).toMatchObject({ sessionBackup: true, sessionBackupInterval: 3, sessionBackupMax: 10 });
     const page = CATEGORIES.find((c) => c.id === 'autoSave');

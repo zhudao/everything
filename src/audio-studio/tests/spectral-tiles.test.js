@@ -99,3 +99,70 @@ describe('tile cache', () => {
     expect(c.bytes).toBe(0);
   });
 });
+
+describe('spectrogram shader', () => {
+  it('shows the loudest bin a pixel spans, so narrow high tones stay visible', async () => {
+    // On a log axis one pixel near the top covers many bins; sampling only the
+    // pixel centre dropped tones between centres (a 6 kHz sine vanished).
+    const { FS } = await import('../src/spectral/renderer.js');
+    expect(FS).toMatch(/dFdy\(vUv\.y\)/);
+    expect(FS).toMatch(/v = max\(v, texture\(uTex/);
+  });
+});
+
+describe('tile textures wider than the GPU allows', () => {
+  it('combines neighbouring bins, keeping the loudest', async () => {
+    const { fitBins } = await import('../src/spectral/renderer.js');
+    // Two columns of 4097 bins (an 8192-point FFT) for a 4096-texel GPU.
+    const bins = 4097;
+    const bytes = new Uint8Array(bins * 2);
+    bytes[256] = 200; // column 0, bin 256
+    bytes[bins + 4096] = 99; // column 1, the Nyquist bin
+    bytes[bins + 1001] = 7;
+    const { bytes: out, width } = fitBins(bytes, bins, 2, 4096);
+    expect(width).toBe(2049);
+    expect(out.length).toBe(2049 * 2);
+    expect(out[128]).toBe(200);
+    expect(out[2049 + 2048]).toBe(99);
+    expect(out[2049 + 500]).toBe(7);
+    // Within the limit, the bytes pass through untouched.
+    expect(fitBins(bytes, bins, 2, 8192)).toEqual({ bytes, width: bins });
+  });
+});
+
+describe('graphics context loss', () => {
+  it('reports the loss, and after a restore leaves textures of the old context alone', async () => {
+    const { SpectrogramRenderer } = await import('../src/spectral/renderer.js');
+    const deleted = [];
+    let made = 0;
+    const gl = new Proxy(
+      {},
+      {
+        get(t, k) {
+          if (k === 'getParameter') return () => 4096;
+          if (k === 'getShaderParameter' || k === 'getProgramParameter') return () => true;
+          if (k === 'deleteTexture') return (tex) => deleted.push(tex);
+          if (k === 'createTexture') return () => ({ n: made++ });
+          if (typeof k === 'string' && /^[A-Z_0-9]+$/.test(k)) return 1;
+          return () => ({});
+        },
+      },
+    );
+    const canvas = document.createElement('canvas');
+    canvas.getContext = () => gl;
+    const r = new SpectrogramRenderer(canvas);
+    let lost = 0;
+    r.onLost = () => lost++;
+    const old = r.createTile(new Uint8Array(5 * 2), 5, 2);
+    canvas.dispatchEvent(new Event('webglcontextlost', { cancelable: true }));
+    expect(lost).toBe(1);
+    expect(r.available).toBe(false);
+    canvas.dispatchEvent(new Event('webglcontextrestored'));
+    expect(r.available).toBe(true);
+    r.deleteTile(old);
+    expect(deleted).toEqual([]);
+    const fresh = r.createTile(new Uint8Array(5 * 2), 5, 2);
+    r.deleteTile(fresh);
+    expect(deleted).toEqual([fresh]);
+  });
+});

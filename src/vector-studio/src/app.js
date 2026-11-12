@@ -33,6 +33,7 @@ import { CORE_TOOLS } from './tools/index.js';
 import { applyTheme, THEME_OPTIONS } from './theme.js';
 import { defaultLabel } from './model/nodes.js';
 import { formatLength } from './lib/units.js';
+import { installHeldModifiers } from './lib/held-modifiers.js';
 
 /** Focusable controls that Enter or Space activate. */
 const ACTIVATABLE = 'button, a[href], summary, select, [role="button"], [role="menuitem"], [role="menuitemcheckbox"], [role="menuitemradio"], [role="tab"], [role="option"], [role="treeitem"], [role="checkbox"], [role="radio"], [role="switch"], [role="slider"]';
@@ -40,6 +41,8 @@ const ACTIVATABLE = 'button, a[href], summary, select, [role="button"], [role="m
 export class App extends Emitter {
   constructor(root, { prefs, env = 'web', user = null, picture = null, onSignIn = null, onSignOut = null, onSessionChange = null, storage = null } = {}) {
     super();
+    // Shift-tap and friends on tablets whose touch events carry no modifier keys.
+    if (typeof window !== 'undefined') installHeldModifiers(window);
     this.root = root;
     this.prefs = prefs;
     this.env = env;
@@ -294,6 +297,7 @@ export class App extends Emitter {
   addDocument(doc, { file = null, activate = true } = {}) {
     const editor = new Editor(doc, { file, prefs: this.prefs });
     editor.style = { ...editor.style };
+    editor.overlayInsets = () => this.canvasOverlayInsets?.() || null;
     this.editors.push(editor);
     editor.on('selection', () => {
       this.#onEditorEvent(editor);
@@ -372,6 +376,8 @@ export class App extends Emitter {
       }
     }
     const i = this.editors.indexOf(editor);
+    // Closed meanwhile (a second close while the save prompt or the save was pending).
+    if (i < 0) return true;
     this.editors.splice(i, 1);
     this.views.get(editor)?.destroy();
     this.views.get(editor)?.host.remove();

@@ -72,8 +72,23 @@ export async function readFile(path) {
   return sdk().fs.read(path);
 }
 
+/**
+ * Writes a file. Puter rejects with plain objects ({ message } or { error: { message } }),
+ * which reached the user as "Something went wrong."; failures become Errors that say
+ * which file could not be saved and why (storage full, offline...).
+ */
 export async function writeFile(path, data, options = {}) {
-  return sdk().fs.write(path, data, { overwrite: true, createMissingParents: true, ...options });
+  const opts = { overwrite: true, createMissingParents: true, ...options };
+  try {
+    return await sdk().fs.write(path, data, opts);
+  } catch (err) {
+    const why = String(err?.message || err?.error?.message || 'Puter did not answer');
+    const name = String(path).split('/').pop();
+    const error = new Error(`"${name}" could not be saved to Puter (${why.replace(/\.$/, '')}).`);
+    error.cause = err;
+    error.code = err?.code ?? err?.error?.code;
+    throw error;
+  }
 }
 
 // ------------------------------------------------------------ file browsing
@@ -98,12 +113,25 @@ export async function stat(path) {
   return sdk().fs.stat(path);
 }
 
+/** Whether a Puter error means "no such file" (an Error with `code`, `{ code }` or `{ error: { code } }`). */
+export function isNotFound(err) {
+  const code = err?.code ?? err?.error?.code;
+  return code === 'subject_does_not_exist' || err?.status === 404 || err?.error?.status === 404;
+}
+
+/**
+ * Whether a file exists. Only a not-found answer means false: any other
+ * failure (offline, server error) throws, so callers about to overwrite a
+ * file never take "could not check" for "free to write".
+ */
 export async function exists(path) {
   try {
     await stat(path);
     return true;
-  } catch {
-    return false;
+  } catch (err) {
+    if (isNotFound(err)) return false;
+    const why = err?.message || err?.error?.message || 'Puter did not answer';
+    throw new Error(`Could not check whether "${String(path).split('/').pop()}" already exists in Puter (${why}). Nothing was written.`);
   }
 }
 

@@ -19,12 +19,14 @@ const str = (b, o, n) => {
  * @param {Uint8Array} head first bytes of the file
  * @param {number} size total file size
  * @param {Uint8Array} [tail] last bytes (Ogg and MP4 with the index at the end)
- * @returns {{ format, duration?, sampleRate?, channels?, bitDepth?, needTail? }}
+ * @returns {{ format, duration?, sampleRate?, channels?, bitDepth?, needTail?, skip? }}
+ *   `skip`: an ID3v2 tag (cover art) fills the head; probe again with the
+ *   bytes from that offset and `size - skip` (see probeSource).
  */
 export function probeAudio(head, size, tail = null) {
   const dv = new DataView(head.buffer, head.byteOffset, head.byteLength);
   const id = str(head, 0, 4);
-  if ((id === 'RIFF' || id === 'RF64') && str(head, 8, 4) === 'WAVE') {
+  if ((id === 'RIFF' || id === 'RF64' || id === 'BW64') && str(head, 8, 4) === 'WAVE') {
     let o = 12;
     let fmt = null;
     let ds64 = null;
@@ -35,7 +37,10 @@ export function probeAudio(head, size, tail = null) {
       if (cid === 'fmt ' && o + 24 <= head.length) fmt = { channels: dv.getUint16(o + 10, true), sampleRate: dv.getUint32(o + 12, true), blockAlign: dv.getUint16(o + 20, true), bits: dv.getUint16(o + 22, true) };
       if (cid === 'data') {
         if (!fmt) break;
-        const bytes = csize === 0xffffffff && ds64 != null ? ds64 : Math.min(csize, size - o - 8);
+        let bytes = csize === 0xffffffff && ds64 != null ? ds64 : Math.min(csize, size - o - 8);
+        // A recording cut off before its header was finished: size 0 with the audio running
+        // to the end of the file (as parseWav reads it), unless another chunk follows.
+        if (csize === 0 && !/^[\x20-\x7e]{4}$/.test(str(head, o + 8, 4))) bytes = size - o - 8;
         return { format: 'WAV', sampleRate: fmt.sampleRate, channels: fmt.channels, bitDepth: fmt.bits, duration: bytes / (fmt.blockAlign || 1) / fmt.sampleRate };
       }
       o += 8 + csize + (csize & 1);
@@ -94,6 +99,7 @@ export function probeAudio(head, size, tail = null) {
   if (head[0] === 0x1a && head[1] === 0x45 && head[2] === 0xdf && head[3] === 0xa3) return { format: str(head, 0, 64).includes('webm') ? 'WebM' : 'Matroska' };
   // MPEG audio (after an optional ID3v2 tag).
   const tag = id3v2Size(head);
+  if (tag && tag + 4096 > head.length && size > head.length) return { format: 'MP3', skip: tag };
   for (let i = tag; i + 4 < Math.min(head.length, tag + 8192); i++) {
     const h = parseMp3Header(head, i);
     if (!h) continue;
@@ -103,14 +109,31 @@ export function probeAudio(head, size, tail = null) {
     const sideInfo = h.version === 1 ? (h.channels === 1 ? 17 : 32) : h.channels === 1 ? 9 : 17;
     const x = i + 4 + sideInfo;
     let frames = 0;
-    if (str(head, x, 4) === 'Xing' || str(head, x, 4) === 'Info') {
+    if ((str(head, x, 4) === 'Xing' || str(head, x, 4) === 'Info') && x + 12 <= head.length) {
       const flags = new DataView(head.buffer, head.byteOffset + x + 4).getUint32(0);
       if (flags & 1) frames = new DataView(head.buffer, head.byteOffset + x + 8).getUint32(0);
-    } else if (str(head, i + 36, 4) === 'VBRI') frames = new DataView(head.buffer, head.byteOffset + i + 50).getUint32(0);
+    } else if (str(head, i + 36, 4) === 'VBRI' && i + 54 <= head.length) {
+      frames = new DataView(head.buffer, head.byteOffset + i + 50).getUint32(0);
+    }
     const duration = frames ? (frames * h.samples) / h.sampleRate : ((size - i) * 8) / (h.bitrate * 1000);
     return { format: 'MP3', sampleRate: h.sampleRate, channels: h.channels, duration };
   }
   return { format: '' };
+}
+
+/**
+ * Probes a file through `read(offset, count)` (resolving a Uint8Array):
+ * the head, then the tail or the audio after a large ID3v2 tag when needed.
+ */
+export async function probeSource(read, size) {
+  const head = await read(0, Math.min(HEAD_BYTES, size || HEAD_BYTES));
+  let p = probeAudio(head, size);
+  if (p.needTail && size > HEAD_BYTES) p = probeAudio(head, size, await read(Math.max(0, size - TAIL_BYTES), Math.min(TAIL_BYTES, size)));
+  else if (p.skip) {
+    const rest = probeAudio(await read(p.skip, Math.min(HEAD_BYTES, size - p.skip)), size - p.skip);
+    p = rest.format === 'MP3' ? rest : { format: 'MP3' };
+  }
+  return p;
 }
 
 function mvhd(b) {

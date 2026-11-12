@@ -1,8 +1,8 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { parseMarkerText, parseDelimited } from '../src/storage/markers-io.js';
 import { conformOptions, defaultOptions, estimateSize, withExtension, sanitizeFileName, exportMarkers, formatForName, describeSampleType, describeSettings, usesDither } from '../src/export/formats.js';
 import { id3v2Tag, parseId3v2, riffInfoChunk, parseRiffInfo, vorbisComment, parseVorbisComment, cleanMeta, readTags } from '../src/audio/meta.js';
-import { probeAudio, describeProbe } from '../src/storage/probe.js';
+import { probeAudio, probeSource, describeProbe } from '../src/storage/probe.js';
 import { WavWriter, AiffWriter } from '../src/export/pcm.js';
 import { parseAiff } from '../src/audio/aiff.js';
 import { decodeAudio, sniffSampleRate } from '../src/audio/decode.js';
@@ -81,6 +81,12 @@ describe('export option logic', () => {
   it('handles names, extensions and markers', () => {
     expect(withExtension('Take 1.wav', 'flac')).toBe('Take 1.flac');
     expect(withExtension('v1.2 mix', 'mp3')).toBe('v1.2 mix.mp3');
+    // A version number at the end is part of the name, not an extension.
+    expect(withExtension('Mix 1.5', 'wav')).toBe('Mix 1.5.wav');
+    expect(withExtension('Song.m4a', 'wav')).toBe('Song.wav');
+    expect(withExtension('Song.', 'wav')).toBe('Song.wav');
+    expect(withExtension('Song.mp3..', 'flac')).toBe('Song.flac');
+    expect(initialState(AudioFile.blank({ name: 'Mix 1.5.wav', sampleRate: 44100, channels: 1, seconds: 1 }), { mode: 'saveAs', frames: 1 }).name).toBe('Mix 1.5.wav');
     expect(sanitizeFileName(' a/b:c*?.wav ')).toBe('a_b_c__.wav');
     expect(formatForName('X.AIFF')).toBe('aiff');
     expect(formatForName('x.ogg')).toBe(null);
@@ -117,6 +123,14 @@ describe('metadata writers and readers', () => {
     expect(parseVorbisComment(vorbisComment(meta))).toEqual(meta);
     expect(cleanMeta({ title: '  ', foo: 'x', artist: ' A ' })).toEqual({ artist: 'A' });
   });
+  it('reads Windows-1252 text that older editors wrote in WAV chunks', () => {
+    // "Café Nürn" in Windows-1252, not valid UTF-8.
+    const text = [0x43, 0x61, 0x66, 0xe9, 0x20, 0x4e, 0xfc, 0x72, 0x6e, 0];
+    const info = Uint8Array.from([...'INFOINAM'].map((c) => c.charCodeAt(0)).concat([text.length, 0, 0, 0], text));
+    expect(parseRiffInfo(info)).toEqual({ title: 'Café Nürn' });
+    // UTF-8 text is still read as UTF-8.
+    expect(parseRiffInfo(riffInfoChunk({ title: 'Café ♪' }).subarray(8))).toEqual({ title: 'Café ♪' });
+  });
   it('edits one field of a document state', () => {
     const s = { channels: [], meta: { title: 'a' } };
     expect(withMetaField(s, 'title', 'a')).toBe(null);
@@ -132,6 +146,24 @@ describe('file probing and decoding', () => {
     w.write([tone(22050), tone(22050)], 22050);
     return new Uint8Array(await w.finish().arrayBuffer());
   }
+  it('probes an MP3 whose Info header is cut off without failing', () => {
+    const head = new Uint8Array(42);
+    head.set([0xff, 0xfb, 0x90, 0x00]);
+    head.set([0x49, 0x6e, 0x66, 0x6f], 36); // "Info", its flags and frame count missing
+    expect(probeAudio(head, 100000)).toMatchObject({ format: 'MP3', sampleRate: 44100 });
+  });
+  it('reads the duration of a WAV recording whose data size was never written', async () => {
+    const wav = await bytesOf(WavWriter, { meta: {} });
+    const dataAt = 36;
+    expect(String.fromCharCode(...wav.subarray(dataAt, dataAt + 4))).toBe('data');
+    new DataView(wav.buffer).setUint32(dataAt + 4, 0, true);
+    expect(probeAudio(wav.subarray(0, 4096), wav.length).duration).toBe(1);
+    // A genuinely empty data chunk followed by another chunk stays empty.
+    const markers = [{ start: 0, name: 'A' }];
+    const w = new WavWriter({ sampleRate: 22050, channels: 2, frames: 0, markers });
+    const empty = new Uint8Array(await w.finish().arrayBuffer());
+    expect(probeAudio(empty, empty.length).duration).toBe(0);
+  });
   it('reads durations from WAV, AIFF, MP3 and Ogg headers', async () => {
     const wav = await bytesOf(WavWriter);
     expect(probeAudio(wav.subarray(0, 4096), wav.length)).toMatchObject({ format: 'WAV', sampleRate: 22050, channels: 2, bitDepth: 16, duration: 1 });
@@ -146,6 +178,14 @@ describe('file probing and decoding', () => {
     const p = probeAudio(mp3, mp3.length);
     expect(p.format).toBe('MP3');
     expect(p.duration).toBeCloseTo((417 * 100 * 8) / 128000, 3);
+    // Behind 300 KB of ID3v2 cover art, past the probed head.
+    const art = 300000;
+    const tagged = new Uint8Array(10 + art + mp3.length);
+    tagged.set([0x49, 0x44, 0x33, 3, 0, 0, (art >> 21) & 0x7f, (art >> 14) & 0x7f, (art >> 7) & 0x7f, art & 0x7f]);
+    tagged.set(mp3, 10 + art);
+    const read = async (at, n) => tagged.slice(at, at + n);
+    expect(await probeSource(read, tagged.length)).toMatchObject({ format: 'MP3', sampleRate: 44100, duration: p.duration });
+    expect(await probeSource(read, mp3.length + 10 + art)).not.toHaveProperty('skip');
     const pages = muxOggOpus({ channels: 2, packets: Array.from({ length: 50 }, () => ({ data: new Uint8Array(40), samples: 960 })), totalSamples: 48000 });
     const ogg = new Uint8Array(pages.reduce((s, x) => s + x.length, 0));
     let o = 0;
@@ -166,6 +206,35 @@ describe('file probing and decoding', () => {
     expect(r.channels[0][50]).toBe(0.25);
     expect(parseAiff(buf).channels.length).toBe(1);
     expect(readTags(buf)).toEqual({});
+  });
+  it('opens the other files when one of several fails, naming the one that failed', async () => {
+    const { openFiles } = await import('../src/storage/files.js');
+    const good = await bytesOf(WavWriter);
+    const bad = good.slice();
+    new DataView(bad.buffer).setUint16(22, 0, true); // zero channels: a damaged header
+    const added = [];
+    const app = { setStatus: () => {}, notify: vi.fn(), addDocument: (d) => added.push(d), activate: vi.fn(), prefs: { get: () => [], set: () => {} } };
+    const docs = await openFiles(app, [new File([bad], 'Broken.wav'), new File([good], 'Fine.wav')]);
+    expect(docs.map((d) => d.name)).toEqual(['Fine.wav']);
+    expect(app.activate).toHaveBeenCalledWith(docs[0]);
+    expect(app.notify).toHaveBeenCalledWith('"Broken.wav" could not be opened. The WAV file header is damaged.', { error: true });
+  });
+  it('shows a Puter file that is already open instead of opening a second copy', async () => {
+    const { openFiles } = await import('../src/storage/files.js');
+    const good = await bytesOf(WavWriter);
+    const open = { id: 'd1', name: 'Song.wav', source: { type: 'puter', path: '/u/Song.wav' } };
+    const read = vi.fn(async () => new Blob([good]));
+    const prefs = { get: () => [], set: () => {} };
+    const app = { documents: [open], setStatus: () => {}, notify: vi.fn(), prefs };
+    Object.assign(app, { addDocument: vi.fn(), activate: vi.fn() });
+    const docs = await openFiles(app, [{ name: 'Song.wav', path: '/u/Song.wav', read }]);
+    expect(docs).toEqual([open]);
+    expect(read).not.toHaveBeenCalled();
+    expect(app.addDocument).not.toHaveBeenCalled();
+    expect(app.activate).toHaveBeenCalledWith(open);
+    // Another file still opens.
+    const more = await openFiles(app, [{ name: 'Other.wav', path: '/u/Other.wav', read }]);
+    expect(more[0].source).toMatchObject({ type: 'puter', path: '/u/Other.wav' });
   });
   it('rejects empty and known-unsupported files with clear messages', async () => {
     await expect(decodeAudio(new ArrayBuffer(0), 'a.mp3')).rejects.toThrow(/empty/);

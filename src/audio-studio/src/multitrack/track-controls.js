@@ -17,6 +17,8 @@ export class TrackControls {
     this.doc = doc;
     /** key `${trackId}:${param}` -> { trackId, param, segments: [{ t0, points }], value, lastT, done } */
     this.passes = new Map();
+    /** Touch passes that ended before another touch of the same control in one playback. */
+    this.finished = [];
     doc.overrides = {};
   }
 
@@ -79,6 +81,7 @@ export class TrackControls {
     const t = Math.round(this.app.playhead);
     let pass = this.passes.get(key);
     if (!pass || pass.done) {
+      if (pass) this.finished.push(pass);
       pass = { trackId: track.id, param, segments: [{ t0: t, points: [{ t, v: value }] }], value, lastT: t, done: false };
       this.passes.set(key, pass);
     } else {
@@ -96,6 +99,7 @@ export class TrackControls {
       pass.value = value;
       pass.lastT = t;
     }
+    pass.seen = t;
     if (phase === 'change' && track.mode === 'touch') {
       pass.done = true;
       const o = { ...(this.doc.overrides[track.id] || {}) };
@@ -106,6 +110,31 @@ export class TrackControls {
     }
     this.app.syncGraph();
     this.doc.emit('change', { kind: 'automation' });
+  }
+
+  /**
+   * Follows the playhead during playback (`frame`). A loop jump closes the passes that hold a
+   * value (Write, a latched control) at the loop end and continues them from the loop start, so
+   * every pass played is written, also when nothing is touched after the jump.
+   */
+  follow(frame) {
+    if (!this.passes.size) return;
+    const loop = this.app.engine.range?.loop;
+    const looping = loop && loop.end > loop.start;
+    for (const pass of this.passes.values()) {
+      if (pass.done) continue;
+      const seen = pass.seen ?? pass.lastT;
+      pass.seen = frame;
+      if (frame >= seen) continue;
+      // A jump from near the loop end to near its start is the loop wrapping (meters arrive a few
+      // times a second); other jumps back are seeks, which continue from where they land.
+      const near = this.doc.sampleRate * 0.5;
+      const end = looping && loop.end - seen <= near ? Math.max(pass.lastT, loop.end - 1) : Math.max(pass.lastT, seen);
+      const start = looping && frame >= loop.start && frame - loop.start <= near ? loop.start : frame;
+      pass.segments[pass.segments.length - 1].points.push({ t: end, v: pass.value });
+      pass.segments.push({ t0: start, points: [{ t: start, v: pass.value }] });
+      pass.lastT = start;
+    }
   }
 
   /** Starts Write passes for tracks in Write mode (called when playback starts). */
@@ -121,20 +150,27 @@ export class TrackControls {
   commit(stopFrame) {
     if (!this.passes.size) return;
     let state = this.doc.state;
-    for (const pass of this.passes.values()) {
+    // Earlier touches of a control first, so a later pass over the same time wins.
+    for (const pass of [...this.finished, ...this.passes.values()]) {
       const track = findTrack(state, pass.trackId);
       if (!track) continue;
       let lane = track.automation[pass.param];
+      const fallback = track[pass.param];
       pass.segments.forEach((seg, i) => {
         const last = i === pass.segments.length - 1;
         const end = last && !pass.done ? Math.max(pass.lastT, Math.round(stopFrame ?? pass.lastT)) : seg.points[seg.points.length - 1].t;
         const pts = seg.points.slice();
         if (last && !pass.done && end > pts[pts.length - 1].t) pts.push({ t: end, v: pass.value });
-        lane = writeEnvelopeRange(lane, seg.t0, end, pts);
+        // Outside the pass the lane keeps what it played (or the track's own value), rather than
+        // ramping from the old points to the new ones.
+        const before = seg.t0 > 0 ? [{ t: seg.t0 - 1, v: envelopeValue(lane, seg.t0 - 1, fallback) }] : [];
+        const after = { t: end + 1, v: envelopeValue(lane, end + 1, fallback) };
+        lane = writeEnvelopeRange(lane, seg.t0 - before.length, end + 1, [...before, ...pts, after]);
       });
       state = setAutomation(state, pass.trackId, pass.param, lane);
     }
     this.passes.clear();
+    this.finished = [];
     this.doc.overrides = {};
     this.doc.apply('Write Automation', state);
     this.app.syncGraph();

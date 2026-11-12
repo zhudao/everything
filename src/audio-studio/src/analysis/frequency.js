@@ -51,6 +51,34 @@ export function spectrumBars(db, rate, fft, toHz, count) {
   return out;
 }
 
+/**
+ * The latest `size` output frames for a live spectrum. A mixer tap holds
+ * fewer frames than the largest FFT sizes, so the start of the window comes
+ * from earlier taps, moved along by the frames played since (`m.frame`);
+ * after a seek or a gap they move by a whole tap. `hist` is the state
+ * returned by the previous call (null to start over).
+ */
+export function liveWindow(hist, m, size) {
+  const n = m.L.length;
+  if (n >= size) return { L: m.L.subarray(n - size), R: m.R.subarray(n - size), frame: m.frame };
+  if (!hist || hist.L.length !== size || !hist.own) hist = { L: new Float32Array(size), R: new Float32Array(size), frame: null, own: true };
+  const step = hist.frame === null ? n : Math.round(m.frame - hist.frame);
+  const shift = step > 0 && step <= n ? step : n;
+  for (const [h, x] of [[hist.L, m.L], [hist.R, m.R]]) {
+    h.copyWithin(0, shift);
+    h.set(x, size - n);
+  }
+  hist.frame = m.frame;
+  return hist;
+}
+
+/** (L + R) / 2 sample by sample. */
+function midOf(L, R) {
+  const out = new Float32Array(L.length);
+  for (let i = 0; i < L.length; i++) out[i] = (L[i] + R[i]) * 0.5;
+  return out;
+}
+
 export function frequencyPanel(app) {
   const prefs = () => ({ ...DEFAULTS, ...(app.prefs.get('frequencyAnalysis') || {}) });
   const setPref = (patch) => {
@@ -75,7 +103,7 @@ export function frequencyPanel(app) {
     clearBtn,
   );
   const displaySel = select({ label: 'Display', value: p0.display, options: DISPLAYS, onChange: (v) => setPref({ display: v }) });
-  const scanBtn = h('button.btn.sm', { type: 'button', title: 'Average the spectrum of the selection, or of the whole file', onclick: () => recompute.now({ scan: true }) }, 'Scan');
+  const scanBtn = h('button.btn.sm', { type: 'button', title: 'Average the spectrum of the selection, or of the whole file', onclick: () => scanNow() }, 'Scan');
   const advBtn = h('button.disclosure.freq-adv-toggle', { type: 'button', 'aria-expanded': String(Boolean(p0.advanced)), onclick: () => setPref({ advanced: !prefs().advanced }) }, icon('chevron-right', 12), 'Advanced');
   const advanced = h('div.freq-advanced', { hidden: !p0.advanced }, h('label.freq-field', h('span', 'FFT Size:'), fftSel), h('label.freq-field', h('span', 'Window:'), winSel));
   const bottom = h(
@@ -92,11 +120,13 @@ export function frequencyPanel(app) {
   let visible = false;
   let raf = 0;
   let live = null; // { L: dB[], R: dB[], rate, fft }
+  let tapHist = null; // the latest output frames (see liveWindow)
   let still = null; // computed from the document when stopped
   let holds = new Array(HOLD_COLORS.length).fill(null);
   let scanRange = null; // set by Scan until the selection or document changes
   let hoverX = null;
   let gen = 0;
+  let stale = false; // something changed while the panel was hidden
   let d = null;
   let analyzers = new Map();
   dsp().then((x) => (d = x)).catch(() => {});
@@ -114,26 +144,32 @@ export function frequencyPanel(app) {
   // Live: spectra of the latest output block, smoothed in power.
   const tap = masterTap(app, (m) => {
     if (!visible || !d) return;
-    const { fft, window } = prefs();
+    const { fft, window, channel } = prefs();
     const a = analyzer(fft, window);
     if (!a) return;
-    const n = Math.min(fft, m.L.length);
-    const frame = (x) => a.frame(x.subarray(x.length - n));
-    const L = frame(m.L);
-    const R = frame(m.R);
+    tapHist = liveWindow(tapHist, m, fft);
+    const L = a.frame(tapHist.L);
+    const R = a.frame(tapHist.R);
+    const M = channel === 'mid' ? a.frame(midOf(tapHist.L, tapHist.R)) : null;
     if (live && live.fft === fft) {
-      for (const [prev, next] of [[live.L, L], [live.R, R]]) {
+      for (const [prev, next] of [[live.L, L], [live.R, R], [live.M, M]]) {
+        if (!prev || !next) continue;
         for (let k = 0; k < next.length; k++) {
           // Fast attack, slower release.
           next[k] = next[k] > prev[k] ? next[k] : prev[k] * 0.6 + next[k] * 0.4;
         }
       }
     }
-    live = { L, R, rate: m.rate, fft };
+    live = { L, R, M, rate: m.rate, fft };
     schedule();
   });
 
   const compute = async ({ scan = false } = {}) => {
+    // A hidden panel skips the analysis; show() computes it again.
+    if (!visible) {
+      stale = true;
+      return;
+    }
     const doc = app.active;
     const my = ++gen;
     if (scan && doc?.kind === 'audio') scanRange = { doc, ...(doc.hasSelection ? doc.selection : { start: 0, end: doc.length }) };
@@ -143,7 +179,7 @@ export function frequencyPanel(app) {
       schedule();
       return;
     }
-    const { fft, window } = prefs();
+    const { fft, window, channel } = prefs();
     const sel = scanRange || doc.selection;
     const hasSel = sel.end - sel.start >= fft;
     let positions;
@@ -151,25 +187,36 @@ export function frequencyPanel(app) {
       const frames = Math.max(1, Math.min(scanRange ? 256 : 128, Math.floor((sel.end - sel.start - fft) / (fft / 2)) + 1));
       const step = frames > 1 ? (sel.end - sel.start - fft) / (frames - 1) : 0;
       positions = Array.from({ length: frames }, (_, i) => Math.round(sel.start + i * step));
-    } else positions = [Math.round(doc.cursor - fft / 2)];
+    } else {
+      // Centred on the playhead, but kept inside the file: a window half off
+      // either end reads 6 dB low with a smeared spectrum.
+      positions = [Math.round(Math.max(0, Math.min(doc.length - fft, doc.cursor - fft / 2)))];
+    }
     const channels = doc.state.channels;
     try {
+      const blocks = channels.slice(0, 2).map((ch) => {
+        const samples = new Float32Array(positions.length * fft);
+        positions.forEach((p, i) => ch.read(p, samples, i * fft, fft));
+        return samples;
+      });
+      // Mid is the spectrum of (L + R) / 2, so out-of-phase content cancels.
+      if (channel === 'mid' && blocks.length > 1) blocks.push(midOf(blocks[0], blocks[1]));
       const results = await Promise.all(
-        channels.slice(0, 2).map((ch) => {
-          const samples = new Float32Array(positions.length * fft);
-          positions.forEach((p, i) => ch.read(p, samples, i * fft, fft));
-          return analysisPool().call({ op: 'average', size: fft, window, hop: fft, frames: positions.length, samples }, [samples.buffer]);
-        }),
+        blocks.map((samples) => analysisPool().call({ op: 'average', size: fft, window, hop: fft, frames: positions.length, samples }, [samples.buffer])),
       );
       if (my !== gen) return;
       const label = scanRange ? (scanRange.start === 0 && scanRange.end === doc.length ? 'Whole file' : 'Scanned selection') : hasSel ? 'Selection' : 'Playhead';
-      still = { L: results[0], R: results[1] || results[0], rate: doc.sampleRate, fft, label };
+      still = { L: results[0], R: results[1] || results[0], M: results[2] || null, rate: doc.sampleRate, fft, label };
       schedule();
     } catch (err) {
       console.warn('[frequency]', err);
     }
   };
   const recompute = debounce(() => compute(), 150);
+  const scanNow = () => {
+    recompute.cancel();
+    compute({ scan: true });
+  };
 
   const current = () => (app.engine.playing && live ? live : still);
 
@@ -179,6 +226,8 @@ export function frequencyPanel(app) {
     if (channel === 'left') return [['L', data.L]];
     if (channel === 'right') return [['R', data.R]];
     if (channel === 'mid') {
+      if (data.M || data.L === data.R) return [['M', data.M || data.L]];
+      // Until the mid spectrum arrives: the mean power of the two channels.
       const M = data.L.map((v, k) => 10 * Math.log10((Math.pow(10, v / 10) + Math.pow(10, data.R[k] / 10)) / 2));
       return [['M', M]];
     }
@@ -278,8 +327,9 @@ export function frequencyPanel(app) {
       });
       ctx.globalAlpha = 1;
     };
-    const curve = (db, fft, color, width = 1.25, dash = null, fill = false) => {
-      const df = rate / fft;
+    // `traceRate` is the sample rate the trace was measured at (a held trace may differ).
+    const curve = (db, fft, traceRate, color, width = 1.25, dash = null, fill = false) => {
+      const df = traceRate / fft;
       const bins = db.length;
       ctx.strokeStyle = color;
       ctx.lineWidth = width;
@@ -291,6 +341,8 @@ export function frequencyPanel(app) {
         const fb = scale.toHz((i + 1) / cols);
         const ka = fa / df;
         const kb = fb / df;
+        // A held trace from a lower sample rate ends at its own Nyquist frequency.
+        if (i && ka > bins - 0.5) break;
         let v;
         if (kb - ka < 1) {
           const k = (ka + kb) / 2;
@@ -324,7 +376,7 @@ export function frequencyPanel(app) {
     ctx.rect(g.left, g.top, g.right - g.left, g.bottom - g.top);
     ctx.clip();
     holds.forEach((hd, i) => {
-      if (hd) for (const [, db] of hd.traces) curve(db, hd.fft, HOLD_COLORS[i], 1, [4, 3]);
+      if (hd) for (const [, db] of hd.traces) curve(db, hd.fft, hd.rate, HOLD_COLORS[i], 1, [4, 3]);
     });
     const colors = { L: cssVar('--wave'), M: cssVar('--wave'), R: cssVar('--accent-strong') };
     const shown = traces(data, channel);
@@ -332,7 +384,7 @@ export function frequencyPanel(app) {
     // The first channel is drawn last, on top.
     for (const [name, db] of shown.slice().reverse()) {
       if (display === 'bars') drawBars(db, data.fft, colors[name], shown.length > 1 && name === 'R' ? 0.45 : 0.85);
-      else curve(db, data.fft, colors[name], 1.5, null, display === 'area');
+      else curve(db, data.fft, rate, colors[name], 1.5, null, display === 'area');
     }
     // Cursor.
     if (hoverX !== null && hoverX >= g.left && hoverX <= g.right) {
@@ -345,6 +397,9 @@ export function frequencyPanel(app) {
       ...traces(data, channel).map(([name]) => h('span.legend-item', h('span.swatch', { style: { background: colors[name] } }), name === 'M' ? 'Mid' : name === 'L' ? 'Left' : 'Right')),
       ...holds.flatMap((hd, i) => (hd ? [h('span.legend-item', h('span.swatch.dashed', { style: { borderColor: HOLD_COLORS[i] } }), `Hold ${i + 1}`)] : [])),
     );
+    // While playing the readout changes every frame: a live region would talk non-stop.
+    const quiet = app.engine.playing ? 'off' : 'polite';
+    if (readout.getAttribute('aria-live') !== quiet) readout.setAttribute('aria-live', quiet);
     if (hoverX !== null && data) {
       const f = scale.toHz((hoverX - g.left) / (g.right - g.left));
       const k = Math.round(f / (rate / data.fft));
@@ -401,11 +456,14 @@ export function frequencyPanel(app) {
     app.on('transport', (s) => {
       if (s === 'stopped') {
         live = null;
+        tapHist = null;
         recompute();
       }
       schedule();
     }),
   ];
+  // Colours come from the theme: repaint when it changes (also while stopped).
+  window.addEventListener('themechange', () => schedule());
   const ro = new ResizeObserver(() => schedule());
   ro.observe(plot);
   void offs;
@@ -416,7 +474,12 @@ export function frequencyPanel(app) {
     show() {
       visible = true;
       tap.start();
-      recompute();
+      if (stale) {
+        // Replace the trace from before the panel was hidden right away.
+        stale = false;
+        recompute.cancel();
+        compute();
+      } else recompute();
       schedule();
     },
     hide() {
@@ -426,6 +489,6 @@ export function frequencyPanel(app) {
     focus() {
       plot.focus();
     },
-    scan: () => recompute(),
+    scan: () => scanNow(),
   };
 }

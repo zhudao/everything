@@ -473,9 +473,17 @@ export async function runDcOffset({ channels, onProgress, signal }) {
   for (let c = 0; c < channels.length; c++) {
     checkAbort(signal);
     const src = channels[c];
+    // NaN or infinite samples (a damaged float file) are left out of the mean,
+    // or one of them would turn the whole channel into NaN.
     let sum = 0;
-    for (let i = 0; i < src.length; i++) sum += src[i];
-    const mean = src.length ? sum / src.length : 0;
+    let count = 0;
+    for (let i = 0; i < src.length; i++) {
+      if (Number.isFinite(src[i])) {
+        sum += src[i];
+        count++;
+      }
+    }
+    const mean = count ? sum / count : 0;
     const dst = new Float32Array(src.length);
     for (let i = 0; i < src.length; i++) dst[i] = src[i] - mean;
     out.push(dst);
@@ -501,9 +509,10 @@ registerEffect({
 
 /**
  * Peak normalization. Statistics come from the WASM stats kernel; the gain
- * multiply is a single pass per channel.
+ * multiply is a single pass per channel. Equal normalization takes the loudest
+ * of the channels being written (`mask`), so their peak reaches the target.
  */
-async function runNormalize({ channels, values, dsp, onProgress, signal }) {
+async function runNormalize({ channels, values, dsp, onProgress, signal, mask = null }) {
   const target = values.unit === 0 ? 10 ** (values.targetDb / 20) : values.targetPercent / 100;
   const info = [];
   for (const ch of channels) {
@@ -512,7 +521,7 @@ async function runNormalize({ channels, values, dsp, onProgress, signal }) {
     const mean = values.removeDc && ch.length ? sum / ch.length : 0;
     info.push({ mean, peak: Math.max(Math.abs(max - mean), Math.abs(min - mean)) });
   }
-  const loudest = Math.max(0, ...info.map((i) => i.peak));
+  const loudest = Math.max(0, ...info.filter((_, c) => !mask || mask[c]).map((i) => i.peak));
   // DC Bias Adjust moves each channel's offset to the bias amount (0 % removes it).
   const bias = values.removeDc ? (values.dcAmount || 0) / 100 : 0;
   const out = [];
@@ -640,6 +649,8 @@ function envelopeRunner(maxValue) {
 }
 
 const curveParam = choice('curve', 'Curve', ['Linear', 'Spline'], 0);
+/** The editor draws the curve the process applies (straight or the monotone spline). */
+const drawEnvelope = (points, n, v) => renderEnvelope(points, n, v.curve === 1);
 
 registerEffect({
   id: 'fadeEnvelope',
@@ -648,7 +659,16 @@ registerEffect({
   kind: null,
   about: 'Fades the selection along a drawn curve from silence to full level. Click to add points, drag them, double-click to remove one; Spline smooths the curve.',
   params: [
-    { id: 'envelope', label: 'Envelope', type: 'envelope', min: 0, max: 1, unit: '%', default: [{ t: 0, v: 0 }, { t: 1, v: 1 }] },
+    {
+      id: 'envelope',
+      label: 'Envelope',
+      type: 'envelope',
+      min: 0,
+      max: 1,
+      unit: '%',
+      default: [{ t: 0, v: 0 }, { t: 1, v: 1 }],
+      render: drawEnvelope,
+    },
     curveParam,
   ],
   presets: [
@@ -670,7 +690,16 @@ registerEffect({
   kind: null,
   about: 'Raises or lowers the level across the selection along a drawn curve, up to four times louder. Click to add points, drag them, double-click to remove one.',
   params: [
-    { id: 'envelope', label: 'Envelope', type: 'envelope', min: 0, max: 4, unit: '%', default: [{ t: 0, v: 1 }, { t: 1, v: 1 }] },
+    {
+      id: 'envelope',
+      label: 'Envelope',
+      type: 'envelope',
+      min: 0,
+      max: 4,
+      unit: '%',
+      default: [{ t: 0, v: 1 }, { t: 1, v: 1 }],
+      render: drawEnvelope,
+    },
     curveParam,
   ],
   presets: [

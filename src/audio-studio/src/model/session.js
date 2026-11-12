@@ -37,6 +37,8 @@ export class Session extends Emitter {
     this.savedState = this.history.state;
     this.history.on('change', () => {
       this.previewState = null;
+      // Selected keyframes are indices into an envelope: any change (undo, a trim) may move them.
+      this.selectedKeys = null;
       this.#pruneSelection();
       this.clampView();
       this.emit('change', { kind: 'history' });
@@ -98,8 +100,9 @@ export class Session extends Emitter {
     return null;
   }
 
-  markSaved() {
-    this.savedState = this.state;
+  /** Marks `state` (by default the current one) as what the file holds. */
+  markSaved(state = this.state) {
+    this.savedState = state;
     this.emit('change', { kind: 'saved' });
   }
 
@@ -243,10 +246,18 @@ export class Session extends Emitter {
     this.emit('change', { kind: 'clip-selection' });
   }
 
-  /** Selected clips that still exist, in timeline order. */
+  /** Selected clips that still exist, in timeline order (a new array each time). */
   get clipSelection() {
-    return this.state.clips.filter((c) => this.selectedClips.has(c.id)).sort((a, b) => a.start - b.start);
+    // Menus ask for it once per command: sort once per clip list and selection.
+    const c = this.#selectionCache;
+    const set = this.selectedClips;
+    if (c && c.clips === this.state.clips && c.set === set && c.size === set.size) return c.list.slice();
+    const list = this.state.clips.filter((x) => set.has(x.id)).sort((a, b) => a.start - b.start);
+    this.#selectionCache = { clips: this.state.clips, set, size: set.size, list };
+    return list.slice();
   }
+
+  #selectionCache = null;
 
   #pruneSelection() {
     const ids = new Set(this.state.clips.map((c) => c.id));

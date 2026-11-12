@@ -7,7 +7,7 @@
 // view.layers entries { id, el, layout(rect), draw(), pointer(e, phase) }.
 
 import { h, announce } from '../lib/dom.js';
-import { TimeRuler, rulerTicks } from './time-ruler.js';
+import { TimeRuler, rulerTicks, rulerFps } from './time-ruler.js';
 import { Overview } from './overview.js';
 import { WaveformRenderer } from '../render/waveform-gl.js';
 import { channelColumns } from '../audio/peaks.js';
@@ -32,6 +32,9 @@ function withAlpha(color, alpha) {
   const [r, g, b, a] = parseColor(color);
   return `rgba(${Math.round(r * 255)}, ${Math.round(g * 255)}, ${Math.round(b * 255)}, ${a * alpha})`;
 }
+
+/** Time each frame may spend building peak levels for blocks drawn for the first time. */
+const PEAK_FRAME_BUDGET_MS = 12;
 
 /** Levels the amplitude ruler can label, loudest first. */
 const DB_LADDER = [0, -1, -3, -6, -9, -12, -18, -24, -30, -36, -42, -48, -54, -60, -72, -84, -96];
@@ -76,6 +79,12 @@ export function dbMinorTicks(lane, amp) {
   }
   return out;
 }
+
+/**
+ * The first sample at or after a grid line between samples (a video frame or beat): the
+ * time display rounds down, so the nearest sample could show as the previous frame.
+ */
+const firstSampleOf = (frame) => Math.ceil(frame - 1e-4);
 
 /** Keeps a w x h box at (x, y) inside a W x H area. */
 export function clampHud(x, y, w, h, W, H) {
@@ -122,6 +131,7 @@ export class WaveformView {
       seek: (f) => this.seek(f),
       snap: (f, o) => this.snap(f, o),
       setView: (a, b) => doc.setView(a, b),
+      viewMax: () => Math.max(doc.length, doc.sampleRate),
       moveMarker: (id, start, { preview }) => this.moveMarker(id, start, preview),
       renameMarker: (id) => app.commands.run('marker.rename', { id }),
       selectMarker: (id) => this.selectMarker(id),
@@ -218,11 +228,22 @@ export class WaveformView {
     syncPin();
     this.syncHudPin = syncPin;
     this.#bindHudGrip(hud, grip);
-    const setGain = (db) => {
+    const showGain = (db) => {
       this.hudGain = Math.max(-60, Math.min(30, Math.round(db * 10) / 10));
       valueEl.textContent = formatDb(this.hudGain).replace(/ dB$/, '');
       knobEl.setAttribute('aria-valuenow', String(this.hudGain));
       knobEl.setAttribute('aria-valuetext', formatDb(this.hudGain));
+    };
+    // Switching files drops the HUD's preview (the app clears it), so an unapplied
+    // adjustment is dropped too instead of showing a gain that is no longer heard.
+    this.offActive = this.app.on('active', (d) => {
+      if (d !== this.doc && this.hudGain) {
+        drag = null;
+        showGain(0);
+      }
+    });
+    const setGain = (db) => {
+      showGain(db);
       this.app.previewFx = this.hudGain ? [{ key: 'hud', kind: 1, params: [this.hudGain, this.hudGain, 1], enabled: true, mix: 1 }] : null;
       this.app.syncGraph();
       this.invalidate('wave');
@@ -440,7 +461,7 @@ export class WaveformView {
       const rate = this.doc.sampleRate;
       if (prefs.get('timeFormat') === 'bars') {
         const step = musicalStep(this.fpp, rate, this.app.timeOptions(), snap.rulerFine ? 3 : 12);
-        consider(Math.round(Math.round(frame / step) * step));
+        consider(firstSampleOf(Math.round(frame / step) * step));
       } else {
         const secPerPx = this.fpp / rate;
         const steps = [0.001, 0.01, 0.1, 0.5, 1, 5, 10, 30, 60];
@@ -452,15 +473,21 @@ export class WaveformView {
     const fps = snap.frames ? framesPerSecond(this.app.prefs) : 0;
     if (fps) {
       const step = this.doc.sampleRate / fps;
-      consider(Math.round(Math.round(frame / step) * step));
+      consider(firstSampleOf(Math.round(frame / step) * step));
     }
     if (snap.zero && bestD === tol) {
-      const ch = this.doc.state.channels[0];
-      if (ch && ch.length) {
+      // The sum of the channels enabled for editing, as Adjust Selection to Zero Crossings uses.
+      const chans = this.doc.state.channels.filter((_, i) => this.doc.selection.channels[i] !== false);
+      const len = chans[0]?.length ?? 0;
+      if (len) {
         const r = Math.max(8, Math.round(this.fpp * 6));
         const a = Math.max(0, Math.round(frame) - r);
-        const b = Math.min(ch.length, Math.round(frame) + r);
-        const s = ch.toArray(a, b);
+        const b = Math.min(len, Math.round(frame) + r);
+        const s = new Float32Array(Math.max(0, b - a));
+        for (const c of chans) {
+          const x = c.toArray(a, b);
+          for (let i = 0; i < x.length; i++) s[i] += x[i];
+        }
         let zbest = -1;
         let zd = Infinity;
         for (let i = 1; i < s.length; i++) {
@@ -492,6 +519,9 @@ export class WaveformView {
     if (!this.width) return;
     const playing = this.app.engine.playing && this.app.active === doc;
     if (playing) this.#autoScroll();
+    // A newly opened long file builds its peak levels over several frames
+    // instead of in one long task; what is not ready yet fills in as it is.
+    this.peakDefer = { deadline: performance.now() + PEAK_FRAME_BUDGET_MS, pending: new Set() };
     if (this.dirty.wave) this.#drawWave();
     if (this.dirty.overlay) this.#drawOverlay();
     if (this.dirty.ruler) this.ruler.draw();
@@ -499,6 +529,12 @@ export class WaveformView {
     if (this.dirty.amp) this.#drawAmp();
     for (const l of this.layers) if (l.visible?.() !== false) l.draw?.(this.dirty);
     for (const k of Object.keys(this.dirty)) this.dirty[k] = false;
+    if (this.peakDefer.pending.size) {
+      this.overview.peaksFor = null;
+      this.invalidate('wave');
+      this.invalidate('overview');
+    }
+    this.peakDefer = null;
     this.#placePlayhead();
   }
 
@@ -532,7 +568,7 @@ export class WaveformView {
     });
     const amp = doc.view.amp;
     this.waveMask = doc.selection.channels.join();
-    this.renderer.draw({ channels: doc.state.channels, start: doc.view.start, fpp: this.fpp / dpr, amp, lanes, colors });
+    this.renderer.draw({ channels: doc.state.channels, start: doc.view.start, fpp: this.fpp / dpr, amp, lanes, colors, defer: this.peakDefer });
   }
 
   #drawOverlay() {
@@ -651,7 +687,8 @@ export class WaveformView {
     }
     const t0 = v.start / rate;
     const t1 = v.end / rate;
-    return rulerTicks(t0, t1, W).ticks.map((sec) => Math.round(((sec - t0) / (t1 - t0)) * W));
+    const { ticks } = rulerTicks(t0, t1, W, 70, rulerFps(this.app));
+    return ticks.map((sec) => Math.round(((sec - t0) / (t1 - t0)) * W));
   }
 
   #drawAmp() {
@@ -691,7 +728,7 @@ export class WaveformView {
     const ch = this.doc.state.channels;
     if (!ch.length || !this.doc.length) return null;
     const fpp = total / cols;
-    const strips = ch.map((c) => channelColumns(c, 0, fpp, cols));
+    const strips = ch.map((c) => channelColumns(c, 0, fpp, cols, undefined, this.peakDefer));
     if (strips.length === 1 || !this.app.prefs.get('waveLayered')) return strips.length === 1 ? strips[0] : strips;
     const out = strips[0];
     for (const o of strips.slice(1)) {
@@ -722,14 +759,17 @@ export class WaveformView {
   }
 
   moveMarker(id, start, preview) {
+    // Markers stay inside the file: a drag past the end stops with the marker (or range) at the end.
+    const dur = this.doc.state.markers.find((m) => m.id === id)?.duration || 0;
+    start = Math.max(0, Math.min(Math.round(start), this.doc.length - dur));
     if (preview) {
-      this.markerPreview = { id, start: Math.round(start) };
+      this.markerPreview = { id, start };
       this.invalidate('ruler');
       this.invalidate('overlay');
       return;
     }
     this.markerPreview = null;
-    const markers = this.doc.state.markers.map((m) => (m.id === id ? { ...m, start: Math.round(start) } : m));
+    const markers = this.doc.state.markers.map((m) => (m.id === id ? { ...m, start } : m));
     this.doc.apply('Move Marker', { ...this.doc.state, markers: sortMarkers(markers) });
   }
 
@@ -754,7 +794,12 @@ export class WaveformView {
         this.invalidate('wave');
         this.#buildChannelButtons();
       }
-    } else if (e.kind === 'cursor') this.#placePlayhead(); else if (e.kind === 'rename') this.surface.setAttribute('aria-label', `Waveform of ${this.doc.name}`);
+    } else if (e.kind === 'cursor') {
+      this.#placePlayhead();
+      this.ruler.syncValue(this.doc.cursor);
+    } else if (e.kind === 'rename') {
+      this.surface.setAttribute('aria-label', `Waveform of ${this.doc.name}`);
+    }
     if (e.kind === 'edit' || e.kind === 'history') this.#buildChannelButtons();
   }
 
@@ -807,6 +852,7 @@ export class WaveformView {
         const [a, b] = [...pointers.values()];
         pinch = { dist: Math.abs(a.x - b.x) || 1, mid: (a.x + b.x) / 2, view: { ...this.doc.view } };
         if (drag?.started) this.doc.setSelection(drag.prev.start, drag.prev.end, { channels: drag.prev.channels });
+        clearTimeout(drag?.edgeTimer);
         drag = null;
         return;
       }
@@ -890,7 +936,7 @@ export class WaveformView {
       clearTimeout(longPress);
       drag.started = true;
       this.#dragTo(drag, x);
-      this.#edgeScroll(x);
+      this.#edgeScroll(drag, x);
     });
 
     const finish = (e, cancelled) => {
@@ -898,6 +944,7 @@ export class WaveformView {
       if (pointers.size < 2) pinch = null;
       clearTimeout(longPress);
       if (!drag) return;
+      clearTimeout(drag.edgeTimer);
       if (drag.layer) {
         drag.layer.pointer(e, cancelled ? 'cancel' : 'up');
         drag = null;
@@ -977,20 +1024,35 @@ export class WaveformView {
     if (!this.app.engine.playing) this.doc.setCursor(Math.min(drag.anchor, f), { silent: true });
   }
 
-  #edgeScroll(x) {
-    const v = this.doc.view;
-    const span = v.end - v.start;
-    if (x < 0) this.doc.setView(v.start - span * 0.02, v.end - span * 0.02);
-    else if (x > this.width) this.doc.setView(v.start + span * 0.02, v.end + span * 0.02);
+  /**
+   * While a selection drag is held past the left or right edge, the view keeps
+   * scrolling (faster the further out the pointer is) and the selection follows,
+   * even when the pointer stops moving.
+   */
+  #edgeScroll(drag, x) {
+    drag.edgeX = x;
+    if (drag.edgeTimer) return;
+    const tick = () => {
+      drag.edgeTimer = 0;
+      const over = drag.edgeX < 0 ? drag.edgeX : drag.edgeX > this.width ? drag.edgeX - this.width : 0;
+      if (!over) return;
+      const v = this.doc.view;
+      const shift = (v.end - v.start) * 0.02 * Math.sign(over) * Math.min(2, Math.max(0.25, Math.abs(over) / 40));
+      this.doc.setView(v.start + shift, v.end + shift);
+      this.#dragTo(drag, drag.edgeX);
+      drag.edgeTimer = setTimeout(tick, 16);
+    };
+    tick();
   }
 
   #bindKeys() {
     this.surface.addEventListener('keydown', (e) => {
       if (e.metaKey || e.ctrlKey) return;
       const doc = this.doc;
-      const step = e.altKey ? 1 : Math.max(1, Math.round(this.fpp * (e.shiftKey ? 1 : 10)));
+      const step = Math.max(1, Math.round(this.fpp * (e.shiftKey ? 1 : 10)));
       let handled = true;
-      if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+      // Alt+Left/Right are Move Playhead to Previous/Next, as in the Multitrack editor.
+      if ((e.key === 'ArrowLeft' || e.key === 'ArrowRight') && !e.altKey) {
         const dir = e.key === 'ArrowLeft' ? -1 : 1;
         if (e.shiftKey) {
           const sel = doc.selection;
@@ -1000,7 +1062,11 @@ export class WaveformView {
           const next = Math.max(0, Math.min(doc.length, moving + dir * Math.max(1, Math.round(this.fpp * 10))));
           doc.setSelection(anchor, next);
           doc.setCursor(next, { silent: true });
-        } else this.seek(doc.cursor + dir * step);
+        } else {
+          // While this file plays, step from the moving playhead, not from where playback started.
+          const from = this.app.engine.playing && this.app.active === doc ? this.app.playhead : doc.cursor;
+          this.seek(from + dir * step);
+        }
       } else if (e.key === 'Escape') doc.setSelection(doc.cursor, doc.cursor);
       else handled = false;
       if (handled) {
@@ -1080,6 +1146,7 @@ export class WaveformView {
   destroy() {
     this.offDoc();
     this.offPrefs();
+    this.offActive();
     window.removeEventListener('themechange', this.onTheme);
     this.resizeObserver.disconnect();
     this.renderer.dispose();

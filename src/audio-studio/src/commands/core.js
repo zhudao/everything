@@ -92,6 +92,9 @@ async function newAudioDialog(app, { title = 'New Audio File', name } = {}) {
   return { name: nameInput.value.trim() || 'Untitled', sampleRate: Number(rate.value), channels: Number(channels.value), bitDepth: Number(bits.value) };
 }
 
+/** Longest silence Insert Silence adds (s): far beyond real use, short of what stalls the tab. */
+export const MAX_INSERT_SECONDS = 24 * 3600;
+
 async function durationDialog(app, title, label) {
   const doc = audio(app);
   const input = h('input.input', { type: 'text', value: app.formatTime(doc.sampleRate, doc.sampleRate), 'aria-label': label, style: { width: '160px' } });
@@ -107,6 +110,10 @@ async function durationDialog(app, title, label) {
   const frames = parseTime(input.value, doc.sampleRate, app.prefs.get('timeFormat'), app.timeOptions());
   if (!Number.isFinite(frames) || frames <= 0) {
     app.notify('Enter a duration greater than zero.', { error: true });
+    return null;
+  }
+  if (frames > MAX_INSERT_SECONDS * doc.sampleRate) {
+    app.notify('Enter a duration of 24 hours or less.', { error: true });
     return null;
   }
   return frames;
@@ -143,7 +150,9 @@ export function installCoreCommands(app) {
   const C = app.commands;
   const markersOf = (args) => {
     const doc = audio(app);
-    const ids = args?.ids?.length ? args.ids : app.selectedMarkerIds?.() || [];
+    // The Markers panel's selection; without that panel (it is created when first shown),
+    // the markers selected on the editor's time ruler.
+    const ids = args?.ids?.length ? args.ids : app.selectedMarkerIds?.() || [...(app.currentView?.()?.selectedMarkers || [])];
     return doc ? doc.state.markers.filter((m) => ids.includes(m.id)) : [];
   };
 
@@ -252,7 +261,11 @@ export function installCoreCommands(app) {
         const doc = app.active;
         if (!(await confirmDialog({ title: 'Revert', message: `Discard all changes to "${doc.name}" since it was last saved?`, confirm: 'Revert', danger: true }))) return;
         const i = doc.history.entries.findIndex((e) => e.state === doc.savedState);
-        doc.history.goTo(i >= 0 ? i : 0);
+        if (i >= 0) doc.history.goTo(i);
+        // The saved state can be gone from the history (cleared, trimmed, or
+        // rewritten by marker changes kept out of it): restore it as a new step.
+        else if (doc.savedState && doc.apply) doc.apply('Revert', doc.savedState);
+        else doc.history.goTo(0);
       },
     },
     {
@@ -330,11 +343,13 @@ export function installCoreCommands(app) {
       enabled: (a) => hasAudio(a) && a.clipboard?.type === 'audio',
       run: async () => {
         const doc = audio(app);
-        const clip = await conformRate(app.clipboard, doc.sampleRate);
+        // The clipboard as it was when Paste ran (another can be chosen while a clip is resampled).
+        const source = app.clipboard;
+        const clip = await conformRate(source, doc.sampleRate);
         const n = clip.channels[0]?.length ?? 0;
         const at = doc.hasSelection ? doc.selection.start : doc.cursor;
         let state = doc.hasSelection ? E.replaceRange(doc.state, doc.selection.start, doc.selection.end, clip, doc.channelMask) : E.insertClip(doc.state, at, clip, doc.channelMask);
-        if (!doc.channelMask) state = withClipMarkers(app, state, app.clipboard, at, app.clipboard.sampleRate);
+        if (!doc.channelMask) state = withClipMarkers(app, state, source, at, source.sampleRate);
         doc.apply('Paste', state, { selection: { start: at, end: at + n }, cursor: at });
       },
     },
@@ -371,7 +386,8 @@ export function installCoreCommands(app) {
       run: async (a, args) => {
         const doc = audio(app);
         // args.seconds (a recorded favorite) inserts without asking.
-        const frames = args?.seconds > 0 ? Math.round(args.seconds * doc.sampleRate) : await durationDialog(app, 'Insert Silence', 'Duration');
+        const seconds = Math.min(MAX_INSERT_SECONDS, args?.seconds);
+        const frames = seconds > 0 ? Math.round(seconds * doc.sampleRate) : await durationDialog(app, 'Insert Silence', 'Duration');
         if (!frames) return;
         const at = doc.hasSelection ? doc.selection.start : doc.cursor;
         doc.apply('Insert Silence', E.insertSilence(doc.state, at, frames), { selection: { start: at, end: at + frames } });
@@ -540,7 +556,7 @@ export function installCoreCommands(app) {
       enabled: hasAudio,
       run: () => {
         const doc = audio(app);
-        const at = app.playhead - 1;
+        const at = app.playhead;
         const prev = doc.state.markers.flatMap((m) => [m.start, m.start + m.duration]).filter((f) => f < at).sort((a, b) => b - a)[0] ?? 0;
         app.currentView?.()?.seek(prev);
       },
@@ -552,7 +568,7 @@ export function installCoreCommands(app) {
       enabled: hasAudio,
       run: () => {
         const doc = audio(app);
-        const at = app.playhead + 1;
+        const at = app.playhead;
         const next = doc.state.markers.flatMap((m) => [m.start, m.start + m.duration]).filter((f) => f > at).sort((a, b) => a - b)[0] ?? doc.length;
         app.currentView?.()?.seek(next);
       },
@@ -591,7 +607,7 @@ export function installCoreCommands(app) {
         doc.apply('Silence', E.silenceRange(doc.state, doc.selection.start, doc.selection.end, doc.channelMask));
       },
     },
-    { id: 'fx.applyLast', label: (a) => (a.lastCommand ? `Repeat ${C.label(a.lastCommand.id)}` : 'Repeat Last Effect'), enabled: (a) => Boolean(a.lastCommand), run: () => C.run('edit.repeatNoDialog') },
+    { id: 'fx.applyLast', label: (a) => (a.lastCommand ? `Repeat ${String(C.label(a.lastCommand.id)).replace(/(\.\.\.|\u2026)$/, '')}` : 'Repeat Last Effect'), enabled: (a) => Boolean(a.lastCommand), run: () => C.run('edit.repeatNoDialog') },
 
     // ---------------------------------------------------------------- View
     {
@@ -734,7 +750,9 @@ export function installCoreCommands(app) {
       enabled: anyDoc,
       run: () => {
         const doc = app.active;
-        const at = app.playhead - doc.sampleRate * 0.05;
+        // While playing, a stop just passed (within 50 ms) is skipped so pressing Previous again
+        // goes on to the one before it; when stopped the playhead sits exactly on its stop.
+        const at = app.engine.playing ? app.playhead - doc.sampleRate * 0.05 : app.playhead;
         const stops = [0, ...(doc.state?.markers || []).flatMap((m) => [m.start, m.start + m.duration])];
         if (doc.hasSelection) stops.push(doc.selection.start, doc.selection.end);
         const prev = stops.filter((f) => f < at).sort((a, b) => b - a)[0] ?? 0;
@@ -748,7 +766,7 @@ export function installCoreCommands(app) {
       enabled: anyDoc,
       run: () => {
         const doc = app.active;
-        const at = app.playhead + 1;
+        const at = app.playhead;
         const stops = [doc.length, ...(doc.state?.markers || []).flatMap((m) => [m.start, m.start + m.duration])];
         if (doc.hasSelection) stops.push(doc.selection.start, doc.selection.end);
         const next = stops.filter((f) => f > at).sort((a, b) => a - b)[0] ?? doc.length;

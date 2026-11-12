@@ -147,6 +147,8 @@ describe('autosave controller', () => {
     doc.on('change', (e) => app.emit('doc-change', doc, e));
     await ctl.run();
     expect((await store.list()).length).toBe(0); // clean documents are not saved
+    const list = [{ id: 'iXML', bytes: Uint8Array.of(60, 0, 255, 62) }];
+    doc.info.wavChunks = { sampleRate: 48000, channels: 1, frames: 5000, list };
     doc.apply('Edit', { ...doc.state, meta: { artist: 'A' } });
     await ctl.run();
     const saved = await store.list();
@@ -163,6 +165,10 @@ describe('autosave controller', () => {
     expect(docs[0].dirty).toBe(true);
     expect(docs[0].length).toBe(5000);
     expect(docs[0].state.meta).toEqual({ artist: 'A' });
+    // The iXML and other chunks kept for the next WAV save are recovered too.
+    const kept = docs[0].info.wavChunks;
+    expect(kept).toMatchObject({ sampleRate: 48000, channels: 1, frames: 5000 });
+    expect(kept.list.map((c) => [c.id, Array.from(c.bytes)])).toEqual([['iXML', [60, 0, 255, 62]]]);
     expect((await store.list()).filter((m) => m.session === ctl.session)).toHaveLength(0);
     // Saving the recovered file removes its new autosave entry.
     await ctl2.run();
@@ -172,5 +178,34 @@ describe('autosave controller', () => {
     await new Promise((r) => setTimeout(r, 10));
     expect((await store.list()).length).toBe(0);
     ctl2.destroy();
+  });
+
+  it('leaves no recovery copy of a document closed or saved while its autosave was being written', async () => {
+    const root = new MemDir();
+    const store = new AutosaveStore(async () => root);
+    const app = fakeApp();
+    const ctl = installAutosave(app, { store, interval: 1e9 });
+    const doc = docWith('Closed.wav', 600000);
+    app.documents.push(doc);
+    doc.on('change', (e) => app.emit('doc-change', doc, e));
+    doc.apply('Edit', { ...doc.state, meta: { artist: 'A' } });
+    // Closed (without saving) while the write is in progress.
+    const pending = ctl.run();
+    await new Promise((r) => setTimeout(r, 0));
+    app.documents.length = 0;
+    app.emit('documents');
+    await pending;
+    expect(await store.list()).toHaveLength(0);
+    // Saved while the write is in progress.
+    const doc2 = docWith('Saved.wav', 600000);
+    app.documents.push(doc2);
+    doc2.on('change', (e) => app.emit('doc-change', doc2, e));
+    doc2.apply('Edit', { ...doc2.state, meta: { artist: 'B' } });
+    const pending2 = ctl.run();
+    await new Promise((r) => setTimeout(r, 0));
+    doc2.markSaved();
+    await pending2;
+    expect(await store.list()).toHaveLength(0);
+    ctl.destroy();
   });
 });

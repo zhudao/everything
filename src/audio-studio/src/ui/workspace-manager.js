@@ -128,8 +128,8 @@ function editDialog(app) {
   let groups = workspaceGroups(app);
   let custom = { ...(prefs.get('customWorkspaces') || {}) };
   let selected = prefs.get('workspace');
-  const renames = [];
-  const deleted = new Set();
+  // Renames and deletions in the order they were made: a name can be deleted and reused.
+  const changes = [];
   const list = h('div.ws-list', { role: 'listbox', 'aria-label': 'Workspaces', tabindex: '0' });
   const note = h('p.dlg-note.ws-note', icon('info', 14), h('span', `Drag workspaces into the order and place you want, or use the arrow buttons. Up to ${TAB_LIMIT} fit on the toolbar.`));
   const all = () => [...groups.bar, ...groups.overflow, ...groups.hidden];
@@ -157,7 +157,7 @@ function editDialog(app) {
       if (!groups[g.id].length) rows.push(h('div.ws-empty.faint', { dataset: { group: g.id } }, 'Drop a workspace here'));
       for (const name of groups[g.id]) {
         const isCustom = !WORKSPACES[name];
-        const row = h('div.ws-row', { role: 'option', draggable: 'true', 'aria-selected': String(name === selected), dataset: { name } }, icon('grip-vertical', 14), h('span.ws-name', name), isCustom ? h('span.faint', '(custom)') : null);
+        const row = h('div.ws-row', { role: 'option', id: `ws-option-${rows.length}`, draggable: 'true', 'aria-selected': String(name === selected), dataset: { name } }, icon('grip-vertical', 14), h('span.ws-name', name), isCustom ? h('span.faint', '(custom)') : null);
         row.addEventListener('click', () => {
           selected = name;
           render();
@@ -180,6 +180,10 @@ function editDialog(app) {
       }
     }
     list.replaceChildren(...rows);
+    // Focus stays on the list: name the selected workspace to screen readers.
+    const current = rows.find((r) => r.dataset.name === selected);
+    if (current) list.setAttribute('aria-activedescendant', current.id);
+    else list.removeAttribute('aria-activedescendant');
     for (const empty of list.querySelectorAll('.ws-empty')) {
       empty.addEventListener('dragover', (e) => dragging && e.preventDefault());
       empty.addEventListener('drop', (e) => {
@@ -216,7 +220,7 @@ function editDialog(app) {
     const n = next.trim();
     groups = Object.fromEntries(Object.entries(groups).map(([k, v]) => [k, v.map((x) => (x === name ? n : x))]));
     custom = renameKey(custom, name, n);
-    renames.push([name, n]);
+    changes.push(['rename', name, n]);
     selected = n;
     render();
   });
@@ -225,7 +229,7 @@ function editDialog(app) {
     if (!(await confirmDialog({ title: 'Delete Workspace', message: `Delete the workspace "${name}"?`, confirm: 'Delete', danger: true }))) return;
     groups = Object.fromEntries(Object.entries(groups).map(([k, v]) => [k, v.filter((x) => x !== name)]));
     delete custom[name];
-    deleted.add(name);
+    changes.push(['delete', name]);
     render();
   });
   render();
@@ -244,14 +248,16 @@ function editDialog(app) {
     let layouts = { ...(prefs.get('layouts') || {}) };
     let saved = { ...(prefs.get('savedLayouts') || {}) };
     let current = prefs.get('workspace');
-    for (const [from, to] of renames) {
-      layouts = renameKey(layouts, from, to);
-      saved = renameKey(saved, from, to);
-      if (current === from) current = to;
-    }
-    for (const name of deleted) {
-      delete layouts[name];
-      delete saved[name];
+    for (const [kind, from, to] of changes) {
+      if (kind === 'rename') {
+        layouts = renameKey(layouts, from, to);
+        saved = renameKey(saved, from, to);
+        if (current === from) current = to;
+      } else {
+        delete layouts[from];
+        delete saved[from];
+        if (current === from) current = null;
+      }
     }
     const order = all();
     prefs.set('customWorkspaces', custom);
@@ -260,7 +266,7 @@ function editDialog(app) {
     prefs.set('workspaceOrder', order);
     prefs.set('workspaceTabs', groups.bar.slice());
     prefs.set('workspaceHidden', groups.hidden.slice());
-    if (deleted.has(current)) current = order[0];
+    if (!current || !order.includes(current)) current = order[0];
     app.setWorkspace(current);
   });
 }

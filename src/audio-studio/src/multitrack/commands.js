@@ -15,7 +15,7 @@ import { pickLocalFiles, saveDocument, downloadBlob } from '../storage/files.js'
 import { AUDIO_ACCEPT, VIDEO_EXTENSIONS, baseName } from '../audio/decode.js';
 import { videoClip } from '../model/session-video.js';
 import * as puter from '../storage/puter.js';
-import { insertDocs, insertFiles, linkSource, newTrack, channelsAtRate, placementOptions, freeTrackShift } from './insert.js';
+import { insertDocs, insertFiles, linkSource, newTrack, channelsAtRate, placementOptions, freeTrackShift, shownAudioTracks, trackChannelsFor } from './insert.js';
 import { renderSession, renderedDoc, clipsRange } from './render.js';
 import { saveSession, exportSession, sessionZip } from './storage.js';
 import { prepareVideoBytes } from '../video/session-media.js';
@@ -39,6 +39,11 @@ import { templateFromState, stateFromTemplate, userTemplates, saveTemplate, dele
 
 const session = (app) => (app.active?.kind === 'session' ? app.active : null);
 const hasSession = (app) => Boolean(session(app));
+/** For commands run by track controls with arguments: off without them (command search, shortcuts). */
+const hasArgs =
+  (...keys) =>
+  (app, args) =>
+    hasSession(app) && keys.every((k) => args?.[k] != null);
 const selected = (app) => session(app)?.clipSelection || [];
 const hasClips = (app) => selected(app).length > 0;
 const hasTimeSel = (app) => Boolean(session(app)?.hasSelection);
@@ -48,6 +53,8 @@ const selTrack = (app, args) => {
   return S.findTrack(doc.state, args?.id || doc.selectedTrack);
 };
 const view = (app) => app.currentView?.();
+/** False once a session was closed (while a command awaited audio work): it must not be reopened. */
+const isOpen = (app, doc) => app.documents.includes(doc);
 const audioDoc = (app) => (app.active?.kind === 'audio' ? app.active : null);
 
 const COLOR_NAMES = ['Green', 'Blue', 'Amber', 'Red', 'Violet', 'Cyan', 'Pink', 'Lime', 'Orange', 'Indigo', 'Olive', 'Slate'];
@@ -204,12 +211,11 @@ async function matchLoudnessDialog(app, doc, clips) {
   });
   if (r !== 'ok') return;
   const t = Number(target.value);
-  let state = doc.state;
+  const gains = new Map();
   clips.forEach((c, i) => {
-    if (!Number.isFinite(levels[i])) return;
-    state = S.updateClips(state, [c.id], { gain: Math.max(-48, Math.min(24, Math.round((c.gain + t - levels[i]) * 10) / 10)) });
+    if (Number.isFinite(levels[i])) gains.set(c.id, Math.max(-48, Math.min(24, Math.round((c.gain + t - levels[i]) * 10) / 10)));
   });
-  doc.apply('Match Clip Loudness', state);
+  doc.apply('Match Clip Loudness', S.updateClips(doc.state, [...gains.keys()], (c) => ({ gain: gains.get(c.id) })));
 }
 
 /** The metronome sound a session uses: its own choice, else the last one picked. */
@@ -354,6 +360,7 @@ async function speechAlign(app, doc) {
     if (err?.name === 'AbortError') return;
     throw err;
   }
+  if (!isOpen(app, doc)) return;
   const file = new AudioFile({ name: app.uniqueName(`${o.unaligned.name} Aligned`, '.wav'), sampleRate: doc.sampleRate, channels: result.channels.map((d) => Channel.fromSamples(d)) });
   app.addDocument(file, { activate: false });
   app.activate(doc);
@@ -403,14 +410,16 @@ async function targetSession(app, rate) {
 /** Clips cut/copied from a session: { type: 'clips', sampleRate, clips (relative), pool } */
 function clipboardFrom(doc, clips, range) {
   const t0 = range ? range[0] : Math.min(...clips.map((c) => c.start));
-  const audio = S.audioTracks(doc.state);
+  // Track offsets count shown tracks, as pasting does (clips never land on hidden tracks).
+  const audio = shownAudioTracks(doc.state);
   const idx = new Map(audio.map((t, i) => [t.id, i]));
-  const firstTrack = Math.min(...clips.map((c) => idx.get(c.trackId) ?? 0));
   let parts = clips;
   if (range) {
     const s = S.trimClipsToRange({ ...doc.state, clips: clips.map((c) => ({ ...c, locked: false })) }, clips.map((c) => c.id), range[0], range[1], (id) => doc.sourceLength(id));
     parts = s.clips.filter((c) => c.start < range[1] && S.clipEnd(c) > range[0]);
   }
+  // Track offsets count from the top track of what is copied (selected clips outside the range are not).
+  const firstTrack = Math.min(...parts.map((c) => idx.get(c.trackId) ?? 0));
   const pool = new Map();
   for (const c of parts) {
     pool.set(c.sourceId, doc.pool.get(c.sourceId));
@@ -434,7 +443,7 @@ function clipboardFrom(doc, clips, range) {
 async function pasteClips(app, doc, clip) {
   const at = doc.cursor;
   let state = doc.state;
-  const audio = () => S.audioTracks(state);
+  const audio = () => shownAudioTracks(state);
   let base = audio().findIndex((t) => t.id === doc.selectedTrack);
   if (base < 0) base = 0;
   const ids = [];
@@ -446,18 +455,19 @@ async function pasteClips(app, doc, clip) {
   if (clip.type === 'audio') {
     // Waveform audio becomes a new file in the Files panel and a clip.
     const channels = clip.sampleRate === doc.sampleRate ? clip.channels : await channelsAtRate(clip.channels, clip.sampleRate, doc.sampleRate);
+    if (!isOpen(app, doc)) return;
     const file = new AudioFile({ name: app.uniqueName('Pasted Audio', '.wav'), sampleRate: doc.sampleRate, channels });
     app.addDocument(file, { activate: false });
     app.activate(doc);
     const sourceId = await linkSource(doc, file);
     let track = audio()[base];
     while (!track) {
-      const made = newTrack(state, { channels: Math.min(2, channels.length) });
+      const made = newTrack(state, { channels: trackChannelsFor(state, channels.length) });
       state = made.state;
       track = audio()[base];
     }
     const c = S.createClip({ trackId: track.id, sourceId, name: baseName(file.name), start: at, length: channels[0].length });
-    state = S.addClips(state, [c]);
+    state = S.addClipsOnTop(state, [c]);
     ids.push(c.id);
   } else {
     for (const [id, src] of clip.pool) if (src && !doc.pool.has(id)) doc.pool.set(id, src);
@@ -465,15 +475,18 @@ async function pasteClips(app, doc, clip) {
       app.notify('Clips copied from a session at another sample rate cannot be pasted here.', { error: true });
       return;
     }
+    const pasted = [];
     for (const c of clip.clips) {
       while (!audio()[base + c.trackOffset]) {
         const made = newTrack(state, {});
         state = made.state;
       }
       const n = S.createClip({ ...c, id: undefined, trackId: audio()[base + c.trackOffset].id, start: at + c.start });
-      state = S.addClips(state, [n]);
+      pasted.push(n);
       ids.push(n.id);
     }
+    // Pasted clips come to the front, like clips placed by a move.
+    state = S.addClipsOnTop(state, pasted);
   }
   doc.apply('Paste', state, { clips: ids });
 }
@@ -595,13 +608,14 @@ export function installMultitrackCommands(app) {
     },
     run: () => {
       const doc = session(app);
-      let state = doc.state;
-      for (const c of doc.clipSelection) {
-        const f = dir === 'in' ? c.fadeIn : c.fadeOut;
+      const key = dir === 'in' ? 'fadeIn' : 'fadeOut';
+      const crossfading = new Set(S.activeCrossfades(doc.state).map((x) => (dir === 'in' ? x.in : x.out)));
+      const state = S.updateClips(doc.state, [...doc.selectedClips], (c) => {
+        const f = c[key];
         // A crossfading end keeps its overlap length; the curve shapes the crossfade.
-        const length = f.length || (S.fadeMode(state, c, dir) === 'crossfade' ? 0 : S.defaultFadeLength(c, doc.sampleRate));
-        state = S.setFade(state, [c.id], dir, { curve: S.FADE_CURVES[kind.toLowerCase()], length });
-      }
+        const length = f.length || (crossfading.has(c.id) ? 0 : S.defaultFadeLength(c, doc.sampleRate));
+        return { [key]: { ...f, curve: S.FADE_CURVES[kind.toLowerCase()], length: Math.max(0, Math.min(c.length, Math.round(length))) } };
+      });
       doc.apply(dir === 'in' ? 'Fade In' : 'Fade Out', state);
     },
   });
@@ -681,12 +695,14 @@ export function installMultitrackCommands(app) {
       name = 'Clip Bounce';
       after = clips[clips.length - 1]?.trackId || after;
     }
-    const { data } = await rendered('Bouncing', o);
+    // The new track plays through the master, so the bounce leaves the master out.
+    const { data } = await rendered('Bouncing', { ...o, master: false });
     const file = renderedDoc(app, doc, data, name);
     app.addDocument(file, { activate: false });
     const sourceId = await linkSource(doc, file);
     const afterTrack = S.findTrack(doc.state, after);
-    const made = newTrack(doc.state, { name: baseName(file.name), afterId: afterTrack?.type === 'audio' ? after : undefined });
+    // A 5.1 render goes on a 5.1 track, which plays all six channels.
+    const made = newTrack(doc.state, { name: baseName(file.name), channels: data.length === 6 ? 6 : 2, afterId: afterTrack?.type === 'audio' ? after : undefined });
     const clip = S.createClip({ trackId: made.track.id, sourceId, name: baseName(file.name), start: o.start, length: data[0].length });
     doc.apply('Bounce to New Track', S.addClips(made.state, [clip]), { clips: [clip.id] });
     doc.selectTrack(made.track.id);
@@ -817,11 +833,11 @@ export function installMultitrackCommands(app) {
         if (name && name.trim() && name.trim() !== t.name) doc.apply('Rename Track', S.updateTrack(doc.state, t.id, { name: name.trim() }));
       },
     },
-    { id: 'mt.setTrackInput', label: 'Track Input', enabled: hasSession, run: (a, args) => session(app).apply('Track Input', S.updateTrack(session(app).state, args.id, { input: args.input })) },
+    { id: 'mt.setTrackInput', label: 'Track Input', enabled: hasArgs('id', 'input'), run: (a, args) => session(app).apply('Track Input', S.updateTrack(session(app).state, args.id, { input: args.input })) },
     {
       id: 'mt.setTrackOutput',
       label: 'Track Output',
-      enabled: hasSession,
+      enabled: hasArgs('id', 'output'),
       run: (a, args) => {
         const doc = session(app);
         if (args.output !== 'master' && S.wouldCycle(doc.state, args.id, args.output)) {
@@ -838,8 +854,8 @@ export function installMultitrackCommands(app) {
       const show = !t.showAutomation;
       doc.amendView((st) => S.updateTrack(st, t.id, { showAutomation: show }));
     } },
-    { id: 'mt.setAutomationMode', label: 'Automation Mode', enabled: hasSession, run: (a, args) => session(app).apply(`Automation ${args.mode[0].toUpperCase()}${args.mode.slice(1)}`, S.updateTrack(session(app).state, args.id, { mode: args.mode })) },
-    { id: 'mt.setAutomationParam', label: 'Automation Parameter', enabled: hasSession, run: (a, args) => session(app).amendView((st) => S.updateTrack(st, args.id, { autoParam: args.param, showAutomation: true })) },
+    { id: 'mt.setAutomationMode', label: 'Automation Mode', enabled: hasArgs('id', 'mode'), run: (a, args) => session(app).apply(`Automation ${args.mode[0].toUpperCase()}${args.mode.slice(1)}`, S.updateTrack(session(app).state, args.id, { mode: args.mode })) },
+    { id: 'mt.setAutomationParam', label: 'Automation Parameter', enabled: hasArgs('id', 'param'), run: (a, args) => session(app).amendView((st) => S.updateTrack(st, args.id, { autoParam: args.param, showAutomation: true })) },
     {
       id: 'mt.insertFiles',
       label: 'Insert Files...',
@@ -1050,9 +1066,12 @@ export function installMultitrackCommands(app) {
         const [a, b] = clipsRange(clips);
         const trackId = clips[0].trackId;
         const graphClips = new Set(clips.map((c) => c.id));
-        // Render only these clips through clip gain, fades and envelopes (not the track).
-        const tmp = { ...doc.state, tracks: doc.state.tracks.map((t) => (t.id === trackId ? { ...t, volume: 0, pan: 0, fx: [], mode: 'off', mute: false, solo: false, output: 'master' } : t)) };
-        const data = await renderSession(app, doc, { state: tmp, start: a, end: b, clipIds: graphClips, trackId, label: 'Merging clips' });
+        // Render only these clips through clip gain, fades and envelopes (not the track): the
+        // merged clip still plays through the track's EQ, polarity and pan, so they stay out.
+        const dry = { volume: 0, pan: 0, fx: [], mode: 'off', mute: false, solo: false, output: 'master', invert: false, eq: { on: false, values: {} }, sends: [] };
+        const tmp = { ...doc.state, tracks: doc.state.tracks.map((t) => (t.id === trackId ? { ...t, ...dry } : t)) };
+        const data = await renderSession(app, doc, { state: tmp, start: a, end: b, clipIds: graphClips, trackId, master: false, label: 'Merging clips' });
+        if (!isOpen(app, doc)) return;
         const file = renderedDoc(app, doc, data, `${clips[0].name} Merged`);
         app.addDocument(file, { activate: false });
         app.activate(doc);
@@ -1075,6 +1094,7 @@ export function installMultitrackCommands(app) {
         const doc = session(app);
         await stretchIdle(doc);
         await remixIdle(doc);
+        if (!isOpen(app, doc)) return;
         let state = doc.state;
         const made = [];
         for (const c of doc.clipSelection) {
@@ -1134,9 +1154,9 @@ export function installMultitrackCommands(app) {
       enabled: hasClips,
       run: () => {
         const doc = session(app);
-        let s = doc.state;
-        for (const c of doc.clipSelection) if (app.playhead > c.start && app.playhead < S.clipEnd(c)) s = S.trimClip(s, c.id, 'in', app.playhead, doc.sourceLength(c.sourceId));
-        doc.apply('Trim Start', s);
+        const at = app.playhead;
+        const under = doc.clipSelection.filter((c) => at > c.start && at < S.clipEnd(c)).map((c) => c.id);
+        doc.apply('Trim Start', S.trimClipsAt(doc.state, under, 'in', at, (id) => doc.sourceLength(id)));
       },
     },
     {
@@ -1145,13 +1165,24 @@ export function installMultitrackCommands(app) {
       enabled: hasClips,
       run: () => {
         const doc = session(app);
-        let s = doc.state;
-        for (const c of doc.clipSelection) if (app.playhead > c.start && app.playhead < S.clipEnd(c)) s = S.trimClip(s, c.id, 'out', app.playhead, doc.sourceLength(c.sourceId));
-        doc.apply('Trim End', s);
+        const at = app.playhead;
+        const under = doc.clipSelection.filter((c) => at > c.start && at < S.clipEnd(c)).map((c) => c.id);
+        doc.apply('Trim End', S.trimClipsAt(doc.state, under, 'out', at, (id) => doc.sourceLength(id)));
       },
     },
     { id: 'clip.lock', label: 'Lock in Time', enabled: hasClips, checked: allSelected('locked'), run: toggleSelected('locked', 'Lock Clip', 'Unlock Clip') },
-    { id: 'clip.loop', label: 'Loop', enabled: hasClips, checked: allSelected('loop'), run: toggleSelected('loop', 'Loop Clip', 'Unloop Clip') },
+    {
+      id: 'clip.loop',
+      label: 'Loop',
+      enabled: hasClips,
+      checked: allSelected('loop'),
+      run: (a, args) => {
+        const doc = session(app);
+        const clips = clipsArg(doc, args);
+        const v = !clips.every((c) => c.loop);
+        doc.apply(v ? 'Loop Clip' : 'Unloop Clip', S.setClipsLoop(doc.state, clips.map((c) => c.id), v, (id) => doc.sourceLength(id)));
+      },
+    },
     { id: 'clip.mute', label: 'Mute', enabled: hasClips, checked: allSelected('mute'), run: toggleSelected('mute', 'Mute Clip', 'Unmute Clip') },
     { id: 'clip.gain', label: 'Clip Gain...', enabled: hasClips, run: () => clipGainDialog(app, session(app), selected(app)) },
     { id: 'clip.matchLoudness', label: 'Match Clip Loudness...', enabled: hasClips, run: () => matchLoudnessDialog(app, session(app), selected(app)) },

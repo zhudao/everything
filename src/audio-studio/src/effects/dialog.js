@@ -15,7 +15,7 @@ import { paramControls as buildControls } from './param-ui.js';
 import { channelNames, defaultRoute, routeSummary, rememberRoute, recallRoute, sameRoute } from './routing.js';
 import { allPresets, savePreset, deletePreset, matchPreset, lastValues } from './presets.js';
 import { editorFor } from './displays.js';
-import { isRealtime } from './apply.js';
+import { isRealtime, latencyFrames } from './apply.js';
 
 const CUSTOM = '\u0000custom';
 
@@ -40,12 +40,15 @@ export function paramControls(def, getValues, onSet, opts = {}) {
  * Returns a function that dismisses the prompt.
  */
 export function inlinePrompt(bar, { label, value = '', onSave, returnFocus }) {
+  // A new prompt in the same bar replaces the open one (and its key handler).
+  bar.fxPromptDismiss?.();
   const input = h('input.input', { type: 'text', value, 'aria-label': label.replace(/:$/, '') });
   const error = h('span.fx-name-error', { role: 'alert' });
   let open = true;
   const done = (refocus = true) => {
     if (!open) return;
     open = false;
+    if (bar.fxPromptDismiss === dismiss) bar.fxPromptDismiss = null;
     window.removeEventListener('keydown', keys, true);
     bar.hidden = true;
     bar.replaceChildren();
@@ -72,7 +75,9 @@ export function inlinePrompt(bar, { label, value = '', onSave, returnFocus }) {
   bar.hidden = false;
   input.focus();
   input.select();
-  return () => done(false);
+  const dismiss = () => done(false);
+  bar.fxPromptDismiss = dismiss;
+  return dismiss;
 }
 
 /** Input and output level bars (L/R each) fed while the dialog is open. */
@@ -123,6 +128,7 @@ export function openEffectDialog(app, def, { mode = 'apply', values: initial, ti
   const routable = mode === 'apply' && Boolean(routing) && channelCount === 2;
   let route = routable ? recallRoute(def.id) || defaultRoute(doc.channelMask) : null;
   let previewing = false;
+  let restarting = false;
   const realtime = isRealtime(def);
   const groups = linkGroups(def);
   const subscribers = new Set();
@@ -167,8 +173,8 @@ export function openEffectDialog(app, def, { mode = 'apply', values: initial, ti
     values = normalizeValues(def, next);
     changed(null);
   }
-  // The Preview Editor follows the settings of effects about to be applied to a file.
-  const announceValues = (v) => mode === 'apply' && doc && app.emit('effect-values', v && { def, values: v, doc });
+  // The Preview Editor follows the settings (and channel map) of effects about to be applied to a file.
+  const announceValues = (v) => mode === 'apply' && doc && app.emit('effect-values', v && { def, values: v, doc, route });
   function changed(from) {
     controls?.refresh(values, from);
     subscribers.forEach((fn) => fn(values));
@@ -224,7 +230,9 @@ export function openEffectDialog(app, def, { mode = 'apply', values: initial, ti
   } }, icon('save', 15));
   const favBtn = app.favorites
     ? h('button.icon-btn', { type: 'button', 'aria-label': 'Save settings as a favorite', title: 'Save settings as a favorite', onclick: () => {
-        askName('Favorite name:', def.name, (name) => {
+        askName('Favorite name:', def.name, (text) => {
+          const name = String(text || '').trim();
+          if (!name) throw new Error('Enter a favorite name.');
           app.favorites.addEffect(name, def.id, values);
           announce(`Favorite ${name} saved`);
         });
@@ -233,7 +241,7 @@ export function openEffectDialog(app, def, { mode = 'apply', values: initial, ti
   // Channel map: which channels feed the effect and which receive its output.
   const mapPanel = h('div.fx-popover.fx-chmap', { hidden: true, role: 'group', 'aria-label': 'Channel map' });
   const summary = h('div.fx-route-summary');
-  const showRoute = () => (summary.textContent = routeSummary(route, channelCount));
+  const showRoute = () => (summary.textContent = routeSummary(route, channelCount, doc?.channelMask));
   const mapBtn = h('button.icon-btn.fx-map-btn', { type: 'button', 'aria-label': 'Channel map', 'aria-expanded': 'false', title: routable ? 'Channel map: choose the channels the effect reads and writes' : 'Channel routing is available for stereo files from the Effects menu', disabled: !routable, onclick: () => toggle(mapPanel, mapBtn, buildMap) }, icon('channel-map', 16));
   function buildMap() {
     const names = channelNames(2);
@@ -246,6 +254,7 @@ export function openEffectDialog(app, def, { mode = 'apply', values: initial, ti
     const set = (next) => {
       route = next;
       showRoute();
+      announceValues(values);
       if (previewing) pushPreview();
     };
     const inputs = [0, 1].map((c) => h('label.fx-chmap-cell', h('span.faint', full[c]), pick(route.in[c], [[0, `File ${names[0]}`], [1, `File ${names[1]}`], [-1, 'Silence']], (v) => set({ ...route, in: route.in.map((x, i) => (i === c ? v : x)) }), `Effect ${full[c].toLowerCase()} input`)));
@@ -288,7 +297,21 @@ export function openEffectDialog(app, def, { mode = 'apply', values: initial, ti
       panel.hidden = false;
       btn.setAttribute('aria-expanded', 'true');
     }
+    if (open) window.addEventListener('keydown', popoverKeys, true);
+    else window.removeEventListener('keydown', popoverKeys, true);
   }
+  // While one is open, Escape closes the channel map or info popover before the dialog
+  // (caught at the window, ahead of the dialog's own Escape, like the inline name prompt).
+  function popoverKeys(e) {
+    if (e.key !== 'Escape' || !(body.closest('.dialog') || body).contains(e.target) || nameBar.contains(e.target) || e.target.classList?.contains('hot-edit')) return;
+    const open = [[mapPanel, mapBtn], [infoPanel, infoBtn]].find(([pnl]) => !pnl.hidden);
+    if (!open) return;
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    toggle(...open);
+    open[1].focus();
+  }
+  cleanups.push(() => window.removeEventListener('keydown', popoverKeys, true));
 
   const presetBar = h('div.fx-presetbar', h('span.fx-label', 'Presets:'), presetSel, saveBtn, delBtn, h('span.fx-bar-sep', { 'aria-hidden': 'true' }), favBtn, h('span.spacer'), mapBtn, infoBtn);
   syncPresetSelect();
@@ -308,13 +331,26 @@ export function openEffectDialog(app, def, { mode = 'apply', values: initial, ti
     // Tabbed pages: each holds its sections (and the graphical editor when `editor` is set).
     const parts = [];
     const tabBtns = [];
+    const uid = `fxdlgtab${Math.random().toString(36).slice(2, 8)}`;
+    // One tab in the Tab order; arrow keys move between tabs (the ARIA tabs pattern).
+    const selectTab = (i, focus = false) => {
+      pages.forEach((pg, k) => (pg.hidden = k !== i));
+      tabBtns.forEach((b, k) => {
+        b.setAttribute('aria-selected', String(k === i));
+        b.tabIndex = k === i ? 0 : -1;
+      });
+      if (focus) tabBtns[i].focus();
+    };
     const pages = tabs.map((t, i) => {
       const c = paramControls(def, () => values, set, { ...ctlOpts, sections: t.sections || [] });
       parts.push(c);
-      const page = h('div.fx-tabpage', { role: 'tabpanel', hidden: i > 0, 'aria-label': t.label }, t.editor && editorEl ? h('div.fx-editor', editorEl) : null, c.el);
-      tabBtns.push(h('button.fx-tab', { type: 'button', role: 'tab', 'aria-selected': String(i === 0), onclick: () => {
-        pages.forEach((pg, k) => (pg.hidden = k !== i));
-        tabBtns.forEach((b, k) => b.setAttribute('aria-selected', String(k === i)));
+      const page = h('div.fx-tabpage', { role: 'tabpanel', id: `${uid}-p${i}`, 'aria-labelledby': `${uid}-t${i}`, hidden: i > 0 }, t.editor && editorEl ? h('div.fx-editor', editorEl) : null, c.el);
+      tabBtns.push(h('button.fx-tab', { type: 'button', role: 'tab', id: `${uid}-t${i}`, 'aria-controls': `${uid}-p${i}`, 'aria-selected': String(i === 0), tabindex: i === 0 ? '0' : '-1', onclick: () => selectTab(i), onkeydown: (e) => {
+        const d = e.key === 'ArrowRight' ? 1 : e.key === 'ArrowLeft' ? -1 : 0;
+        if (!d) return;
+        e.preventDefault();
+        e.stopPropagation();
+        selectTab((i + d + tabs.length) % tabs.length, true);
       } }, t.label));
       return page;
     });
@@ -344,7 +380,10 @@ export function openEffectDialog(app, def, { mode = 'apply', values: initial, ti
     loopBtn.setAttribute('aria-pressed', String(on));
     app.prefs.set('fxPreviewLoop', on);
     if (previewing) {
+      // Restart with the new loop setting; the stop in between does not end the preview.
+      restarting = true;
       app.stop();
+      restarting = false;
       startPlayback();
     }
   } }, icon('transport-loop', 15));
@@ -354,7 +393,14 @@ export function openEffectDialog(app, def, { mode = 'apply', values: initial, ti
 
   function pushPreview() {
     if (mode !== 'apply') return;
-    app.previewFx = previewing && realtime ? [slotSpec(def, values, { key: `preview:${def.id}`, enabled: power, doc, route })] : null;
+    let spec = null;
+    if (previewing && realtime) {
+      spec = slotSpec(def, values, { key: `preview:${def.id}`, enabled: power, doc, route });
+      // Its processing delay, which the file's playback graph compensates (decorateGraph).
+      const latency = doc ? latencyFrames(def, values, doc.sampleRate) : 0;
+      if (latency) spec.latency = latency;
+    }
+    app.previewFx = spec ? [spec] : null;
     app.syncGraph();
   }
   function startPlayback() {
@@ -382,7 +428,7 @@ export function openEffectDialog(app, def, { mode = 'apply', values: initial, ti
     if (!meterRaf) meterRaf = requestAnimationFrame(meterLoop);
   }
   const onTransport = (s) => {
-    if (s === 'stopped' && previewing) {
+    if (s === 'stopped' && previewing && !restarting) {
       setPreviewing(false);
       pushPreview();
       meters.set([0, 0], [0, 0]);

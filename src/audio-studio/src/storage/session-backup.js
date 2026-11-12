@@ -28,6 +28,8 @@ const VERSION = 1;
 const BLOCK = 1 << 16;
 /** Backups older than this are deleted on start whatever the count. */
 const MAX_AGE = 30 * 24 * 3600 * 1000;
+/** How long unreferenced media of another tab are kept: its backup may still be being written. */
+const IN_FLIGHT = 10 * 60 * 1000;
 
 const validKey = (k) => typeof k === 'string' && /^[a-z0-9-]+$/i.test(k);
 
@@ -109,8 +111,15 @@ export class SessionBackupStore {
 
   /** Writes one source revision (Channel objects) as float WAV. */
   async writeMedia(key, sampleRate, channels) {
-    const file = await (await this.#media()).getFileHandle(`${key}.wav`, { create: true });
-    const out = await file.createWritable();
+    const media = await this.#media();
+    const file = await media.getFileHandle(`${key}.wav`, { create: true });
+    let out;
+    try {
+      out = await file.createWritable();
+    } catch (err) {
+      await media.removeEntry(`${key}.wav`).catch(() => {});
+      throw err;
+    }
     try {
       const nch = channels.length;
       const frames = channels[0]?.length ?? 0;
@@ -129,6 +138,9 @@ export class SessionBackupStore {
       await out.close();
     } catch (err) {
       await out.abort?.().catch(() => {});
+      // Creating the handle made an empty file: remove it, or hasMedia() would
+      // report this revision as written and every later backup would lack its audio.
+      await media.removeEntry(`${key}.wav`).catch(() => {});
       throw err;
     }
   }
@@ -166,13 +178,24 @@ export class SessionBackupStore {
     await (await this.#dir()).removeEntry(`${key}.json`).catch(() => {});
   }
 
-  /** Deletes media no remaining manifest refers to (except `keep`, being written now). */
-  async sweepMedia(manifests, keep = new Set()) {
+  /**
+   * Deletes media no remaining manifest refers to (except `keep`, being written now).
+   * Media of other tabs (keys not starting with `own`) go only once they are a few
+   * minutes old: another tab writes a backup's media before its manifest.
+   */
+  async sweepMedia(manifests, keep = new Set(), { own = null, now = Date.now() } = {}) {
     const used = new Set([...keep, ...manifests.flatMap((m) => m.media.map((x) => x.key))]);
     const media = await this.#media();
     const names = [];
-    for await (const [name] of media.entries()) names.push(name);
-    for (const name of names) if (name.endsWith('.wav') && !used.has(name.slice(0, -4))) await media.removeEntry(name).catch(() => {});
+    for await (const [name, handle] of media.entries()) names.push([name, handle]);
+    for (const [name, handle] of names) {
+      if (!name.endsWith('.wav') || used.has(name.slice(0, -4))) continue;
+      if (!own || !name.startsWith(`${own}-`)) {
+        const file = await handle.getFile().catch(() => null);
+        if (file && now - file.lastModified < IN_FLIGHT) continue;
+      }
+      await media.removeEntry(name).catch(() => {});
+    }
   }
 }
 
@@ -183,6 +206,7 @@ export class SessionBackupStore {
 export function installSessionBackup(app, { store, tab, now = () => Date.now() } = {}) {
   if (!store) return null;
   const written = new Map(); // session doc id -> state last backed up
+  const latest = new Map(); // session doc id -> newest manifest this tab wrote
   const mediaKeys = new WeakMap(); // channels array -> media key
   let seq = 0;
   let running = null;
@@ -230,7 +254,8 @@ export function installSessionBackup(app, { store, tab, now = () => Date.now() }
     const drop = backupsToPrune(all, max(), at);
     for (const m of drop) await store.remove(m.key);
     const dropped = new Set(drop.map((m) => m.key));
-    await store.sweepMedia(all.filter((m) => !dropped.has(m.key)), fresh);
+    const kept = all.filter((m) => !dropped.has(m.key));
+    await store.sweepMedia(kept, fresh, { own: tab });
     return manifest;
   };
 
@@ -244,8 +269,9 @@ export function installSessionBackup(app, { store, tab, now = () => Date.now() }
         if (doc.stretcher?.busy || doc.remixer?.busy) continue;
         const state = doc.state;
         try {
-          await backup(doc);
+          latest.set(doc.id, await backup(doc));
           written.set(doc.id, state);
+          await settle(doc);
         } catch (err) {
           if (!warned) {
             warned = true;
@@ -259,6 +285,34 @@ export function installSessionBackup(app, { store, tab, now = () => Date.now() }
     });
     return running;
   };
+
+  /**
+   * Keeps the newest backup's flags true to the session: saved since (no
+   * unsaved changes) or closed (not offered at start; it stays listed in
+   * File > Restore Session Backup).
+   */
+  const settle = async (doc) => {
+    const m = latest.get(doc.id);
+    if (!m) return;
+    const open = app.documents.includes(doc);
+    const patch = !open ? { offered: true } : !doc.dirty ? { dirty: false } : null;
+    if (!open) {
+      latest.delete(doc.id);
+      written.delete(doc.id);
+    }
+    if (!patch || Object.keys(patch).every((k) => m[k] === patch[k])) return;
+    const next = { ...m, ...patch };
+    if (open) latest.set(doc.id, next);
+    await store.writeManifest(next).catch(() => {});
+  };
+  app.on?.('doc-change', (doc, e) => {
+    if (e?.kind === 'saved' && latest.has(doc?.id)) settle(doc);
+  });
+  app.on?.('documents', () => {
+    for (const id of [...latest.keys()]) {
+      if (!app.documents.some((d) => d.id === id)) settle({ id, dirty: true });
+    }
+  });
 
   const schedule = () => {
     clearInterval(timer);
@@ -302,7 +356,7 @@ export function installSessionBackup(app, { store, tab, now = () => Date.now() }
         if (drop.length) {
           const dropped = new Set(drop.map((m) => m.key));
           all = all.filter((m) => !dropped.has(m.key));
-          await store.sweepMedia(all);
+          await store.sweepMedia(all, new Set(), { own: tab });
         }
       } catch {
         return [];

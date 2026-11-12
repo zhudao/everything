@@ -11,6 +11,8 @@ import { openFiles } from '../storage/files.js';
 import { statusParts } from './status-fields.js';
 import { tabNames } from './workspace-manager.js';
 import { TOOLS } from './tools.js';
+import { eventKey } from '../commands/registry.js';
+import { keyedLabel, syncKeyedLabel } from '../panels/transport-controls.js';
 
 /** Actions offered by the menu beside the current workspace tab. */
 const WORKSPACE_ACTIONS = ['workspace.reset', 'workspace.saveChanges', 'workspace.saveAs', '-', 'workspace.edit'];
@@ -33,18 +35,26 @@ export function createShell(app, root) {
 
   // Toolbar ------------------------------------------------------------------
   const modeBtn = (kind, ic, label, cmd) =>
-    h('button.mode-btn', { type: 'button', role: 'radio', 'aria-checked': 'false', dataset: { kind }, onclick: () => app.commands.run(cmd), title: `${label} (${kind === 'audio' ? '9' : '0'})` }, icon(ic, 16), h('span', label));
+    h('button.mode-btn', { type: 'button', role: 'radio', 'aria-checked': 'false', dataset: { kind, label, keyOf: cmd }, title: keyedLabel(app, cmd, label), onclick: () => app.commands.run(cmd) }, icon(ic, 16), h('span', label));
   const modes = h('div.mode-switch', { role: 'radiogroup', 'aria-label': 'Editor' }, modeBtn('audio', 'mode-waveform', 'Waveform', 'view.waveform'), modeBtn('session', 'mode-multitrack', 'Multitrack', 'view.multitrack'));
+  // A command button whose label names the command's current key ("Move Tool (V)").
+  const keyedButton = (cmd, label, glyph, data = {}) => {
+    const text = keyedLabel(app, cmd, label);
+    const dataset = { ...data, cmd, label, keyOf: cmd };
+    const attrs = { type: 'button', 'aria-label': text, title: text, dataset };
+    if (data.tool) attrs['aria-pressed'] = 'false';
+    return h('button.icon-btn', { ...attrs, onclick: () => app.commands.run(cmd) }, glyph);
+  };
   const displayBtns = h(
     'div.tool-group',
     { role: 'group', 'aria-label': 'Display' },
-    h('button.icon-btn', { type: 'button', 'aria-label': 'Show Spectral Frequency Display (Shift+D)', title: 'Show Spectral Frequency Display (Shift+D)', dataset: { cmd: 'view.spectral' }, onclick: () => app.commands.run('view.spectral') }, icon('spectral-frequency', 18)),
+    keyedButton('view.spectral', 'Show Spectral Frequency Display', icon('spectral-frequency', 18)),
     h('button.icon-btn', { type: 'button', 'aria-label': 'Show Spectral Pitch Display', title: 'Show Spectral Pitch Display', dataset: { cmd: 'view.spectralPitch' }, onclick: () => app.commands.run('view.spectralPitch') }, icon('spectral-pitch', 18)),
   );
   const toolBtns = h(
     'div.tool-group.tools',
     { role: 'toolbar', 'aria-label': 'Tools' },
-    TOOLS.map(([id, ic, label]) => h('button.icon-btn', { type: 'button', 'aria-label': label, title: label, 'aria-pressed': 'false', dataset: { tool: id, cmd: `tool.${id}` }, onclick: () => app.commands.run(`tool.${id}`) }, icon(ic, 18))),
+    TOOLS.map(([id, ic, label]) => keyedButton(`tool.${id}`, label, icon(ic, 18), { tool: id })),
   );
   const workspaceTabs = h('div.workspace-tabs', { role: 'tablist', 'aria-label': 'Workspaces' });
   const workspaceMore = h('button.icon-btn', { type: 'button', 'aria-label': 'All workspaces', title: 'Workspaces', 'aria-haspopup': 'menu' }, icon('chevrons-right', 16));
@@ -75,21 +85,32 @@ export function createShell(app, root) {
       const on = b.dataset.kind === kind;
       b.setAttribute('aria-checked', String(on));
       b.classList.toggle('on', on);
+      // The mode buttons show their text: the key goes in the tooltip only.
+      b.title = keyedLabel(app, b.dataset.keyOf, b.dataset.label);
     }
     for (const b of toolbar.querySelectorAll('[data-cmd]')) {
+      syncKeyedLabel(app, b);
       b.disabled = !app.commands.isEnabled(b.dataset.cmd);
       if (b.dataset.tool) b.setAttribute('aria-pressed', String(app.tool === b.dataset.tool));
       else if (app.commands.get(b.dataset.cmd)?.checked) b.setAttribute('aria-pressed', String(app.commands.isChecked(b.dataset.cmd)));
     }
     docTitle.textContent = app.active ? `${app.active.name}${app.active.dirty ? ' *' : ''}` : '';
     document.title = app.active ? `${app.active.name}${app.active.dirty ? ' *' : ''} - Audio Studio` : 'Audio Studio';
+    workspaceTabs.hidden = app.layoutMode !== 'desktop';
+    workspaceMore.hidden = app.layoutMode !== 'desktop';
     // Workspace tabs.
     const names = tabNames(app);
     const current = app.prefs.get('workspace');
     if (!names.includes(current)) names.push(current);
+    // Rebuilt only when the workspaces change (refreshes come with every status
+    // message and playback change), keeping keyboard focus on the same tab.
+    const tabsKey = JSON.stringify([names, current]);
+    if (tabsKey === workspaceTabs.dataset.key) return;
+    workspaceTabs.dataset.key = tabsKey;
+    const had = workspaceTabs.contains(document.activeElement) ? document.activeElement : null;
     workspaceTabs.replaceChildren(
       ...names.flatMap((n) => {
-        const tab = h('button.workspace-tab', { type: 'button', role: 'tab', 'aria-selected': String(n === current), onclick: () => app.setWorkspace(n) }, n);
+        const tab = h('button.workspace-tab', { type: 'button', role: 'tab', 'aria-selected': String(n === current), dataset: { name: n }, onclick: () => app.setWorkspace(n) }, n);
         if (n !== current) return [tab];
         // The current workspace carries a menu to reset, save or edit workspaces.
         const menuBtn = h('button.icon-btn.workspace-menu-btn', { type: 'button', 'aria-label': `${n} workspace menu`, title: 'Workspace menu', 'aria-haspopup': 'menu' }, icon('menu', 14));
@@ -100,8 +121,13 @@ export function createShell(app, root) {
         return [tab, menuBtn];
       }),
     );
-    workspaceTabs.hidden = app.layoutMode !== 'desktop';
-    workspaceMore.hidden = app.layoutMode !== 'desktop';
+    if (had) {
+      const tabs = [...workspaceTabs.querySelectorAll('.workspace-tab')];
+      const same = had.classList.contains('workspace-menu-btn')
+        ? workspaceTabs.querySelector('.workspace-menu-btn')
+        : tabs.find((t) => t.dataset.name === had.dataset.name);
+      (same || workspaceTabs.querySelector('[aria-selected=true]'))?.focus({ preventScroll: true });
+    }
   };
   const refreshStatus = () => {
     status.textContent = app.statusMessage || '';
@@ -140,6 +166,7 @@ export function createShell(app, root) {
   dock.setLayout(app.currentLayout());
 
   // Keyboard -----------------------------------------------------------------
+  const TEXT_KEYS = /^([acvxyz]|backspace|delete|home|end|arrow(up|down|left|right))$/;
   const NAV_WIDGETS = '[role=menu], [role=listbox], [role=grid], [role=tree], [role=treegrid], [role=tablist], [role=slider], [role=radiogroup], [role=spinbutton], [role=separator], input[type=range], [data-own-keys]';
   window.addEventListener('keydown', (e) => {
     if (e.defaultPrevented || e.isComposing) return;
@@ -148,12 +175,14 @@ export function createShell(app, root) {
     if (t instanceof Element && t.closest('puter-user-menu')) return;
     const typing = t instanceof HTMLElement && (t.isContentEditable || (t.tagName === 'INPUT' && !['checkbox', 'radio', 'range', 'button'].includes(t.type)) || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT');
     if (typing && !(e.metaKey || e.ctrlKey)) return;
+    // Text editing keys (select all, clipboard, undo, caret and word moves) stay with the field.
+    if (typing && TEXT_KEYS.test(eventKey(e))) return;
     if (document.querySelector('.dialog-backdrop')) return;
     const id = app.commands.match(e);
     if (!id) return;
     // Plain keys (Space, letters) should still activate focused buttons and menus.
     const plain = !e.metaKey && !e.ctrlKey && !e.altKey;
-    if (plain && (e.key === ' ' || e.key === 'Enter') && t instanceof HTMLElement && t.closest('button, [role=menuitem], [role=tab], [role=option], a, summary')) return;
+    if (plain && (e.key === ' ' || e.key === 'Enter') && t instanceof HTMLElement && t.closest('button, input[type=checkbox], input[type=radio], [role=menuitem], [role=menuitemcheckbox], [role=tab], [role=option], [role=checkbox], [role=switch], [role=radio], a, summary')) return;
     // Navigation keys stay with focused widgets that move with them (lists, tabs, sliders).
     const nav = /^(Delete|Backspace|Home|End|PageUp|PageDown|Arrow(Up|Down|Left|Right))$/.test(e.key);
     if (plain && nav && t instanceof HTMLElement && t.closest(NAV_WIDGETS)) return;
@@ -225,7 +254,18 @@ function bindCommandSearch(app, input) {
     }
     if (!results.length) results.push({ type: 'cmd', label: 'No matching commands', enabled: false });
     const r = input.getBoundingClientRect();
-    menu = openMenu(app, results, { x: r.left, y: r.bottom + 2, anchor: input, label: 'Command results', focus: 'none', onClose: () => (menu = null) });
+    menu = openMenu(app, results, {
+      x: r.left,
+      y: r.bottom + 2,
+      anchor: input,
+      label: 'Command results',
+      // The field keeps focus so typing goes on refining the search.
+      focus: 'keep',
+      onClose: (reason) => {
+        menu = null;
+        if (reason === 'escape') input.focus();
+      },
+    });
   };
   input.addEventListener('input', show);
   input.addEventListener('keydown', (e) => {

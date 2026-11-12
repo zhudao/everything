@@ -120,10 +120,23 @@ export function remixClip(clip, settings, segments, derivedId) {
   };
 }
 
-/** The clip back on its original media and range (Revert Remix). */
+/**
+ * The clip back on its original media and range (Revert Remix). A clip that plays only part
+ * of its remix (split or trimmed) gets the same share of the original range, so the pieces of a
+ * split remix together hold the original once instead of each holding all of it.
+ */
 export function unremixClip(clip) {
   if (!clip.remix) return clip;
-  const { sourceId, offset, length } = clip.remix;
+  const { sourceId } = clip.remix;
+  let { offset, length } = clip.remix;
+  const total = remixLength(clip.remix.segments || []);
+  if (total > 0 && (clip.offset > 0 || clip.length < total)) {
+    const end = offset + length;
+    const a = Math.min(end - 1, offset + Math.round((clip.offset * length) / total));
+    const b = Math.min(end, offset + Math.round(((clip.offset + clip.length) * length) / total));
+    offset = a;
+    length = Math.max(1, b - a);
+  }
   return { ...clip, sourceId, offset, ...fitTo(clip, length), remix: null };
 }
 
@@ -197,9 +210,10 @@ export function splitRemix(clip, makeId, sourceLength = Infinity) {
   };
   return out.map((s, i) => {
     // Overlap the neighbours by half the crossfade on each side of the cut, where there is audio.
-    const left = s.first ? 0 : Math.min(half, s.from);
-    const right = s.last ? 0 : Math.max(0, Math.min(half, sourceLength - (s.from + s.len)));
     const t0 = s.pos - lo;
+    // (not before the session start, when the clip begins at 0 with a short first piece)
+    const left = s.first ? 0 : Math.max(0, Math.min(half, s.from, clip.start + t0));
+    const right = s.last ? 0 : Math.max(0, Math.min(half, sourceLength - (s.from + s.len)));
     const length = s.len + left + right;
     return {
       ...clip,

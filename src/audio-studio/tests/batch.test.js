@@ -31,10 +31,22 @@ describe('batch queue', () => {
     const s = batchSettings({ format: 'mp3', prefix: 'Clean ', suffix: '_v2' });
     expect(outputName('Interview.wav', s)).toBe('Clean Interview_v2.mp3');
     expect(outputName('a/b:c.wav', batchSettings({ format: 'flac' }))).toBe('a_b_c.flac');
+    expect(outputName('Take 2.1', batchSettings({ format: 'flac' }))).toBe('Take 2.1.flac');
     const items = [{ name: 'take.wav' }, { name: 'take.aif' }, { name: 'Take.mp3' }, { name: 'other.wav' }];
     expect(plannedNames(items, batchSettings({ format: 'wav' }))).toEqual(['take.wav', 'take 2.wav', 'Take 3.wav', 'other.wav']);
     const taken = new Set(['x.wav']);
     expect(uniqueName('x.wav', taken)).toBe('x 2.wav');
+  });
+
+  it("never plans an output over a later item's Puter source in the output folder", () => {
+    const puterItem = (path) => ({ name: path.split('/').pop(), source: { type: 'puter', path } });
+    const items = [puterItem('/u/In/a.mp3'), puterItem('/u/In/a.wav'), puterItem('/u/Other/b.mp3')];
+    const s = batchSettings({ format: 'wav', collision: 'overwrite' });
+    // a.mp3 would become a.wav and replace the a.wav source before it was converted.
+    expect(plannedNames(items, s)).toEqual(['a.wav', 'a 2.wav', 'b.wav']);
+    expect(plannedNames(items, s, { dir: '/u/In/' })).toEqual(['a 2.wav', 'a.wav', 'b.wav']);
+    // A file's own output may still replace it.
+    expect(plannedNames([puterItem('/u/In/a.wav')], s, { dir: '/u/In' })).toEqual(['a.wav']);
   });
 
   it('builds export options per source', () => {

@@ -161,6 +161,23 @@ describe('Amplitude Statistics', () => {
     expect(row(statsRows(result, 1, { ref: 'sine' }), 'Peak Amplitude')).toBe('-6.02 dB');
   });
 
+  it('measures a range shorter than the RMS window as one window', () => {
+    // 100 samples at 0.5: no whole 50 ms window, so the windowed stats are empty.
+    const ch = { min: 0.5, max: 0.5, sum: 50, sq: 0.25 * 100, clipped: 0, bits: 32, rmsMin: Infinity, rmsMax: 0, rmsSum: 0, rmsCount: 0, frames: 100 };
+    const result = { channels: [ch], loudness: { truePeak: [0.5], integrated: -Infinity, range: 0, maxMomentary: -Infinity, maxShortTerm: -Infinity } };
+    const row = (label) => statsRows(result, 1).find((r) => r[0] === label)[1][0];
+    for (const label of ['Minimum RMS Amplitude', 'Maximum RMS Amplitude', 'Average RMS Amplitude', 'Total RMS Amplitude']) expect(row(label), label).toBe('-6.02 dB');
+    expect(row('Dynamic Range')).toBe('0.00 dB');
+    // The RMS histogram shows that one window too.
+    const { series } = histogramSeries(result, 1);
+    expect(series[0][-HIST_FLOOR - 6]).toBe(100);
+    // Silence keeps its minus-infinity levels.
+    const silent = { ...ch, min: 0, max: 0, sum: 0, sq: 0 };
+    const rows = statsRows({ ...result, channels: [silent] }, 1);
+    expect(rows.find((r) => r[0] === 'Average RMS Amplitude')[1][0]).toBe('-∞ dB');
+    expect(rows.find((r) => r[0] === 'Dynamic Range')[1][0]).toBe('∞ dB');
+  });
+
   it('has General, RMS Histogram and RMS Settings tabs', () => {
     const app = makeApp();
     app.addDocument(audioDoc());
@@ -278,6 +295,47 @@ describe('Properties', () => {
     expect(again.el.querySelector('.prop-toggle').getAttribute('aria-expanded')).toBe('false');
   });
 
+  it('keeps keyboard focus on the same control when an edit or a rename rebuilds it', async () => {
+    const app = makeApp();
+    app.syncGraph = () => {};
+    const doc = app.addDocument(audioDoc());
+    const { Dock } = await import('../src/ui/dock.js');
+    const root = document.createElement('div');
+    document.body.replaceChildren(root);
+    // Only this panel: the editor's view would keep drawing after the test.
+    app.dock = new Dock(app, root, new Map([['properties', app.panels.get('properties')]]));
+    app.dock.setLayout({ t: 'group', tabs: ['properties'], a: 'properties' });
+    const panel = () => root.querySelector('.properties-panel');
+    panel().querySelector('.prop-toggle').focus();
+    doc.apply('Gain', doc.state);
+    expect(document.activeElement.className).toBe('prop-toggle');
+    expect(panel().contains(document.activeElement)).toBe(true);
+    // Renaming (Enter in the name field) also re-renders the dock to retitle the editor.
+    const name = panel().querySelector('input[aria-label="File name"]');
+    name.focus();
+    name.value = 'b.wav';
+    name.dispatchEvent(new Event('change'));
+    expect(doc.name).toBe('b.wav');
+    expect(document.activeElement.getAttribute('aria-label')).toBe('File name');
+    expect(document.activeElement).not.toBe(name);
+    root.remove();
+  });
+
+  it('gives the same uncompressed size as the status bar', async () => {
+    const app = makeApp();
+    const doc = audioDoc(3);
+    doc.info.bitDepth = 16;
+    app.addDocument(doc);
+    const p = create(app, 'properties');
+    const rows = [...p.el.querySelectorAll('.prop-row')];
+    const size = rows.find((r) => r.textContent.startsWith('Uncompressed Size'));
+    const { statusParts } = await import('../src/ui/status-fields.js');
+    const status = statusParts(app, doc, {});
+    // 3 s of 16-bit stereo at 1 kHz: 12,000 bytes.
+    expect(size.querySelector('.prop-value').textContent).toBe('11.7 KB');
+    expect(status).toContain('11.7 KB');
+  });
+
   it('makes any section built by a feature collapsible', () => {
     const root = document.createElement('div');
     root.innerHTML = '<section class="prop-section"><h3 class="prop-heading">Track</h3><div class="prop-row">x</div></section>';
@@ -303,6 +361,25 @@ describe('Level Meters', () => {
     expect(app.prefs.get('meterOrientation')).toBe('vertical');
     expect(app.commands.isChecked('meter.orientVertical')).toBe(true);
     expect(app.commands.isChecked('meter.orientAuto')).toBe(false);
+  });
+});
+
+describe('Level Meters colors', () => {
+  it('redraws in the new colors when the theme changes while stopped', () => {
+    const app = makeApp();
+    const p = create(app, 'levels');
+    const frames = [];
+    const raf = vi.spyOn(window, 'requestAnimationFrame').mockImplementation((fn) => frames.push(fn));
+    try {
+      p.show();
+      // The first frame draws (jsdom has no layout, so it stops at the size check).
+      frames.splice(0).forEach((fn) => fn(0));
+      window.dispatchEvent(new CustomEvent('themechange'));
+      expect(frames.length).toBe(1);
+    } finally {
+      p.hide();
+      raf.mockRestore();
+    }
   });
 });
 
@@ -336,6 +413,44 @@ describe('Files panel', () => {
     expect(app.prefs.get('filesHiddenColumns')).toEqual(['format']);
     p.menu().find((i) => i.label === 'Show Preview Transport').run();
     expect(p.el.querySelector('.files-footer').hidden).toBe(true);
+  });
+});
+
+describe('Files panel keyboard', () => {
+  it('reaches the markers listed under an expanded file with the arrow keys', async () => {
+    const { createMarker } = await import('../src/model/markers.js');
+    const app = makeApp();
+    app.syncGraph = () => {};
+    const a = new AudioFile({
+      name: 'a.wav',
+      sampleRate: RATE,
+      channels: [Channel.fromSamples(new Float32Array(RATE))],
+      markers: [createMarker({ start: 100, name: 'One' }), createMarker({ start: 500, name: 'Two' })],
+    });
+    app.addDocument(a);
+    app.addDocument(audioDoc());
+    const p = create(app, 'files');
+    document.body.replaceChildren(p.el);
+    const key = (k) =>
+      document.activeElement.dispatchEvent(new KeyboardEvent('keydown', { key: k, bubbles: true }));
+    const at = () => document.activeElement.textContent;
+    p.el.querySelector(`tr[data-id="${a.id}"]`).focus();
+    key('ArrowRight');
+    key('ArrowDown');
+    expect(at()).toContain('One');
+    key('ArrowDown');
+    expect(at()).toContain('Two');
+    key('ArrowDown');
+    expect(document.activeElement.dataset.id).not.toBe(a.id);
+    key('ArrowUp');
+    expect(at()).toContain('Two');
+    // Enter goes to the marker and keeps focus on it; Left returns to its file.
+    key('Enter');
+    expect(a.cursor).toBe(500);
+    expect(at()).toContain('Two');
+    key('ArrowLeft');
+    expect(document.activeElement.dataset.id).toBe(a.id);
+    p.el.remove();
   });
 });
 
@@ -393,5 +508,73 @@ describe('Markers to Batch Process', () => {
     const { state } = await loadItem(item);
     expect(state.channels[0].length).toBe(500);
     expect(doc.state.channels[0].length).toBe(4000);
+  });
+});
+
+describe('Files panel focus', () => {
+  it('keeps keyboard focus on the same file when the list re-renders', () => {
+    const app = makeApp();
+    app.syncGraph = () => {};
+    const a = audioDoc(1);
+    const b = audioDoc(2);
+    b.name = 'b.wav';
+    app.addDocument(a);
+    app.addDocument(b);
+    const panel = create(app, 'files');
+    document.body.replaceChildren(panel.el);
+    const row = (d) => panel.el.querySelector(`tr[data-id="${d.id}"]`);
+    row(a).focus();
+    expect(document.activeElement).toBe(row(a));
+    // Playback starting or stopping re-renders every row.
+    app.emit('transport', 'playing');
+    expect(document.activeElement).toBe(row(a));
+    expect(document.activeElement.isConnected).toBe(true);
+  });
+});
+
+describe('Markers panel focus', () => {
+  it('moves focus to the next row when the focused marker is deleted', async () => {
+    const app = makeApp();
+    app.syncGraph = () => {};
+    const d = audioDoc(2);
+    app.addDocument(d);
+    for (const [id, start] of [['m1', 100], ['m2', 600], ['m3', 1200]]) d.apply('Add Marker', { ...d.state, markers: [...d.state.markers, { id, name: id, start, duration: 0, type: 'cue', description: '' }] });
+    const panel = create(app, 'markers');
+    document.body.replaceChildren(panel.el);
+    panel.show();
+    const row = (id) => panel.el.querySelector(`tr[data-id="${id}"]`);
+    row('m2').dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    expect(document.activeElement).toBe(row('m2'));
+    row('m2').dispatchEvent(new KeyboardEvent('keydown', { key: 'Delete', bubbles: true, cancelable: true }));
+    await new Promise((r) => setTimeout(r, 0));
+    expect(d.state.markers.map((m) => m.id)).toEqual(['m1', 'm3']);
+    // Focus stays in the list (on the marker now in that place), not on the page.
+    expect(document.activeElement).toBe(row('m3'));
+  });
+});
+
+describe('Playlist panel focus', () => {
+  it('keeps focus in the list when entries are removed or playback changes', async () => {
+    const { playlistPanel, setPlaylist } = await import('../src/panels/playlist.js');
+    const app = makeApp();
+    app.syncGraph = () => {};
+    const d = audioDoc(2);
+    app.addDocument(d);
+    const markers = ['m1', 'm2', 'm3'].map((id, i) => ({ id, name: id, start: i * 500, duration: 200, type: 'cue', description: '' }));
+    d.apply('Add Markers', { ...d.state, markers });
+    setPlaylist(d, markers.map((m) => ({ id: `e-${m.id}`, markerId: m.id, loops: 1 })));
+    const panel = playlistPanel(app);
+    document.body.replaceChildren(panel.el);
+    panel.render();
+    const row = (id) => panel.el.querySelector(`tr[data-id="${id}"]`);
+    row('e-m1').dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    expect(document.activeElement).toBe(row('e-m1'));
+    // A re-render (e.g. the player moving on) keeps focus on the same entry.
+    panel.render();
+    expect(document.activeElement).toBe(row('e-m1'));
+    // Delete removes it and focus moves to the entry now selected in its place.
+    row('e-m1').dispatchEvent(new KeyboardEvent('keydown', { key: 'Delete', bubbles: true, cancelable: true }));
+    expect(panel.el.querySelectorAll('tr[data-id]')).toHaveLength(2);
+    expect(document.activeElement).toBe(row('e-m2'));
   });
 });

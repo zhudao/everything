@@ -25,7 +25,7 @@ export const DIAGNOSTICS = [
 
 const fmtLevel = (p) => {
   if (p.kind === 'click') return `${p.level.toFixed(1)}x`;
-  return Number.isFinite(p.level) ? `${p.level.toFixed(1)} dB` : '-inf dB';
+  return Number.isFinite(p.level) ? `${p.level.toFixed(1)} dB` : '-∞ dB';
 };
 
 export function diagnosticsPanel(app) {
@@ -152,6 +152,8 @@ export function diagnosticsPanel(app) {
   );
 
   // ----------------------------------------------------------------- scan
+  /** Results are acted on in full, even inside a spectral selection (which would mask the repairs). */
+  const commit = (doc, label, state) => (app.spectral?.applyRaw ? app.spectral.applyRaw(doc, label, state) : doc.apply(label, state));
   const audioDoc = () => (app.active?.kind === 'audio' ? app.active : null);
   const meta = () => DIAGNOSTICS.find((d) => d.id === effectId);
   const setProgress = (f) => {
@@ -172,10 +174,19 @@ export function diagnosticsPanel(app) {
     caption.textContent = `Scanning ${selectionOnly && doc.hasSelection ? 'the selection' : doc.name}...`;
     refresh();
     try {
-      const r = await scanProblems({ effect: effectId, values, channels: doc.state.channels, rate: doc.sampleRate, start: range[0], end: range[1], signal, onProgress: setProgress });
-      result = { docId: doc.id, state: doc.state, effect: effectId, values: { ...values }, problems: r.problems, info: r.info, range };
+      // Like the effects, clicks and clipping are only looked for (and repaired) in enabled channels.
+      const mask = doc.channelMask;
+      const state = doc.state;
+      const r = await scanProblems({ effect: effectId, values, channels: state.channels, rate: doc.sampleRate, start: range[0], end: range[1], mask, signal, onProgress: setProgress });
       selected = new Set();
       focusIndex = 0;
+      if (doc.state !== state) {
+        // Edited during the scan: the problem positions no longer match the audio.
+        result = null;
+        caption.textContent = 'The file changed during the scan. Scan again to update the list.';
+        return;
+      }
+      result = { docId: doc.id, state, effect: effectId, values: { ...values }, problems: r.problems, info: r.info, range, mask };
       const n = r.problems.length;
       caption.textContent = n ? `${n} ${meta().noun}${n === 1 ? '' : 's'} found.` : `No ${meta().noun}s found.`;
       announce(caption.textContent);
@@ -215,7 +226,7 @@ export function diagnosticsPanel(app) {
         next =
           effect === 'declicker'
             ? await repairClicks(doc.state, list, result.values, { runner, signal, onProgress: setProgress })
-            : await repairClips(doc.state, list, result.values, result.info.level, result.range, { runner, signal, onProgress: setProgress });
+            : await repairClips(doc.state, list, result.values, result.info.level, result.range, { mask: result.mask, runner, signal, onProgress: setProgress });
         const done = new Set(list.map((p) => p.id));
         remaining = result.problems.filter((p) => !done.has(p.id));
       } else if (effect === 'deleteSilence') {
@@ -234,7 +245,7 @@ export function diagnosticsPanel(app) {
       }
       applying = true;
       try {
-        doc.apply(label, next);
+        commit(doc, label, next);
       } finally {
         applying = false;
       }
@@ -264,7 +275,7 @@ export function diagnosticsPanel(app) {
     const noun = m.noun[0].toUpperCase() + m.noun.slice(1);
     applying = true;
     try {
-      doc.apply(`${getEffect(result.effect).name}: Mark ${list.length} ${m.noun}${list.length === 1 ? '' : 's'}`, markProblems(doc.state, list, noun));
+      commit(doc, `${getEffect(result.effect).name}: Mark ${list.length} ${m.noun}${list.length === 1 ? '' : 's'}`, markProblems(doc.state, list, noun));
     } finally {
       applying = false;
     }
@@ -327,21 +338,34 @@ export function diagnosticsPanel(app) {
 
   const chanLabel = (p, count) => (count === 1 ? 'Mono' : p.channels.length >= count ? 'All' : p.channels.map((c) => (count === 2 ? (c === 0 ? 'L' : 'R') : String(c + 1))).join(', '));
 
+  let shown = null; // the rows on screen: { key, problems, rows }
+
   function renderRows() {
     const doc = audioDoc();
     if (!result || !doc || result.docId !== doc.id) {
+      shown = null;
       body.replaceChildren(h('tr', h('td.empty-row', { colspan: '5' }, h('span.empty-text', doc ? 'Choose a diagnostic, then scan the selection or the whole file.' : 'Open an audio file to scan it for clicks, clipping and silence.'))));
       return;
     }
     if (!result.problems.length) {
+      shown = null;
       body.replaceChildren(h('tr', h('td.empty-row', { colspan: '5' }, h('span.empty-text', `No ${meta().noun}s found.`))));
       return;
     }
     const hadFocus = body.contains(document.activeElement);
     const rate = doc.sampleRate;
     const count = doc.channelCount;
-    body.replaceChildren(
-      ...result.problems.map((p, i) =>
+    // Rows depend on the list, the file and the time format; selecting rows only restyles them.
+    const key = `${doc.id}|${rate}|${count}|${app.formatTime(123456, rate)}`;
+    if (shown && shown.problems === result.problems && shown.key === key) {
+      shown.rows.forEach((tr, i) => {
+        const sel = String(selected.has(result.problems[i].id));
+        if (tr.getAttribute('aria-selected') !== sel) tr.setAttribute('aria-selected', sel);
+        const tab = i === focusIndex ? '0' : '-1';
+        if (tr.getAttribute('tabindex') !== tab) tr.setAttribute('tabindex', tab);
+      });
+    } else {
+      const rows = result.problems.map((p, i) =>
         h(
           `tr${p.marked ? '.marked' : ''}`,
           { 'aria-selected': String(selected.has(p.id)), tabindex: i === focusIndex ? '0' : '-1', onclick: (e) => choose(i, e), onkeydown: (e) => rowKeys(e, i) },
@@ -351,8 +375,10 @@ export function diagnosticsPanel(app) {
           h('td', chanLabel(p, count)),
           h('td.num', p.marked ? `${fmtLevel(p)} (marked)` : fmtLevel(p)),
         ),
-      ),
-    );
+      );
+      body.replaceChildren(...rows);
+      shown = { key, problems: result.problems, rows };
+    }
     if (hadFocus) body.children[focusIndex]?.focus();
   }
 

@@ -41,6 +41,11 @@ export class Dock extends Emitter {
 
   setLayout(tree) {
     this.tree = normalize(structuredClone(tree), this.registry) || { t: 'group', tabs: [], a: null };
+    // The editor cannot be closed, so a layout without it is damaged: give it a frame.
+    if (this.registry.has('editor') && !this.groupOf('editor')) {
+      const editor = { t: 'group', tabs: ['editor'], a: 'editor' };
+      this.tree = this.tree.t === 'group' && !this.tree.tabs.length ? editor : { t: 'row', c: [editor, this.tree], s: [3, 1] };
+    }
     this.maximized = null;
     this.render();
     this.emit('change');
@@ -158,14 +163,43 @@ export class Dock extends Emitter {
       return box;
     };
     this.tabsObserver?.disconnect();
+    // Rebuilding detaches whatever had focus in the dock; it is given back below.
+    const focused = document.activeElement;
+    const hadFocus = focused && focused !== document.body && this.root.contains(focused);
+    const focusedGroup = hadFocus ? focused.closest('.panel-group')?._group : null;
     const content = this.maximized && this.groups().includes(this.maximized) ? this.#group(this.maximized, shown) : build(this.tree);
     content.style.flex = '1 1 0px';
     this.root.replaceChildren(content);
     for (const [id, inst] of this.instances) {
       if (!shown.has(id)) inst.hide?.();
     }
+    // Before show(), so a panel that rebuilds itself there sees where focus is
+    // (and again after, for one that rebuilt the focused control away).
+    const lost = () => !document.activeElement || document.activeElement === document.body;
+    if (hadFocus && lost()) this.#restoreFocus(focused, focusedGroup);
     for (const id of shown) this.instances.get(id)?.show?.();
+    if (hadFocus && lost()) this.#restoreFocus(focused, focusedGroup);
     this.emit('render');
+  }
+
+  /**
+   * After a rebuild: focus back on the element that had it (panels are moved,
+   * not rebuilt), else on the same tab, else on its frame's current tab, else
+   * on the editor, so keyboard focus never falls back to the page.
+   */
+  #restoreFocus(el, group) {
+    const opts = { preventScroll: true };
+    if (el.isConnected && this.root.contains(el)) return el.focus(opts);
+    const sameId = el.id && this.root.querySelector(`#${CSS.escape(el.id)}`);
+    const frames = [...this.root.querySelectorAll('.panel-group')];
+    const frame = group && frames.find((g) => g._group === group);
+    const tab = '[role=tab][aria-selected=true]';
+    const target =
+      sameId ||
+      frame?.querySelector(tab) ||
+      this.app.focusTarget?.() ||
+      this.root.querySelector(tab);
+    target?.focus(opts);
   }
 
   #group(g, shown) {
@@ -313,7 +347,14 @@ export class Dock extends Emitter {
         for (const t of g.tabs.slice()) this.closePanel(t);
       } },
       { type: 'sep' },
-      { type: 'cmd', label: this.maximized === g ? 'Restore Frame Size' : 'Maximize Frame', shortcut: '`', enabled: true, run: () => this.toggleMaximize(g) },
+      {
+        type: 'cmd',
+        label: this.maximized === g ? 'Restore Frame Size' : 'Maximize Frame',
+        // The key Window > Maximize Frame has now (it can be remapped).
+        shortcut: this.app.commands?.shortcutLabel('window.maximize') ?? '`',
+        enabled: true,
+        run: () => this.toggleMaximize(g),
+      },
     ];
     const r = anchor.getBoundingClientRect();
     this.app.openMenu(items, { x: r.left, y: r.bottom + 2, anchor, label: `${this.#title(id)} panel menu` });
@@ -494,15 +535,16 @@ function findParent(node, target) {
 /** Drops unknown panels and empty frames, merges single-child splits, fixes weights. */
 export function normalize(node, registry) {
   if (!node) return null;
+  if (typeof node !== 'object') return null;
   if (node.t === 'group') {
-    node.tabs = (node.tabs || []).filter((id, i, arr) => registry.has(id) && arr.indexOf(id) === i);
+    node.tabs = (Array.isArray(node.tabs) ? node.tabs : []).filter((id, i, arr) => registry.has(id) && arr.indexOf(id) === i);
     if (!node.tabs.length) return null;
     if (!node.tabs.includes(node.a)) node.a = node.tabs[0];
     return node;
   }
   const kids = [];
   const weights = [];
-  (node.c || []).forEach((c, i) => {
+  (Array.isArray(node.c) ? node.c : []).forEach((c, i) => {
     const n = normalize(c, registry);
     if (!n) return;
     const w = node.s?.[i] ?? 1;

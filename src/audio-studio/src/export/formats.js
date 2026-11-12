@@ -17,7 +17,8 @@ export const FORMATS = [
     mime: 'audio/wav',
     lossy: false,
     bitDepths: [8, 16, 24, 32],
-    maxChannels: 8,
+    // As many channels as the format holds: multitrack recorder files often have 10 or more.
+    maxChannels: 65535,
     markers: true,
     settings: [],
   },
@@ -29,7 +30,7 @@ export const FORMATS = [
     mime: 'audio/aiff',
     lossy: false,
     bitDepths: [8, 16, 24, 32],
-    maxChannels: 8,
+    maxChannels: 32767,
     markers: true,
     settings: [],
   },
@@ -225,10 +226,19 @@ export function exportMarkers(markers, start, end, from, to) {
     .map((m) => ({ ...m, start: Math.round((m.start - start) * k), duration: Math.round(Math.min(m.duration || 0, end - m.start) * k) }));
 }
 
+/**
+ * `name` without a file extension. Only a suffix with a letter counts, so the
+ * version in "Mix 1.5" is kept (".wav", ".mp3" and ".m4a" are removed).
+ */
+export function stripExtension(name) {
+  return String(name).replace(/\.(?=[0-9]*[a-z])[a-z0-9]{1,5}$/i, '');
+}
+
 /** Replaces the extension of `name` with the format's. */
 export function withExtension(name, formatId) {
   const f = getFormat(formatId);
-  const base = String(name || 'Untitled').replace(/\.[a-z0-9]{1,5}$/i, '');
+  // Trailing dots go first ("Song." is not "Song..wav"); most file systems drop them anyway.
+  const base = stripExtension(String(name || 'Untitled').replace(/\.+$/, ''));
   return `${base}.${f ? f.ext : 'wav'}`;
 }
 

@@ -11,7 +11,7 @@ import { cssVar, CANVAS_FONT } from '../ui/theme.js';
 import { subTabs } from '../panels/subtabs.js';
 import { analysisPool } from './pool.js';
 import { fmtDb, gainToDb, fitCanvas } from './common.js';
-import { HIST_BINS, binDb } from './rms-histogram.js';
+import { HIST_BINS, binDb, rmsBin } from './rms-histogram.js';
 
 /** RMS settings: window width in ms and the 0 dB reference (full-scale square or sine wave). */
 export const RMS_DEFAULTS = { windowMs: 50, ref: 'square' };
@@ -50,6 +50,9 @@ export function statsRows(result, channelCount, settings = RMS_DEFAULTS) {
   const frames = (c) => Math.max(1, c.frames);
   const off = rmsOffset(settings);
   const rmsDb = (g) => fmtDb(gainToDb(g) + off);
+  // A range shorter than the RMS window is measured as one window.
+  const total = (c) => Math.sqrt(c.sq / frames(c));
+  const win = (c) => (c.rmsCount ? null : c.frames ? total(c) : 0);
   return [
     ['Peak Amplitude', per((c) => `${fmtDb(gainToDb(Math.max(Math.abs(c.min), Math.abs(c.max))))} dB`)],
     ['True Peak Amplitude', per((c, i) => `${fmtDb(gainToDb(L.truePeak[i]))} dBTP`)],
@@ -57,11 +60,11 @@ export function statsRows(result, channelCount, settings = RMS_DEFAULTS) {
     ['DC Offset', per((c) => `${((c.sum / frames(c)) * 100).toFixed(3)} %`)],
     ['Minimum Sample Value', per((c) => (c.frames ? c.min.toFixed(5) : '0'))],
     ['Maximum Sample Value', per((c) => (c.frames ? c.max.toFixed(5) : '0'))],
-    ['Minimum RMS Amplitude', per((c) => `${rmsDb(c.rmsCount ? c.rmsMin : 0)} dB`)],
-    ['Maximum RMS Amplitude', per((c) => `${rmsDb(c.rmsMax)} dB`)],
-    ['Average RMS Amplitude', per((c) => `${rmsDb(c.rmsCount ? c.rmsSum / c.rmsCount : 0)} dB`)],
-    ['Total RMS Amplitude', per((c) => `${rmsDb(Math.sqrt(c.sq / frames(c)))} dB`)],
-    ['Dynamic Range', per((c) => (c.rmsCount && c.rmsMin > 0 ? `${(gainToDb(c.rmsMax) - gainToDb(c.rmsMin)).toFixed(2)} dB` : '∞ dB'))],
+    ['Minimum RMS Amplitude', per((c) => `${rmsDb(win(c) ?? c.rmsMin)} dB`)],
+    ['Maximum RMS Amplitude', per((c) => `${rmsDb(win(c) ?? c.rmsMax)} dB`)],
+    ['Average RMS Amplitude', per((c) => `${rmsDb(win(c) ?? c.rmsSum / c.rmsCount)} dB`)],
+    ['Total RMS Amplitude', per((c) => `${rmsDb(total(c))} dB`)],
+    ['Dynamic Range', per((c) => (c.rmsCount && c.rmsMin > 0 ? `${(gainToDb(c.rmsMax) - gainToDb(c.rmsMin)).toFixed(2)} dB` : win(c) > 0 ? '0.00 dB' : '∞ dB'))],
     ['Measured Bit Depth', per((c) => (c.bits === 0 ? 'Silent' : c.bits === 32 ? '32 (float)' : String(c.bits)))],
     ['Integrated Loudness', `${fmtDb(L.integrated)} LUFS`],
     ['Loudness Range', `${L.range.toFixed(2)} LU`],
@@ -72,7 +75,14 @@ export function statsRows(result, channelCount, settings = RMS_DEFAULTS) {
 
 /** Percent of windows per bin, per channel, trimmed to the bins in use (with a little margin). */
 export function histogramSeries(result, channelCount) {
-  const hists = result.channels.slice(0, channelCount).map((c) => c.hist || new Uint32Array(HIST_BINS));
+  const hists = result.channels.slice(0, channelCount).map((c) => {
+    const hst = c.hist || new Uint32Array(HIST_BINS);
+    if (c.rmsCount || !c.frames) return hst;
+    // A range shorter than the RMS window counts as one window (as in statsRows).
+    const one = new Uint32Array(HIST_BINS);
+    one[rmsBin(Math.sqrt(c.sq / c.frames))] = 1;
+    return one;
+  });
   let lo = HIST_BINS;
   let hi = -1;
   for (const hst of hists) {
@@ -193,7 +203,10 @@ export function amplitudePanel(app) {
   };
 
   const render = () => {
-    const { rows, names } = last;
+    const { rows, names, title } = last;
+    // Edits and undo after a scan leave its numbers describing audio that has changed.
+    const changed = last.doc.state !== last.state;
+    caption.textContent = `Statistics for ${title}${changed ? ' (the file has changed since this scan: scan again to update)' : ''}`;
     head.replaceChildren(h('tr', h('th', { scope: 'col' }, ''), ...names.map((n) => h('th.num', { scope: 'col' }, n))));
     body.replaceChildren(
       ...rows.map(([label, v]) =>
@@ -299,12 +312,15 @@ export function amplitudePanel(app) {
     drawHist();
   });
   if (typeof ResizeObserver !== 'undefined') new ResizeObserver(() => drawHist()).observe(histPlot);
+  // Colours come from the theme: repaint when it changes.
+  window.addEventListener('themechange', () => drawHist());
 
   async function scan(selectionOnly) {
     const doc = app.active;
     if (!doc || doc.kind !== 'audio' || abort) return;
     const [start, end] = selectionOnly && doc.hasSelection ? [doc.selection.start, doc.selection.end] : [0, doc.length];
     const s = settings();
+    const state = doc.state;
     abort = new AbortController();
     progress.hidden = false;
     const bar = progress.firstChild;
@@ -313,7 +329,7 @@ export function amplitudePanel(app) {
     settingsNote.textContent = '';
     refresh();
     try {
-      const result = await scanStats(doc.state.channels, doc.sampleRate, start, end, {
+      const result = await scanStats(state.channels, doc.sampleRate, start, end, {
         signal: abort.signal,
         windowMs: s.windowMs,
         onProgress: (f) => {
@@ -321,11 +337,15 @@ export function amplitudePanel(app) {
           progress.setAttribute('aria-valuenow', String(Math.round(f * 100)));
         },
       });
-      const n = doc.channelCount;
-      const names = n === 1 ? ['Mono'] : doc.state.channels.map((_, i) => NAMES[i] || `Channel ${i + 1}`);
+      if (app.active !== doc) {
+        // Another file became active during the scan (which cleared the results).
+        caption.textContent = '';
+        return;
+      }
+      const n = state.channels.length;
+      const names = n === 1 ? ['Mono'] : state.channels.map((_, i) => NAMES[i] || `Channel ${i + 1}`);
       const title = `${doc.name}, ${selectionOnly && doc.hasSelection ? `selection ${app.formatTime(start)} to ${app.formatTime(end)}` : 'entire file'}`;
-      last = { result, rows: statsRows(result, n, s), names, title, settings: s };
-      caption.textContent = `Statistics for ${title}`;
+      last = { result, rows: statsRows(result, n, s), names, title, settings: s, doc, state };
       render();
       announce('Amplitude statistics ready');
     } catch (err) {
@@ -354,7 +374,11 @@ export function amplitudePanel(app) {
     caption.textContent = '';
     refresh();
   });
-  app.on('doc-change', (doc, e) => doc === app.active && (e.kind === 'selection' || e.kind === 'edit' || e.kind === 'history') && refresh());
+  app.on('doc-change', (doc, e) => {
+    if (doc !== app.active || !(e.kind === 'selection' || e.kind === 'edit' || e.kind === 'history')) return;
+    refresh();
+    if (last && last.doc === doc && e.kind !== 'selection') render();
+  });
   refresh();
   return {
     el,

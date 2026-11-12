@@ -169,7 +169,8 @@ registerEffect({
     preset('Air Conditioner Rumble', { amount: 60, focus: 1, gain: 0 }),
     preset('High Frequency Fizz', { amount: 50, focus: 3, gain: 0 }),
   ],
-  latency: () => 2048,
+  // fx/restore/denoise.rs fft_size: 2048 points from 44.1 kHz up, halved per octave below 48 kHz.
+  latency: (v, rate) => 2048 >> Math.min(3, Math.max(0, -Math.round(Math.log2(rate / 48000)))),
 });
 
 // ------------------------------------------------------------------- DeReverb
@@ -367,7 +368,23 @@ registerEffect({
     if (!print) throw new Error('Capture a noise print first: select noise only and choose Capture Noise Print (Shift+P).');
     const def = getEffect('noiseReduction');
     checkAbort(signal);
-    return dsp.runEffect(135, rate, channels, paramArray(def, values), { data: [{ slot: 0, values: print }], onProgress });
+    const params = paramArray(def, values);
+    if (channels.length <= 2) return dsp.runEffect(135, rate, channels, params, { data: [{ slot: 0, values: print }], onProgress });
+    // The processor takes one or two channels: a 5.1 file runs its first two as
+    // the stereo pair and each further channel on its own, with that channel's
+    // noise print when the print has one.
+    const all = extra.noisePrint;
+    const groups = [[0, 1], ...channels.slice(2).map((_, i) => [i + 2])];
+    const out = [];
+    for (let k = 0; k < groups.length; k++) {
+      checkAbort(signal);
+      const g = groups[k];
+      const own = g.every((c) => c < all.channels.length) ? packNoisePrint({ ...all, channels: g.map((c) => all.channels[c]) }, values.curve) : print;
+      const progress = onProgress && ((f) => onProgress((k + f) / groups.length));
+      out.push(...dsp.runEffect(135, rate, g.map((c) => channels[c]), params, { data: [{ slot: 0, values: own }], onProgress: progress }));
+      await pause();
+    }
+    return out;
   },
   process: offloaded('noiseReduction', { context: ({ doc }) => ({ noisePrint: doc?.noisePrint || null }) }),
 });

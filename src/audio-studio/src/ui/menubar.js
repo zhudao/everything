@@ -7,6 +7,13 @@
 import { h } from '../lib/dom.js';
 import { icon } from './icons.js';
 
+/**
+ * Whether a pointerenter is a hover. A finger or pen tap enters the element
+ * just before it presses, so opening a menu on that enter would put the menu
+ * under the tap (which then picks one of its items, or closes it again).
+ */
+const hovering = (e) => e.pointerType !== 'touch' && e.pointerType !== 'pen';
+
 /** Resolve a menu spec into concrete entries for the current app state. */
 export function resolveItems(app, spec) {
   const out = [];
@@ -135,7 +142,7 @@ export function openMenu(app, items, { x, y, anchor, onClose, parentMenu = null,
         });
         submenu.row = row;
       };
-      row.addEventListener('pointerenter', () => openSub(false));
+      row.addEventListener('pointerenter', (e) => hovering(e) && openSub(false));
       row.addEventListener('click', () => openSub(true));
       row._open = openSub;
     } else {
@@ -193,12 +200,17 @@ export function openMenu(app, items, { x, y, anchor, onClose, parentMenu = null,
         e.preventDefault();
         close('escape');
         if (parentMenu) parentMenu.refocus();
+        else restoreFocus(api);
         break;
-      case 'Tab':
+      case 'Tab': {
         e.preventDefault();
         close('tab');
         parentMenu?.closeAll?.();
+        let root = api;
+        while (root.parentMenu) root = root.parentMenu;
+        restoreFocus(root);
         break;
+      }
       case 'Enter':
       case ' ':
         e.preventDefault();
@@ -244,7 +256,18 @@ export function openMenu(app, items, { x, y, anchor, onClose, parentMenu = null,
   // `above`: open upward from y (menus anchored to the status bar).
   let top = above ? Math.max(4, (y ?? 0) - mh) : y ?? 0;
   if (left + mw > vw - 4) left = parentMenu ? Math.max(4, left - mw - (parentMenu.el.offsetWidth - 4)) : Math.max(4, vw - mw - 4);
-  if (top + mh > vh - 4) top = Math.max(4, vh - mh - 4);
+  // A menu dropped from a button keeps clear of it (moved up over the button,
+  // a tall menu would put its first item where the button was): it scrolls in
+  // the room below, or opens above when there is more room there.
+  const from = !parentMenu && !above && anchor?.isConnected ? anchor.getBoundingClientRect() : null;
+  if (top + mh > vh - 4 && from) {
+    const below = vh - 4 - top;
+    if (below >= Math.min(mh, 160) || below >= from.top - 6) menu.style.maxHeight = `${below}px`;
+    else {
+      top = Math.max(4, from.top - 2 - mh);
+      menu.style.maxHeight = `${from.top - 2 - top}px`;
+    }
+  } else if (top + mh > vh - 4) top = Math.max(4, vh - mh - 4);
   menu.style.left = `${left}px`;
   menu.style.top = `${top}px`;
 
@@ -252,6 +275,7 @@ export function openMenu(app, items, { x, y, anchor, onClose, parentMenu = null,
     el: menu,
     close,
     parentMenu,
+    anchor,
     returnFocus,
     child: null,
     refocus: () => {
@@ -268,8 +292,16 @@ export function openMenu(app, items, { x, y, anchor, onClose, parentMenu = null,
   if (parentMenu) parentMenu.child = api;
   if (focus === 'first') (focusable()[0] || menu).focus();
   else if (focus === 'last') (focusable().slice(-1)[0] || menu).focus();
-  else menu.focus({ preventScroll: true });
+  // 'keep' leaves focus where it is (a search field that keeps taking typing).
+  else if (focus !== 'keep') menu.focus({ preventScroll: true });
   return api;
+}
+
+/** After a menu is dismissed: back to the button that opened it, else to what had focus before. */
+function restoreFocus(root) {
+  if (document.activeElement && document.activeElement !== document.body && document.activeElement.isConnected) return;
+  const back = root.anchor?.isConnected ? root.anchor : root.returnFocus;
+  if (back?.isConnected && back !== document.body) back.focus({ preventScroll: true });
 }
 
 /** The application menu bar. */
@@ -284,6 +316,8 @@ export function createMenubar(app, menus) {
     const btn = buttons[i];
     const r = btn.getBoundingClientRect();
     openIndex = i;
+    // Roving tabindex follows the open menu, so Escape and Tab leave from its button.
+    buttons.forEach((b, j) => (b.tabIndex = j === i ? 0 : -1));
     btn.setAttribute('aria-expanded', 'true');
     btn.classList.add('open');
     const items = resolveItems(app, menus[i].submenu);
@@ -320,8 +354,8 @@ export function createMenubar(app, menus) {
         'aria-expanded': 'false',
         tabindex: i === 0 ? '0' : '-1',
         onclick: () => (open && openIndex === i ? open.close('toggle') : openAt(i)),
-        onpointerenter: () => {
-          if (open && openIndex !== i) openAt(i, 'none');
+        onpointerenter: (e) => {
+          if (open && openIndex !== i && hovering(e)) openAt(i, 'none');
         },
         onkeydown: (e) => {
           if (e.key === 'ArrowRight' || e.key === 'ArrowLeft') {

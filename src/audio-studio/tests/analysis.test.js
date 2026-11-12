@@ -1,10 +1,11 @@
 import { describe, it, expect } from 'vitest';
 import { testDsp } from './wasm-helper.js';
 import { loudnessMeter, limiter, bitDepth, windowRms, averageSpectrum, pitchTrack, maskBlend } from '../src/analysis/dsp-ext.js';
-import { planMatch, MATCH_DEFAULTS, LOUDNESS_PRESETS } from '../src/analysis/loudness.js';
+import { planMatch, matchOutcome, MATCH_DEFAULTS, LOUDNESS_PRESETS } from '../src/analysis/loudness.js';
 import { statsRows } from '../src/analysis/amplitude.js';
 import { correlation } from '../src/analysis/phase.js';
 import { fmtDb, gainToDb } from '../src/analysis/common.js';
+import { liveWindow } from '../src/analysis/frequency.js';
 
 const sine = (f, a, n, rate = 48000, ph = 0) => Float32Array.from({ length: n }, (_, i) => a * Math.sin((2 * Math.PI * f * i) / rate + ph));
 
@@ -92,6 +93,17 @@ describe('Match Loudness planning', () => {
     expect(p.gainDb).toBeCloseTo(2);
     expect(p.note).toMatch(/-22.0 LUFS/);
   });
+  it('says when limiting kept a file below the target', () => {
+    const s = { ...MATCH_DEFAULTS, target: -16, peak: -1 };
+    const plan = planMatch({ integrated: -26, truePeakDb: -3 }, s);
+    expect(plan.action).toBe('limit');
+    expect(matchOutcome(plan, { integrated: -16.2 }, s)).toEqual({ text: 'Gain with limiting', short: false });
+    expect(matchOutcome(plan, { integrated: -24 }, s)).toEqual({ text: 'Gain with limiting: reached -24.0 LUFS', short: true });
+    expect(matchOutcome(planMatch({ integrated: -20, truePeakDb: -10 }, s), { integrated: -16 }, s)).toEqual({ text: 'Gain +4.0 dB', short: false });
+    const capped = planMatch({ integrated: -24, truePeakDb: -3 }, { ...s, limit: false });
+    expect(matchOutcome(capped, { integrated: -22 }, { ...s, limit: false }).short).toBe(true);
+  });
+
   it('skips files within tolerance and silent files', () => {
     expect(planMatch({ integrated: -16.3, truePeakDb: -5 }, s).action).toBe('skip');
     expect(planMatch({ integrated: -Infinity, truePeakDb: -Infinity }, s).action).toBe('skip');
@@ -121,5 +133,28 @@ describe('analysis helpers', () => {
     expect(get('Dynamic Range')[0]).toBe('12.04 dB');
     expect(get('Integrated Loudness')).toBe('-20.00 LUFS');
     expect(fmtDb(-Infinity)).toBe('-∞');
+  });
+});
+
+describe('live frequency analysis', () => {
+  it('fills FFT sizes larger than a mixer tap from earlier taps', () => {
+    const d = testDsp();
+    const TAP = 8192;
+    const size = 16384;
+    const x = sine(1000, 1, 48000);
+    // Taps every 4096 frames, each holding the latest TAP frames played.
+    const tapAt = (end) => ({ L: x.slice(end - TAP, end), R: x.slice(end - TAP, end), frame: end });
+    let hist = null;
+    for (const end of [8192, 12288, 16384, 20480]) hist = liveWindow(hist, tapAt(end), size);
+    expect(Array.from(hist.L)).toEqual(Array.from(x.subarray(20480 - size, 20480)));
+    const peak = (a) => Math.max(...a);
+    const a = d.analyzer(size, 0);
+    // As loud as a full window of the tone (a half-filled window reads 6 dB low).
+    expect(peak(a.frame(hist.L))).toBeCloseTo(peak(a.frame(x.subarray(0, size))), 1);
+    // A seek moves the window by a whole tap; the newest frames are always the tap's.
+    hist = liveWindow(hist, tapAt(40000), size);
+    expect(Array.from(hist.R.subarray(size - TAP))).toEqual(Array.from(x.subarray(40000 - TAP, 40000)));
+    // Sizes a tap covers come straight from it.
+    expect(Array.from(liveWindow(hist, tapAt(40000), 4096).L)).toEqual(Array.from(x.subarray(40000 - 4096, 40000)));
   });
 });

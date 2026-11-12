@@ -394,6 +394,14 @@ export function shortcutsDialog(app) {
     return label(id).toLowerCase().includes(q) || categoryOf(id).toLowerCase().includes(q) || keys.some((k) => formatShortcut(k).toLowerCase().includes(q) || k.toLowerCase().includes(q));
   };
 
+  /** A button in the command's current row (after a rebuild), focused. */
+  function freshChip(id, pick) {
+    const row = tree.querySelector(`.sc-row[data-id="${CSS.escape(id)}"]`);
+    const chip = row && pick(row);
+    chip?.focus({ preventScroll: true });
+    return chip || null;
+  }
+
   function shortcutCell(id) {
     const cell = h('span.sc-keys');
     C.keysFor(id).forEach((k, i) => {
@@ -401,7 +409,8 @@ export function shortcutsDialog(app) {
       chip.addEventListener('click', (e) => {
         e.stopPropagation();
         selectCommand(id);
-        capture(id, i, chip);
+        // Selecting rebuilds the tree: capture on this chip's replacement, which shows "Press keys…".
+        capture(id, i, freshChip(id, (row) => row.querySelectorAll('.sc-chip:not(.sc-add)')[i]));
       });
       cell.append(chip);
     });
@@ -409,7 +418,7 @@ export function shortcutsDialog(app) {
     add.addEventListener('click', (e) => {
       e.stopPropagation();
       selectCommand(id);
-      capture(id, C.keysFor(id).length, add);
+      capture(id, C.keysFor(id).length, freshChip(id, (row) => row.querySelector('.sc-add')));
     });
     cell.append(add);
     return cell;
@@ -514,6 +523,12 @@ export function shortcutsDialog(app) {
         return focusRow(id);
       }
       const combo = eventShortcut(e);
+      // Tab and Shift+Tab move keyboard focus: bound to a command, they would trap it.
+      if (e.key === 'Tab' && !e.altKey && !e.ctrlKey && !e.metaKey) {
+        say(`${formatShortcut(combo)} can't be used: it moves keyboard focus.`);
+        refreshAll();
+        return focusRow(id);
+      }
       if (browserReserved(combo)) {
         say(`${formatShortcut(combo)} can't be used: the browser keeps it for itself.`);
         refreshAll();

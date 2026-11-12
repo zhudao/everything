@@ -3,7 +3,15 @@
 
 import { h } from '../lib/dom.js';
 import { openDialog } from '../ui/dialog.js';
-import { AutosaveStore, buildManifest, planAutosave, recoverable, newSessionId, LOCK_PREFIX } from './autosave.js';
+import {
+  AutosaveStore,
+  buildManifest,
+  planAutosave,
+  recoverable,
+  newSessionId,
+  LOCK_PREFIX,
+  unpackChunks,
+} from './autosave.js';
 import { parseWav } from '../audio/wav.js';
 import { AudioFile } from '../model/audio-file.js';
 import { Channel } from '../audio/channel.js';
@@ -61,11 +69,17 @@ export function installAutosave(app, { store = opfsAvailable() ? new AutosaveSto
       for (const doc of planAutosave(app.documents, written, budget)) {
         if (app.recording && app.recorder?.take && doc === app.active) continue;
         const state = doc.state;
+        const key = keyFor(doc);
         try {
-          await store.write(doc, buildManifest(doc, { session, key: keyFor(doc) }));
-          written.set(doc.id, state);
+          await store.write(doc, buildManifest(doc, { session, key }));
+          // Saved or closed while the copy was being written (drop() ran meanwhile):
+          // remove it, or the next start would offer a closed document for recovery.
+          if (keys.get(doc.id) !== key) await store.remove(key).catch(() => {});
+          else written.set(doc.id, state);
         } catch (err) {
-          if (!warned) {
+          if (keys.get(doc.id) !== key) {
+            await store.remove(key).catch(() => {});
+          } else if (!warned) {
             warned = true;
             console.warn('[autosave]', err);
             app.notify('Autosave could not write to this browser\'s storage. Save your work to Puter or download it.', { error: true });
@@ -150,6 +164,7 @@ export function installAutosave(app, { store = opfsAvailable() ? new AutosaveSto
             info: { bitDepth: m.bitDepth, format: m.format, exportOptions: m.exportOptions || undefined },
             source: m.source?.type === 'puter' ? m.source : { type: 'recovered' },
           });
+          doc.info.wavChunks = unpackChunks(m.wavChunks); // iXML... kept for the next WAV save
           doc.savedState = null; // unsaved until the user saves it
           app.addDocument(doc, { activate: !docs.length });
           docs.push(doc);

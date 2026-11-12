@@ -20,7 +20,7 @@ import { lastValues } from './presets.js';
 import { openEffectDialog } from './dialog.js';
 import { groupedEffects } from './rack.js';
 import { showNotice } from '../ui/notices.js';
-import { createRecorder, actionFromSteps, runSteps, stepProblem, placeSelection } from './favorite-sequence.js';
+import { createRecorder, actionFromSteps, runSteps, runEffectRepeatable, stepProblem, placeSelection } from './favorite-sequence.js';
 
 let nextFav = 1;
 const favId = () => `fav${Date.now().toString(36)}${nextFav++}`;
@@ -179,10 +179,7 @@ export async function applyFavorite(app, fav) {
   }
   const a = fav.action;
   if (a.type === 'sequence') return runSteps(app, a.steps);
-  if (a.type === 'effect') {
-    const def = getEffect(a.effect);
-    return app.runEffect(def.id, { values: normalizeValues(def, a.values) });
-  }
+  if (a.type === 'effect') return runEffectRepeatable(app, getEffect(a.effect), a.values);
   await app.commands.run(a.command, a.args);
   return true;
 }
@@ -290,7 +287,8 @@ export async function newFavoriteDialog(app) {
   const effectSel = h(
     'select.select',
     { 'aria-label': 'Effect' },
-    groupedEffects().map((g) => h('optgroup', { label: g.label }, g.defs.map((d) => h('option', { value: d.id }, d.name)))),
+    // Measuring effects (Loudness Meter) leave the audio unchanged: nothing to save.
+    groupedEffects((d) => !d.measureOnly).map((g) => h('optgroup', { label: g.label }, g.defs.map((d) => h('option', { value: d.id }, d.name)))),
   );
   const shortcut = shortcutField(app, '', null);
   const error = h('div.fx-name-error', { role: 'alert' });
@@ -468,9 +466,13 @@ export function favoritesPanel(app) {
   };
 
   const current = () => loadFavorites(app.prefs).find((f) => f.id === selectedId) || null;
+  // What a selection change can alter: whether each favorite can run.
+  const problems = () => loadFavorites(app.prefs).map((f) => favoriteProblem(app, f)).join('\n');
+  let shownProblems = null;
 
   const render = () => {
     const list = loadFavorites(app.prefs);
+    shownProblems = problems();
     if (selectedId && !list.some((f) => f.id === selectedId)) selectedId = null;
     if (!selectedId && list.length) selectedId = list[0].id;
     const hadFocus = el.contains(document.activeElement) && document.activeElement.tagName === 'TR';
@@ -501,7 +503,11 @@ export function favoritesPanel(app) {
             else return;
             e.preventDefault();
             e.stopPropagation();
-            requestAnimationFrame(() => body.querySelector('tr[aria-selected="true"]')?.focus());
+            // The redrawn row takes the focus back, unless the key opened a dialog that has it.
+            requestAnimationFrame(() => {
+              const a = document.activeElement;
+              if (!a || a === document.body || el.contains(a)) body.querySelector('tr[aria-selected="true"]')?.focus();
+            });
           },
         },
         h('td.name-cell', icon(fav.action?.type === 'effect' ? 'fx' : fav.action?.type === 'sequence' ? 'list-ordered' : 'star', 14), h('span', fav.name)),
@@ -531,7 +537,8 @@ export function favoritesPanel(app) {
   app.prefs.on('change', (key) => key === 'favorites' && render());
   app.on('favorites', render);
   app.on('active', render);
-  app.on('doc-change', (doc, e) => doc === app.active && e.kind === 'selection' && render());
+  // Selection drags fire many changes; redraw only when one changes what a favorite can do.
+  app.on('doc-change', (doc, e) => doc === app.active && e.kind === 'selection' && problems() !== shownProblems && render());
   render();
   return { el, show: render, focus: () => (body.querySelector('tr[aria-selected="true"]') || body.querySelector('tr'))?.focus() };
 }

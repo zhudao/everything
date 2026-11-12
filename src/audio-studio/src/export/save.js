@@ -10,10 +10,16 @@ import { conformOptions, defaultOptions, docBitDepth, formatForName, getFormat }
 import { confirmDialog } from '../ui/dialog.js';
 import * as puter from '../storage/puter.js';
 import { downloadBlob, rememberRecent } from '../storage/files.js';
+import { VIDEO_EXTENSIONS, extensionOf } from '../audio/decode.js';
 
 /** Encodes frames [start, end) of a document with export options. */
 export function encodeDoc(doc, options, { start = 0, end = doc.length, onProgress, signal } = {}) {
-  return exportAudio({ channels: doc.state.channels, sampleRate: doc.sampleRate, start, end, markers: doc.state.markers, meta: doc.state.meta || {} }, options, { onProgress, signal });
+  const { channels, markers, meta } = doc.state;
+  // WAV chunks kept from the opened file (iXML...); the pipeline keeps those still true.
+  const chunks = doc.info?.wavChunks || null;
+  const source = { channels, sampleRate: doc.sampleRate, start, end, markers, chunks };
+  source.meta = meta || {};
+  return exportAudio(source, options, { onProgress, signal });
 }
 
 /** Options for re-saving a document in `format`: what it was last saved with, else its own sample type. */
@@ -28,18 +34,44 @@ function encodeWithProgress(doc, options, range, label) {
   return withProgress(label, (onProgress, signal) => encodeDoc(doc, options, { ...range, onProgress, signal }), { detail: label });
 }
 
-/** File > Save: in place when the document has a Puter file in a writable format, else Save As. */
+/**
+ * Uploads to Puter behind a progress dialog. An upload cannot be stopped, so
+ * Cancel only hides the dialog: a failure is still thrown (withProgress would
+ * report it as a cancel), and the caller never marks an unsaved file saved.
+ */
+async function upload(label, path, blob) {
+  let failure = null;
+  const item = await withProgress(
+    label,
+    () =>
+      puter.writeFile(path, blob).catch((err) => {
+        failure = err;
+        throw err;
+      }),
+    { delay: 600, detail: 'Uploading to Puter' },
+  );
+  if (failure) throw failure;
+  return item;
+}
+
+/**
+ * File > Save: in place when the document has a Puter file in a writable format, else Save As.
+ * A video file (an .mp4 opened for its sound) is never overwritten with audio alone, nor a
+ * raw ADTS .aac stream with an MPEG-4 file (AAC is written only inside .m4a).
+ */
 export async function saveDocument(app, doc, { saveAs = false, copy = false } = {}) {
   if (!doc) return false;
   const path = doc.source?.type === 'puter' ? doc.source.path : null;
-  const format = path ? formatForName(path) : null;
+  const ext = path ? extensionOf(path) : '';
+  const inPlace = path && ext !== 'aac' && !VIDEO_EXTENSIONS.includes(ext);
+  const format = inPlace ? formatForName(path) : null;
   if (!saveAs && !copy && path && format && getFormat(format)) {
     if (!puter.isSignedIn() && !(await puter.signIn().catch(() => false))) return false;
     const options = optionsForSave(doc, format);
     const state = doc.state;
     const blob = await encodeWithProgress(doc, options, {}, `Saving ${doc.name}`);
     if (!blob) return false;
-    await withProgress(`Saving ${doc.name}`, () => puter.writeFile(path, blob), { delay: 600, detail: 'Uploading to Puter' });
+    await upload(`Saving ${doc.name}`, path, blob);
     // Only mark saved if nothing changed while encoding.
     if (doc.state === state) doc.markSaved();
     app.setStatus(`Saved ${doc.name}`);
@@ -86,7 +118,7 @@ export async function saveFlow(app, doc, { mode = 'export', range = null } = {})
     }
     let item = null;
     if (path) {
-      item = await withProgress(label, () => puter.writeFile(path, blob), { delay: 600, detail: 'Uploading to Puter' });
+      item = await upload(label, path, blob);
       rememberRecent(app, { name: r.fileName, path });
     } else downloadBlob(blob, r.fileName);
     if (mode === 'saveAs') {
