@@ -110,10 +110,12 @@ export function createColorPicker({ value = '#000000', onInput, onCommit, label 
     const up = () => {
       svWrap.removeEventListener('pointermove', move);
       svWrap.removeEventListener('pointerup', up);
+      svWrap.removeEventListener('pointercancel', up);
       emit(true);
     };
     svWrap.addEventListener('pointermove', move);
     svWrap.addEventListener('pointerup', up);
+    svWrap.addEventListener('pointercancel', up);
   });
   knob.addEventListener('keydown', (e) => {
     const step = e.shiftKey ? 10 : 1;
@@ -134,8 +136,14 @@ export function createColorPicker({ value = '#000000', onInput, onCommit, label 
     emit(false);
   });
   hue.addEventListener('change', () => emit(true));
-  hex.addEventListener('change', () => setHex(hex.value.startsWith('#') ? hex.value : `#${hex.value}`, true));
-  hex.addEventListener('keydown', (e) => e.stopPropagation());
+  hex.addEventListener('change', () => {
+    const v = hex.value.trim();
+    // Text that is not a color goes back to the current color instead of staying in the field.
+    if (isHex(v)) setHex(v.startsWith('#') ? v : `#${v}`, true);
+    else hex.value = current().slice(1).toUpperCase();
+  });
+  // Escape still reaches the popover or panel around the picker, to close it.
+  hex.addEventListener('keydown', (e) => e.key !== 'Escape' && e.stopPropagation());
   chans.forEach((c) =>
     c.addEventListener('change', () => {
       const [r, g, b] = chans.map((x) => Math.max(0, Math.min(255, Number(x.value) || 0)));

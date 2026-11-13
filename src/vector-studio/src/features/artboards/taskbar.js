@@ -319,7 +319,25 @@ export function installTaskbar(app) {
     }
     refreshValues();
     bar.hidden = false;
+    fit();
     position();
+  }
+
+  /**
+   * Too wide for the canvas (a tablet with the panels open): the buttons
+   * drop their visible labels, as on phones, instead of hiding the last
+   * actions past the bar's edge. Their names become tooltips.
+   */
+  function fit() {
+    bar.classList.remove('compact');
+    const compact = bar.scrollWidth > bar.clientWidth + 1;
+    bar.classList.toggle('compact', compact);
+    for (const b of bar.querySelectorAll('.tb-btn')) {
+      const label = b.querySelector('.icon + span')?.textContent;
+      if (!label) continue;
+      if (compact) b.dataset.tip = label;
+      else delete b.dataset.tip;
+    }
   }
 
   let frame = 0;
@@ -358,10 +376,12 @@ export function installTaskbar(app) {
     const up = () => {
       grip.removeEventListener('pointermove', move);
       grip.removeEventListener('pointerup', up);
+      grip.removeEventListener('pointercancel', up);
       if (app.prefs.values.taskbarPos) app.prefs.set('taskbarPos', { ...app.prefs.values.taskbarPos });
     };
     grip.addEventListener('pointermove', move);
     grip.addEventListener('pointerup', up);
+    grip.addEventListener('pointercancel', up);
   }
 
   app.canvasHost.addEventListener('pointerdown', () => {
