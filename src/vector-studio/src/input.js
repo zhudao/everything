@@ -11,6 +11,10 @@
  *   starts with one finger never selects or deselects anything.
  * - A touch long press opens the context menu (iPad Safari sends no
  *   contextmenu event for it).
+ * - A pen opens the context menu with its side button: clicked with the pen
+ *   just above the screen, or held as the pen taps. A pen tip held still on
+ *   the screen does not: Android turns that hold into a contextmenu event,
+ *   which would interrupt precise drawing.
  * - A pen's eraser end erases with the Eraser tool, whatever the tool.
  * - Palm rejection: while a pen touches the canvas, touches are ignored, and
  *   a pen landing ends whatever a touch (a resting palm) had started.
@@ -86,6 +90,11 @@ export class CanvasInput {
     if (!this.editor) return;
     if (e.pointerType === 'touch' && this.#penDown()) {
       this.palms.add(e.pointerId);
+      return;
+    }
+    if (this.#sideButton(e)) {
+      // A side-button press is no stroke: the pen stays untracked, so it holds back no touch.
+      this.#sideButtonDown(e);
       return;
     }
     if (e.pointerType === 'pen') this.#rejectPalms();
@@ -164,6 +173,8 @@ export class CanvasInput {
     const p = this.pendingTouch;
     if (!p) return;
     clearTimeout(p.timer);
+    // Keep the press origin after settling so later movement cancels the hold.
+    this.touchStart = { x: p.x, y: p.y };
     this.pendingTouch = null;
     if (this.pointers.has(p.e.pointerId) || this.lifting === p.e.pointerId)
       this.#startTool(p.e, dragged);
@@ -208,8 +219,39 @@ export class CanvasInput {
       this.active = null;
     }
     this.longPressed = true;
-    this.lastTouchMenu = performance.now();
+    this.lastPressMenu = performance.now();
     this.#openContextMenu(e);
+  }
+
+  /**
+   * Whether a pen event, with the tip off the screen, has the side button
+   * pressed. The Pointer Events spec reports it as button 2. Android reports
+   * the S Pen button clicked in the air as the contact bit with no pressure,
+   * in hovering moves.
+   */
+  #sideButton(e) {
+    if (e.pointerType !== 'pen' || this.pointers.has(e.pointerId)) return false;
+    return e.button === 2 || (e.buttons & 2) !== 0 || ((e.buttons & 1) !== 0 && !e.pressure);
+  }
+
+  /** The side button went down: one menu per press, where the pen is. */
+  #sideButtonDown(e) {
+    if (this.sidePressed) return;
+    this.sidePressed = true;
+    // A tap with the button held already opened it through contextmenu.
+    if (this.lastContextMenu && performance.now() - this.lastContextMenu < 1500) return;
+    this.lastPressMenu = performance.now();
+    this.#openContextMenu(e);
+  }
+
+  /**
+   * A contextmenu event from a pen tip held still on the screen. Android
+   * sends it while the pen touches, as a right-button press, and Windows as
+   * it lifts. A tap with the side button held sends one with no pen press,
+   * so it is not one of these.
+   */
+  #penHold() {
+    return this.#penDown() || (this.penLifted && performance.now() - this.penLifted < 500);
   }
 
   /**
@@ -259,13 +301,19 @@ export class CanvasInput {
 
   move(e) {
     if (!this.editor || this.palms.has(e.pointerId)) return;
+    if (e.pointerType === 'pen' && !this.pointers.has(e.pointerId)) {
+      if (this.#sideButton(e)) {
+        this.#sideButtonDown(e);
+        return;
+      }
+      if (!e.buttons) this.sidePressed = false;
+    }
     if (this.pointers.has(e.pointerId)) this.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY, type: e.pointerType });
     if (e.pointerType === 'touch' && this.pointers.has(e.pointerId)) {
       if (this.longPressed) return;
       const p = this.pendingTouch;
       const start = p || this.touchStart;
       if (p && p.e.pointerId === e.pointerId && Math.hypot(e.clientX - p.x, e.clientY - p.y) > 4) {
-        this.touchStart = { x: p.x, y: p.y };
         this.#flushTouch(true);
       }
       if (this.longPressTimer && start && Math.hypot(e.clientX - start.x, e.clientY - start.y) > TOUCH_SLOP) {
@@ -279,6 +327,7 @@ export class CanvasInput {
       return;
     }
     if (this.pan) {
+      if (this.pan.id !== e.pointerId) return;
       const v = this.editor.view;
       v.set({ panX: this.pan.panX + e.clientX - this.pan.x, panY: this.pan.panY + e.clientY - this.pan.y });
       this.editor.viewChanged();
@@ -298,6 +347,7 @@ export class CanvasInput {
 
   up(e) {
     if (this.palms.delete(e.pointerId)) return;
+    this.#penUp(e);
     if (e.pointerType === 'touch') {
       clearTimeout(this.longPressTimer);
       this.longPressTimer = 0;
@@ -321,6 +371,7 @@ export class CanvasInput {
       return;
     }
     if (this.pan) {
+      if (this.pan.id !== e.pointerId) return;
       this.pan = null;
       this.app.setCanvasCursor(this.currentTool()?.cursor || 'default');
       this.#applyPendingTempTool();
@@ -346,8 +397,33 @@ export class CanvasInput {
     return true;
   }
 
+  /** End document-owned input before the app changes the active editor. */
+  reset() {
+    this.#clearTouchTimers();
+    this.sidePressed = false;
+    this.pendingTouch = null;
+    this.touchStart = null;
+    this.longPressed = false;
+    this.lifting = null;
+    if (this.active) {
+      this.active.tool.cancel?.();
+      this.#endPress(this.active.tool);
+      this.active = null;
+    }
+    this.pan = null;
+    this.gesture = null;
+    this.pointers.clear();
+    this.palms.clear();
+    this.lastClick = { t: 0, x: 0, y: 0 };
+    this.pendingTempTool = null;
+    this.spaceDown = false;
+    this.setTempTool(null);
+    this.app.setCanvasCursor(this.app.tool?.cursor || 'default');
+  }
+
   cancel(e) {
     if (this.palms.delete(e.pointerId)) return;
+    this.#penUp(e);
     if (this.pendingTouch?.e.pointerId === e.pointerId) this.pendingTouch = null;
     this.#clearTouchTimers();
     this.longPressed = false;
@@ -357,7 +433,10 @@ export class CanvasInput {
       this.#endPress(this.active.tool);
       this.active = null;
     }
-    this.pan = null;
+    if (this.pan?.id === e.pointerId) {
+      this.pan = null;
+      this.app.setCanvasCursor(this.currentTool()?.cursor || 'default');
+    }
     if (this.pointers.size < 2) this.gesture = null;
     this.#applyPendingTempTool();
   }
@@ -370,12 +449,20 @@ export class CanvasInput {
    * pointerup or pointercancel nothing is active and this does nothing.
    */
   lostCapture(e) {
-    if (this.pan && !this.active && this.pointers.has(e.pointerId)) {
+    if (this.pan?.id === e.pointerId && !this.active) {
       this.pointers.delete(e.pointerId);
       this.pan = null;
       this.app.setCanvasCursor(this.currentTool()?.cursor || 'default');
       this.#applyPendingTempTool();
       return;
+    }
+    if (this.pointers.get(e.pointerId)?.type === 'touch') {
+      this.#clearTouchTimers();
+      this.pendingTouch = null;
+      this.touchStart = null;
+      this.longPressed = false;
+      this.pointers.delete(e.pointerId);
+      if (this.pointers.size < 2) this.gesture = null;
     }
     if (!this.active || this.active.id !== e.pointerId) return;
     const { tool, last } = this.active;
@@ -399,7 +486,7 @@ export class CanvasInput {
 
   startPan(e) {
     const v = this.editor.view;
-    this.pan = { x: e.clientX, y: e.clientY, panX: v.panX, panY: v.panY };
+    this.pan = { id: e.pointerId, x: e.clientX, y: e.clientY, panX: v.panX, panY: v.panY };
     this.app.setCanvasCursor('grabbing');
   }
 
@@ -457,11 +544,19 @@ export class CanvasInput {
     this.editor.viewChanged();
   }
 
+  /** A pen lifted: its side button is up, and a tip that touched remembers when. */
+  #penUp(e) {
+    if (e.pointerType !== 'pen') return;
+    if (!e.buttons) this.sidePressed = false;
+    if (this.pointers.has(e.pointerId)) this.penLifted = performance.now();
+  }
+
   contextMenu(e) {
     e.preventDefault();
-    if (!this.editor || this.gesture) return;
-    // Android also fires contextmenu after a long press: the touch handler already opened it.
-    if (this.lastTouchMenu && performance.now() - this.lastTouchMenu < 1500) return;
+    if (!this.editor || this.gesture || this.#penHold()) return;
+    // Android also fires contextmenu after a long press or a side-button press: that press already opened it.
+    if (this.lastPressMenu && performance.now() - this.lastPressMenu < 1500) return;
+    this.lastContextMenu = performance.now();
     this.#openContextMenu(e);
   }
 

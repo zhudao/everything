@@ -22,6 +22,7 @@
  * the copies (and parts of copies) that fall inside it.
  */
 import { uid } from '../../lib/ids.js';
+import { stackPaints } from '../../model/appearance.js';
 import { nodeBounds, visualBounds, unionRect } from '../../model/geometry.js';
 
 export const TILE_TYPES = [
@@ -187,6 +188,8 @@ export function previewCopies(def, copies = '5x5') {
 }
 
 const viewCache = new WeakMap();
+const EMPTY_PATTERNS = [];
+const EMPTY_ASSETS = new Map();
 
 /**
  * A read-only document view of a definition's art (get/has/assets/root/walk),
@@ -194,15 +197,37 @@ const viewCache = new WeakMap();
  */
 export function patternView(doc, def) {
   let v = viewCache.get(def);
-  if (v && v.assets === (doc?.assets || v.assets)) return v;
+  const assets = doc?.assets || EMPTY_ASSETS;
+  const patterns = doc?.root?.patterns || EMPTY_PATTERNS;
+  if (v && v.assets === assets && v.root.patterns === patterns) return v;
   const map = new Map();
-  for (const n of def.art?.nodes || []) map.set(n.id, n);
-  const roots = (def.art?.roots || []).filter((id) => map.has(id));
-  const root = { id: '__pattern', type: 'root', children: roots, artboards: [], patterns: doc?.root?.patterns || [] };
+  for (const n of Array.isArray(def.art?.nodes) ? def.art.nodes : []) {
+    if (n && typeof n.id === 'string' && n.id !== '__pattern') map.set(n.id, n);
+  }
+  // Pattern art can come from libraries or damaged files. Give each node one
+  // place in the tree so bounds and rendering cannot recurse through a cycle.
+  // Repair only the view; the stored definition and valid node identities stay intact.
+  const claimed = new Set(['__pattern']);
+  const claimChildren = (ids) => (Array.isArray(ids) ? ids : []).filter((id) => {
+    if (!map.has(id) || claimed.has(id)) return false;
+    claimed.add(id);
+    return true;
+  });
+  const roots = claimChildren(def.art?.roots);
+  const pending = roots.slice().reverse();
+  while (pending.length) {
+    const id = pending.pop();
+    const node = map.get(id);
+    if (node.children === undefined) continue;
+    const children = claimChildren(node.children);
+    if (!Array.isArray(node.children) || children.length !== node.children.length) map.set(id, { ...node, children });
+    for (let i = children.length - 1; i >= 0; i--) pending.push(children[i]);
+  }
+  const root = { id: '__pattern', type: 'root', children: roots, artboards: [], patterns };
   v = {
     get: (id) => (id === root.id ? root : map.get(id)),
     has: (id) => id === root.id || map.has(id),
-    assets: doc?.assets || new Map(),
+    assets,
     root,
     name: def.name,
     artboards: [],
@@ -262,6 +287,7 @@ export const patternClipboardHook = {
     const visitNode = (n) => {
       visit(n.fill);
       visit(n.stroke);
+      for (const paint of stackPaints(n)) visit(paint);
       if (n.runs) for (const r of n.runs) visit(r.fill), visit(r.stroke);
     };
     for (const item of data.items || []) for (const n of item.nodes || []) visitNode(n);

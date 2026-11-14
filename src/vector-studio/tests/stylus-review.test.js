@@ -199,6 +199,170 @@ describe("the pen's eraser end", () => {
   });
 });
 
+describe('the context menu and a pen', () => {
+  // Android sends contextmenu for a pen tip held still, as a right-button press.
+  const menuEvent = (x, y, extra = {}) => ({ ...ptr(x, y, { button: 2, buttons: 2, ...extra }), preventDefault: vi.fn() });
+  const sidePen = (x, y, extra = {}) => pen(x, y, { button: 2, buttons: 2, ...extra });
+
+  function rect() {
+    const doc = app.editor.doc;
+    const p = createPath(rectangle(100, 100, 200, 200), true, { fill: { type: 'solid', color: '#ff0000' }, stroke: null });
+    doc.transact('Rect', () => app.editor.insertDrawn(p));
+    app.editor.clearSelection();
+    return p.id;
+  }
+
+  let menu;
+  beforeEach(() => {
+    Object.assign(app.input, { lastPressMenu: 0, lastContextMenu: 0, penLifted: 0, sidePressed: false });
+    menu = vi.spyOn(app, 'showContextMenu');
+    return () => menu.mockRestore();
+  });
+
+  it('a pen tip held still while drawing opens no menu, and the stroke goes on', () => {
+    app.setTool('pencil');
+    const before = paths().length;
+    const input = app.input;
+    input.down(pen(100, 100));
+    input.move(pen(140, 120));
+    const e = menuEvent(140, 120, { pointerType: 'pen', pointerId: 7 });
+    input.contextMenu(e);
+    expect(e.preventDefault).toHaveBeenCalled();
+    expect(menu).not.toHaveBeenCalled();
+    input.move(pen(180, 160));
+    input.up(pen(180, 160, { buttons: 0 }));
+    expect(paths().length).toBe(before + 1);
+  });
+
+  it('ignores the hold however the browser labels the event while the pen is down', () => {
+    app.setTool('selection');
+    const input = app.input;
+    input.down(pen(500, 500));
+    input.contextMenu(menuEvent(500, 500, { pointerType: 'mouse' }));
+    input.contextMenu(menuEvent(500, 500, { pointerType: 'touch' }));
+    input.up(pen(500, 500, { buttons: 0 }));
+    expect(menu).not.toHaveBeenCalled();
+  });
+
+  it('a tap with the side button pressed opens the menu on the object, and draws nothing', () => {
+    const id = rect();
+    app.setTool('selection');
+    const before = paths().length;
+    const input = app.input;
+    input.down(sidePen(150, 150));
+    expect(menu).toHaveBeenCalledTimes(1);
+    expect(app.editor.selection.has(id)).toBe(true);
+    // The browser's own contextmenu for the same tap opens no second menu.
+    input.contextMenu(menuEvent(150, 150, { pointerType: 'pen', pointerId: 7 }));
+    input.up(sidePen(150, 150, { buttons: 0 }));
+    expect(menu).toHaveBeenCalledTimes(1);
+    expect(paths().length).toBe(before);
+    expect(input.active).toBe(null);
+  });
+
+  it('the side button counts when it is already held as the pen lands (buttons only)', () => {
+    app.setTool('pencil');
+    const before = paths().length;
+    app.input.down(pen(600, 600, { button: 0, buttons: 3 }));
+    app.input.up(pen(600, 600, { buttons: 0 }));
+    expect(menu).toHaveBeenCalledTimes(1);
+    expect(paths().length).toBe(before);
+  });
+
+  it('the menu opened by the side button stays open when the pen lifts', () => {
+    app.setTool('selection');
+    const host = app.canvasHost;
+    const fire = (type, extra = {}) => host.dispatchEvent(new PointerEvent(type, { bubbles: true, cancelable: true, pointerId: 7, pointerType: 'pen', isPrimary: true, clientX: 300, clientY: 300, ...extra }));
+    fire('pointerdown', { button: 2, buttons: 2 });
+    expect(document.querySelector('.menu')).not.toBeNull();
+    fire('pointerup', { button: 2, buttons: 0 });
+    expect(document.querySelector('.menu')).not.toBeNull();
+    document.querySelectorAll('.menu').forEach((m) => m.remove());
+  });
+
+  // Android, on a Samsung tablet with an S Pen: the button clicked in the air
+  // arrives as hovering moves with the contact bit and no pressure.
+  const hover = (x, y, extra = {}) => pen(x, y, { button: -1, buttons: 0, pressure: 0, ...extra });
+
+  it('the side button clicked with the pen in the air opens the menu once per click', () => {
+    app.setTool('pencil');
+    const before = paths().length;
+    const input = app.input;
+    input.move(hover(300, 300));
+    input.move(hover(302, 301, { button: 0, buttons: 1 }));
+    expect(menu).toHaveBeenCalledTimes(1);
+    expect(menu).toHaveBeenLastCalledWith(302, 301);
+    input.move(hover(304, 302, { buttons: 1 }));
+    input.move(hover(306, 303, { buttons: 1 }));
+    expect(menu).toHaveBeenCalledTimes(1);
+    input.move(hover(306, 303));
+    input.move(hover(400, 400, { button: 0, buttons: 1 }));
+    expect(menu).toHaveBeenCalledTimes(2);
+    expect(paths().length).toBe(before);
+    expect(input.active).toBe(null);
+  });
+
+  it('an air click that arrives as a press with no pressure draws nothing and holds back no touch', () => {
+    app.setTool('pencil');
+    const before = paths().length;
+    const input = app.input;
+    input.down(pen(300, 300, { buttons: 1, pressure: 0 }));
+    input.up(pen(300, 300, { buttons: 0, pressure: 0 }));
+    expect(menu).toHaveBeenCalledTimes(1);
+    expect(paths().length).toBe(before);
+    // The pen is not on the screen, so a finger is no palm.
+    input.down(touch(500, 500));
+    expect(input.palms.has(20)).toBe(false);
+    input.cancel(touch(500, 500));
+  });
+
+  it('a tap with the side button held opens the menu from the browser contextmenu alone', () => {
+    app.setTool('pencil');
+    const input = app.input;
+    // No pen press arrives: only contextmenu, labelled pen, mouse or nothing depending on the browser.
+    for (const pointerType of ['pen', 'mouse', '']) {
+      input.lastContextMenu = 0;
+      input.sidePressed = false;
+      menu.mockClear();
+      input.contextMenu(menuEvent(250, 250, { pointerType }));
+      expect(menu).toHaveBeenCalledTimes(1);
+      // Then hovering moves with the button held, as the pen leaves the screen: still one menu.
+      input.move(hover(252, 250, { button: 0, buttons: 1 }));
+      input.move(hover(254, 250));
+      expect(menu).toHaveBeenCalledTimes(1);
+    }
+  });
+
+  it('a hold sent just as the pen tip lifts opens no menu', () => {
+    app.setTool('pencil');
+    const input = app.input;
+    input.down(pen(100, 100));
+    input.up(pen(100, 100, { buttons: 0 }));
+    input.contextMenu(menuEvent(100, 100, { pointerType: 'pen' }));
+    expect(menu).not.toHaveBeenCalled();
+  });
+
+  it('quick air clicks replace the menu instead of stacking menus', () => {
+    menu.mockRestore();
+    app.setTool('pencil');
+    const input = app.input;
+    for (let i = 0; i < 4; i++) {
+      input.move(hover(300 + i * 20, 300, { button: 0, buttons: 1 }));
+      input.move(hover(300 + i * 20, 300));
+    }
+    const menus = document.querySelectorAll('.menu');
+    expect(menus).toHaveLength(1);
+    expect(menus[0].style.left).toBe('360px');
+    menus[0].remove();
+  });
+
+  it('a mouse right-click still opens the menu', () => {
+    app.setTool('selection');
+    app.input.contextMenu(menuEvent(300, 300));
+    expect(menu).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe('brush outlines when the pen leaves', () => {
   for (const id of ['eraser', 'blob-brush', 'warp', 'symbol-sprayer']) {
     it(`the ${id} outline goes when the pen lifts out of range, and stays while it drags`, () => {
