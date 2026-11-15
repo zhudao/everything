@@ -115,7 +115,16 @@ function makeWorld({
     return emailWorker.call(init.method || 'GET', parsed.pathname + parsed.search, {
       headers: init.headers || {},
       body: init.body,
-      user: { ...HOST, puter: { authToken: 'caller-token' } },
+      // The worker's view of the session: it builds Reply-To from the username,
+      // and sends only for an account /whoami calls permanent.
+      user: {
+        ...HOST,
+        username: 'host',
+        puter: {
+          authToken: 'caller-token',
+          auth: { getUser: async () => ({ ...HOST, username: 'host', is_temp: false, email_confirmed: true }) },
+        },
+      },
     });
   });
 
@@ -267,7 +276,7 @@ describe('invites: sending', () => {
     expect(message.subject).toMatch(/^Invitation: Team offsite — /);
     expect(message.text).toContain('Pier 39');
     expect(message.text).toContain(world.invites.planFor(event).ready[0].rsvpUrl + '/accept');
-    expect(message.replyTo).toBe(HOST.email);
+    expect(message.replyTo).toBe('host@puter.email');
 
     // A real iTIP invitation: the guest's mail client renders working native
     // RSVP buttons only for METHOD:REQUEST, with the instant pinned to a zone
@@ -1333,7 +1342,7 @@ describe('invites: an invitation names its host', () => {
     expect(requestEmail).toHaveBeenCalledTimes(1);
 
     const [message] = world.mail;
-    expect(message.replyTo).toBe(HOST.email);
+    expect(message.replyTo).toBe('host@puter.email');
     expect(message.text).toContain(`${HOST.email} invited you`);
     // The guest's calendar reads the organizer from here — without it Google
     // Calendar files the event under unknownorganizer@calendar.google.com.
@@ -1350,7 +1359,7 @@ describe('invites: an invitation names its host', () => {
     const cancel = world.invites.cancellationFor(event);
     await world.store.deleteEvent(event.id);
     await world.invites.sendCancellation(cancel);
-    expect(world.mail[1].replyTo).toBe(HOST.email);
+    expect(world.mail[1].replyTo).toBe('host@puter.email');
     const cancelIcs = Buffer.from(world.mail[1].attachments[0].content, 'base64').toString('utf8');
     expect(cancelIcs).toContain(`ORGANIZER:mailto:${HOST.email}`);
   });
@@ -1378,7 +1387,7 @@ describe('invites: an invitation names its host', () => {
 
       approve(HOST.email);
       await expect(sending).resolves.toMatchObject({ sent: 1 });
-      expect(world.mail[0].replyTo).toBe(HOST.email);
+      expect(world.mail[0].replyTo).toBe('host@puter.email');
       expect(world.invites.planFor(anonymous.event).pending).toHaveLength(0);
     } finally {
       approve(undefined);
@@ -1405,7 +1414,7 @@ describe('invites: an invitation names its host', () => {
     known = HOST;
     world.invites.sendWhenReady(event);
     await until(() => world.mail.length > 0);
-    expect(world.mail[0].replyTo).toBe(HOST.email);
+    expect(world.mail[0].replyTo).toBe('host@puter.email');
     expect(requestEmail).not.toHaveBeenCalled();
   });
 });

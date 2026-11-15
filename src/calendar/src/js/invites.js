@@ -21,8 +21,9 @@
  *
  * Every message names its host. The .ics ORGANIZER is what the guest's
  * calendar shows as the organizer (Google Calendar files one without it under
- * "unknownorganizer@calendar.google.com"), Reply-To is where their mail
- * client's own RSVP buttons answer, and the body says who invited them. Puter
+ * "unknownorganizer@calendar.google.com") and where their mail client's own
+ * RSVP buttons answer, and the body says who invited them. Reply-To is not
+ * ours to set: the worker makes it the sender's <username>@puter.email. Puter
  * withholds the account's email until the user grants it, so an event saved
  * while that was unknown carries no organizer (modal.js saves rather than lose
  * the edit); a send resolves the address then — silently when the grant has
@@ -68,6 +69,10 @@ const SENT_PREFIX = 'cal:invite:';
 /** Why an invitation stays unsent when nobody can be named as its host. */
 export const NO_HOST_EMAIL =
   'Invitations need your email address so guests can see who invited them. Allow Calendar to read it, then send again.';
+
+/** The worker's answer to a temporary account, or one with an unconfirmed email. */
+export const ACCOUNT_NOT_VERIFIED =
+  'Sending email needs a Puter account with a confirmed email address. Create one or confirm yours, then send again.';
 
 /** A stored or reported address, or '' for anything that isn't one. */
 function normalizeEmail(value) {
@@ -433,8 +438,8 @@ export function createInvites({
     if (!canSend()) return { ok: true, sent: 0, skipped: 0, failed: 0, results: [] };
     const ev = ownerEvent(item);
     if (!ev || !planFor(item).eventId) throw new Error('Only the organizer can send invitations.');
-    // The mail speaks for its host — .ics ORGANIZER, Reply-To, "<host> invited
-    // you" — and an event saved while my address was unknown carries none.
+    // The mail speaks for its host — .ics ORGANIZER, "<host> invited you" —
+    // and an event saved while my address was unknown carries none.
     // Resolve it before the plan is read (its digests include the address), or
     // refuse: an anonymous invitation files under an unknown organizer in the
     // guest's calendar and gives their RSVP buttons nobody to answer.
@@ -779,6 +784,7 @@ export function createInvites({
     if (status === 401 || code === 'sign_in_required') {
       return 'Sign in to Puter again to send the cancellation.';
     }
+    if (code === 'account_not_verified') return ACCOUNT_NOT_VERIFIED;
     if (status === 429 || code === 'daily_limit') {
       return "You've reached today's email limit. Try again tomorrow.";
     }
@@ -866,6 +872,7 @@ export function createInvites({
       return "You've reached today's invitation limit. Try again tomorrow.";
     }
     if (status === 404) return 'The invitation service is unavailable right now.';
+    if (code === 'account_not_verified') return ACCOUNT_NOT_VERIFIED;
     // The worker binds the mail's organizer to the signed-in account; a
     // mismatch means the session and this window disagree about who that is.
     if (status === 403 || code === 'organizer_mismatch') {

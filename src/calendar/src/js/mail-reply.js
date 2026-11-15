@@ -24,7 +24,7 @@
  * dialog, and `sendReply` is reached solely through its "Send" button.
  */
 import { toICS } from './ics.js';
-import { EMAIL_WORKER_URL, digest, describeWhen } from './invites.js';
+import { EMAIL_WORKER_URL, ACCOUNT_NOT_VERIFIED, digest, describeWhen } from './invites.js';
 import { getUser, requestUserEmail } from './auth.js';
 import { isBlocked } from './offline.js';
 import { toast as defaultToast } from './toast.js';
@@ -93,6 +93,7 @@ function replyFailureMessage(status, data) {
   const code = (data && data.error) || '';
   if (status === 401 || code === 'sign_in_required') return 'Sign in to Puter again to send your reply.';
   if (status === 429 || code === 'daily_limit') return "You've reached today's email limit. Try again tomorrow.";
+  if (code === 'account_not_verified') return ACCOUNT_NOT_VERIFIED;
   if (status === 403 || code === 'attendee_mismatch') {
     return 'Sign in to Puter again — this reply would not be sent from your account.';
   }

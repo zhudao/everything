@@ -10,10 +10,23 @@ const RAW = readFileSync(
   'utf8',
 );
 
+// What /whoami says of a permanent account with a confirmed email — the only
+// kind the worker sends for.
+const ACCOUNT = {
+  uuid: 'user-uuid-1',
+  username: 'host',
+  email: 'host@example.com',
+  is_temp: false,
+  email_confirmed: true,
+};
+
+// The session's own word on who is calling: the worker builds Reply-To from
+// `username` and accepts `email` (or <username>@puter.email) as the organizer.
 const CALLER = {
   uuid: 'user-uuid-1',
   username: 'host',
-  puter: { authToken: 'caller-token' },
+  email: 'host@example.com',
+  puter: { authToken: 'caller-token', auth: { getUser: async () => ACCOUNT } },
 };
 
 const LINK = 'https://cal-rsvp-abc123.puter.work/rsvp/' + 'a'.repeat(40);
@@ -124,14 +137,14 @@ describe('email worker: access', () => {
       // No uuid/username on the context object itself.
       puter: {
         ...world.caller.puter,
-        auth: { getUser: async () => ({ uuid: 'user-uuid-9' }) },
+        auth: { getUser: async () => ({ ...ACCOUNT, uuid: 'user-uuid-9', username: 'nine' }) },
       },
     };
     expect((await (await post(world, payload(), { user: anonymous })).json()).sent).toBe(1);
 
     // And that id — not a blank shared one — is what keyed the record: the
     // same event to the same guest from a DIFFERENT caller still sends.
-    const other = { uuid: 'user-uuid-2', puter: world.caller.puter };
+    const other = { ...CALLER, uuid: 'user-uuid-2', puter: world.caller.puter };
     expect((await (await post(world, payload(), { user: other })).json()).sent).toBe(1);
     // ...while a repeat from the first caller is recognized as a duplicate.
     const repeat = await (await post(world, payload(), { user: anonymous })).json();
@@ -141,7 +154,8 @@ describe('email worker: access', () => {
 
   it('refuses a session it cannot pin to a person, rather than sharing a bucket', async () => {
     const world = loadWorker();
-    const faceless = { puter: { ...world.caller.puter } }; // no id, no auth handle
+    const { auth, ...puter } = world.caller.puter;
+    const faceless = { puter }; // no id, no auth handle
     const res = await post(world, payload(), { user: faceless });
     expect(res.status).toBe(401);
     expect((await res.json())).toMatchObject({ error: 'sign_in_required', detail: 'no_identity' });
@@ -215,7 +229,8 @@ describe('email worker: the message', () => {
     expect(first.text).not.toContain(LINK2);
     expect(second.text).toContain(`${LINK2}/decline`);
     // Answers come back to the calendar, but a reply goes to the organizer.
-    expect(first.replyTo).toBe('host@example.com');
+    // The caller's own Puter mailbox — not the organizer address in the body.
+    expect(first.replyTo).toBe('host@puter.email');
     expect(first.subject).toBe(
       'Invitation: Team offsite — Thu, Aug 13, 2026 · 9:00 – 10:00 AM (PDT)',
     );
@@ -391,10 +406,72 @@ describe('email worker: never send the same thing twice', () => {
   });
 });
 
+describe('email worker: only a verified account sends', () => {
+  const asAccount = (who) => ({
+    uuid: CALLER.uuid,
+    username: CALLER.username,
+    puter: { ...CALLER.puter, auth: { getUser: async () => who } },
+  });
+  const refused = async (world, user, detail) => {
+    for (const route of ['/invites', '/cancellations', '/replies']) {
+      const res = await world.worker.call('POST', route, { json: payload(), user });
+      expect(res.status).toBe(403);
+      expect(await res.json()).toEqual({ error: 'account_not_verified', detail });
+    }
+    expect(world.sent).toHaveLength(0);
+  };
+
+  it('refuses a temporary account, which takes no signup to get', async () => {
+    const world = loadWorker();
+    await refused(world, asAccount({ ...ACCOUNT, email: null, is_temp: true }), 'temporary_account');
+    // Not being told is not being told "permanent".
+    await refused(world, asAccount({ ...ACCOUNT, is_temp: undefined }), 'temporary_account');
+  });
+
+  it('refuses an account whose email is still awaiting confirmation', async () => {
+    const world = loadWorker();
+    await refused(
+      world,
+      asAccount({ ...ACCOUNT, requires_email_confirmation: 1, email_confirmed: 0 }),
+      'email_unconfirmed',
+    );
+  });
+
+  it('asks a session whose account cannot be read to sign in again', async () => {
+    const world = loadWorker();
+    const failing = asAccount(null);
+    failing.puter.auth.getUser = async () => {
+      throw new Error('whoami unreachable');
+    };
+    const unreadable = [{ uuid: CALLER.uuid, username: CALLER.username, puter: { authToken: 't' } }, failing];
+    for (const user of unreadable) {
+      const res = await post(world, payload(), { user });
+      expect(res.status).toBe(401);
+      expect(await res.json()).toEqual({ error: 'sign_in_required', detail: 'no_account' });
+    }
+    expect(world.sent).toHaveLength(0);
+  });
+
+  it('sends for an older account that was never asked to confirm', async () => {
+    const world = loadWorker();
+    // The unconfirmed address is still not one the mail may name as organizer.
+    const asMailbox = payload({ event: { ...payload().event, organizerEmail: 'host@puter.email' } });
+    const res = await post(world, asMailbox, {
+      user: asAccount({ ...ACCOUNT, requires_email_confirmation: 0, email_confirmed: 0 }),
+    });
+    expect(res.status).toBe(200);
+    expect((await res.json()).sent).toBe(1);
+  });
+});
+
 describe('email worker: the organizer must be the caller', () => {
+  // An account whose address is only reachable through its own Puter.
   const asUser = (email) => ({
-    ...CALLER,
-    puter: { ...CALLER.puter, auth: { getUser: async () => ({ uuid: CALLER.uuid, email }) } },
+    uuid: CALLER.uuid,
+    puter: {
+      ...CALLER.puter,
+      auth: { getUser: async () => ({ ...ACCOUNT, email }) },
+    },
   });
 
   it('refuses an organizer address that is not the signed-in caller', async () => {
@@ -409,12 +486,64 @@ describe('email worker: the organizer must be the caller', () => {
     expect(world.sent).toHaveLength(0);
   });
 
-  it('sends when the organizer is the caller, or when the platform cannot say who that is', async () => {
+  const withOrganizer = (organizerEmail) => payload({ event: { ...payload().event, organizerEmail } });
+
+  it("sends when the organizer is the caller's account email or their own Puter mailbox", async () => {
     const world = loadWorker();
     expect((await post(world, payload(), { user: asUser('HOST@example.com') })).status).toBe(200);
-    // No address on the session: nothing to compare against, the send stands.
     const world2 = loadWorker();
-    expect((await post(world2, payload())).status).toBe(200);
+    expect((await post(world2, withOrganizer('host@puter.email'), { user: asUser('') })).status).toBe(200);
+  });
+
+  it('refuses an organizer the session cannot vouch for, instead of taking the request at its word', async () => {
+    // The platform shares no account email: the old check had nothing to
+    // compare against and let any organizer through.
+    const world = loadWorker();
+    const res = await post(world, withOrganizer('ceo@bank.example'), { user: asUser(undefined) });
+    expect(res.status).toBe(403);
+    expect((await res.json()).error).toBe('organizer_mismatch');
+    expect(world.sent).toHaveLength(0);
+  });
+
+  it('does not vouch for an account email the platform marks unconfirmed', async () => {
+    const world = loadWorker();
+    const unconfirmed = {
+      puter: {
+        ...CALLER.puter,
+        auth: {
+          getUser: async () => ({ ...ACCOUNT, email: 'ceo@bank.example', email_confirmed: false }),
+        },
+      },
+    };
+    const res = await post(world, withOrganizer('ceo@bank.example'), { user: unconfirmed });
+    expect(res.status).toBe(403);
+    expect(world.sent).toHaveLength(0);
+  });
+
+  it("sets Reply-To to the caller's <username>@puter.email, whatever the request says", async () => {
+    const world = loadWorker();
+    const res = await post(
+      world,
+      { ...withOrganizer(''), replyTo: 'attacker@evil.example', event: { ...payload().event, organizerEmail: '', replyTo: 'attacker@evil.example' } },
+      { user: asUser('host@example.com') },
+    );
+    expect(res.status).toBe(200);
+    expect(world.sent).toHaveLength(1);
+    expect(world.sent[0].replyTo).toBe('host@puter.email');
+  });
+
+  it('refuses to send for a session that cannot be pinned to a username', async () => {
+    const world = loadWorker();
+    const nameless = {
+      uuid: CALLER.uuid,
+      puter: { ...CALLER.puter, auth: { getUser: async () => ({ ...ACCOUNT, username: undefined }) } },
+    };
+    for (const route of ['/invites', '/cancellations', '/replies']) {
+      const res = await world.worker.call('POST', route, { json: payload(), user: nameless });
+      expect(res.status).toBe(401);
+      expect(await res.json()).toMatchObject({ error: 'sign_in_required', detail: 'no_username' });
+    }
+    expect(world.sent).toHaveLength(0);
   });
 });
 
@@ -652,7 +781,13 @@ describe('email worker: cancellations', () => {
 
   it('still notifies guests when no host email is available', async () => {
     const world = loadWorker();
-    const res = await postCancel(world, payload({ event: { ...payload().event, organizerEmail: '' } }));
+    const res = await postCancel(world, payload({ event: { ...payload().event, organizerEmail: '' } }), {
+      user: {
+        ...world.caller,
+        email: '',
+        puter: { ...world.caller.puter, auth: { getUser: async () => ({ ...ACCOUNT, email: undefined }) } },
+      },
+    });
     expect((await res.json()).sent).toBe(1);
     expect(world.sent[0].to).toBe('ada@example.com');
   });
@@ -873,9 +1008,13 @@ describe('email worker: the daily cap and a request that needs no mail', () => {
   });
 });
 describe('email worker: replies (the /replies fallback for mail-received invitations)', () => {
+  // An account whose address is only reachable through its own Puter.
   const asUser = (email) => ({
-    ...CALLER,
-    puter: { ...CALLER.puter, auth: { getUser: async () => ({ uuid: CALLER.uuid, email }) } },
+    uuid: CALLER.uuid,
+    puter: {
+      ...CALLER.puter,
+      auth: { getUser: async () => ({ ...ACCOUNT, email }) },
+    },
   });
 
   function replyIcs({ organizerEmail = 'alice@example.com', attendeeEmail = 'host@example.com', status = 'ACCEPTED', method = 'REPLY' } = {}) {
@@ -915,10 +1054,10 @@ describe('email worker: replies (the /replies fallback for mail-received invitat
   const postReply = (world, body = replyPayload(), user = world.caller) =>
     world.worker.call('POST', '/replies', { json: body, user });
 
-  it('reports version 11 from /health', async () => {
+  it('reports version 13 from /health', async () => {
     const world = loadWorker();
     const res = await world.worker.call('GET', '/health');
-    expect((await res.json())).toMatchObject({ ok: true, version: '11' });
+    expect((await res.json())).toMatchObject({ ok: true, version: '13' });
   });
 
   it('composes and sends a reply to the organizer, with no links anywhere', async () => {
@@ -945,6 +1084,14 @@ describe('email worker: replies (the /replies fallback for mail-received invitat
       replyPayload({ attendee: { email: 'someoneelse@example.com', name: 'Nope' } }),
       asUser('host@example.com'),
     );
+    expect(res.status).toBe(403);
+    expect((await res.json()).error).toBe('attendee_mismatch');
+    expect(world.sent).toHaveLength(0);
+  });
+
+  it('refuses a reply as an unverifiable address when the platform shares no account email', async () => {
+    const world = loadWorker();
+    const res = await postReply(world, replyPayload(), asUser(undefined));
     expect(res.status).toBe(403);
     expect((await res.json()).error).toBe('attendee_mismatch');
     expect(world.sent).toHaveLength(0);
