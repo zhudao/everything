@@ -1,12 +1,12 @@
 /**
- * Files feature: the native .vstudio format, opening and saving in the
+ * Files feature: documents as PDF-compatible .ai files, opening and saving in the
  * Puter cloud or on this computer, recent files, autosave and recovery,
  * New Document / New from Template, Document Setup, Document Info and
  * Preferences, Puter launch items and window close handling.
  */
 import { BookmarkPlus, RectangleVertical } from 'lucide';
 import { registerIcons } from '../../ui/icons.js';
-import { baseName, dirName, extensionOf } from './naming.js';
+import { NATIVE_EXT, LEGACY_EXT, baseName, dirName, extensionOf } from './naming.js';
 import { RecentFiles } from './recent.js';
 import { Autosaver } from './autosave.js';
 import { FileService } from './service.js';
@@ -98,13 +98,17 @@ function recentMenuItems(app, files) {
   ];
 }
 
-/** Dropping .vstudio files anywhere opens them; .svg opens when no document is showing. */
+/**
+ * Dropping .ai (or .vstudio) documents opens them; other files open when no
+ * document is showing. Onto the canvas of an open document, a .ai file is
+ * placed as artwork instead (io/system.js handles that drop first).
+ */
 function installDrop(app, service) {
   const hasFiles = (e) => [...(e.dataTransfer?.types || [])].includes('Files');
   const ours = (name) => {
     const ext = extensionOf(name);
     const other = ext === '.svg' || ext === '.svgz' || (app.importers?.openExtensions || []).includes(ext);
-    return ext === '.vstudio' || (other && (!app.editor || !app.home.hidden));
+    return ext === NATIVE_EXT || ext === LEGACY_EXT || (other && (!app.editor || !app.home.hidden));
   };
   window.addEventListener('dragover', (e) => {
     if (e.defaultPrevented || !hasFiles(e)) return;
@@ -125,27 +129,58 @@ function installDrop(app, service) {
     // Chromium can hand over a writable handle, so Save writes back to the dropped file.
     const handles = await Promise.all(picked.map(({ it }) => (it.getAsFileSystemHandle ? it.getAsFileSystemHandle().catch(() => null) : null)));
     for (let i = 0; i < picked.length; i++) {
-      const handle = handles[i]?.kind === 'file' && extensionOf(picked[i].file.name) === '.vstudio' ? handles[i] : null;
+      const handle = handles[i]?.kind === 'file' && [NATIVE_EXT, LEGACY_EXT].includes(extensionOf(picked[i].file.name)) ? handles[i] : null;
       await service.openFileBlob(picked[i].file, { handle });
     }
   });
 }
 
-/** Puter desktop integration: launch items, window title, close prompt. */
+/**
+ * Puter desktop integration: files handed over by the desktop (a double-click,
+ * "Open with", a drag from the desktop or a folder window), and, in a desktop
+ * window, the window title and the close prompt.
+ *
+ * The desktop opens an app in a window of its own (app.env is 'app') or in a
+ * browser tab, where the SDK reports 'web' and hands the session and the file
+ * over a moment after load. Files are taken in both.
+ * https://docs.puter.com/UI/onLaunchedWithItems/
+ */
 export function installPuterHooks(app, service) {
   const puter = app.puter;
   const ui = puter?.ui;
-  if (!ui || app.env !== 'app') return;
-  const openItems = async (items) => {
+  if (!ui) return;
+  const isDir = (it) => Boolean(it.is_dir || it.isDir || it.isDirectory || it.fsentry_is_dir);
+  const openItems = async (given) => {
+    const items = (Array.isArray(given) ? given : [given]).filter((it) => it && typeof it === 'object');
+    const files = items.filter((it) => typeof it.path === 'string' && it.path && !isDir(it));
+    if (!files.length) {
+      if (items.some(isDir)) app.notify?.('Folders cannot be opened. Open the files inside instead.');
+      return;
+    }
     // An open dialog (and the preview it shows) is cancelled first, so the document is never left mid-change.
-    if (items?.length) await cancelOpenDialogs();
-    for (const it of items || []) {
-      if (!it || it.is_dir || it.isDir || !it.path) continue;
-      await service.openPath(it.path, { name: it.name || baseName(it.path) });
+    await cancelOpenDialogs();
+    // In a browser tab the session arrives with the file: the app follows it, so Save goes to the cloud.
+    if (!app.user && puter.auth?.isSignedIn?.()) await Promise.resolve(app.onSessionChange?.()).catch(() => {});
+    for (const it of files) {
+      await service.openPath(it.path, { name: it.name || baseName(it.path), ...(typeof it.read === 'function' ? { item: it } : {}) });
     }
   };
-  ui.onLaunchedWithItems?.(openItems);
-  ui.onItemsOpened?.(openItems);
+  try {
+    // The SDK answers at once (or as soon as the desktop has handed it over) when the app was started with a file.
+    ui.onLaunchedWithItems?.(openItems);
+    ui.onItemsOpened?.(openItems);
+  } catch {
+    // An SDK without launch items.
+  }
+  // Files dragged in from the Puter desktop do not arrive as a browser drop: the SDK
+  // dispatches a drop of its own with the drive's entries in its detail.
+  window.addEventListener('drop', (e) => {
+    const items = e.detail?.items;
+    if (e.dataTransfer || !Array.isArray(items)) return;
+    e.preventDefault();
+    openItems(items);
+  });
+  if (app.env !== 'app') return;
 
   // Mirror the page title (document name, unsaved marker) onto the Puter window.
   let last = '';
