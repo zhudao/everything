@@ -6,7 +6,7 @@ import { assertSize, layer, MAX_LAYERS, type Layer, type PhotoDocument } from '.
 import { newPixelLayer } from '../../model/pixel-layer';
 import { gridFromImage } from '../../model/tiles';
 import { encodeIccProfile } from '../../model/psd-resources';
-import { readRgbProfile } from '../../color/profile';
+import { curveValue, readRgbProfile, srgbProfile } from '../../color/profile';
 import type { RGBA8 } from '../../imaging/types';
 import { decodeImage } from '../../imaging/codecs/decode';
 import { decodeIco, pickIcoEntry } from '../../imaging/codecs/ico';
@@ -20,6 +20,7 @@ import { decodePng16, rgba16To8 } from './png';
 import { decodeApng, isApng } from '../../imaging/codecs/apng';
 import { framesFromLayers, maxFrames } from '../../model/animation';
 import { noteRecent, type RecentSource } from './recent';
+import { flatSaveFormat } from './formats';
 import { emitAppEvent, openedFiles } from '../../app/app-events';
 
 const browserTypes: Record<string, string> = {
@@ -114,7 +115,14 @@ async function decodeWithCodecs(bytes: Uint8Array, _name: string, opts: DecodeOp
   if (!d) throw new Error('Unsupported image format.');
   assertSize(d.width, d.height);
   const notes = d.notes.filter((n) => !/first was opened/.test(n));
-  const out: DecodedFile = { image: applyOrientation(d.rgba8, d.orientation), icc: d.icc, dpi: d.dpi?.x };
+  // The decoders turn gray and CMYK samples into RGB, which a Gray or CMYK
+  // profile does not describe: only an RGB profile tags the document.
+  const icc = d.icc?.length && iccColorSpace(d.icc) === 'RGB ' ? d.icc : undefined;
+  if (d.icc?.length && !icc) notes.push(`The embedded ${spaceNames[iccColorSpace(d.icc)] ?? 'color'} profile does not describe the opened RGB pixels and was not applied.`);
+  // Untagged float samples are linear sRGB (as in the 32-bit document they
+  // open as); the 8-bit image, which callers read as sRGB, is encoded from them.
+  if (d.dataF32 && !icc) encodeLinearSrgb(d.dataF32, d.rgba8.data);
+  const out: DecodedFile = { image: applyOrientation(d.rgba8, d.orientation), icc, dpi: d.dpi?.x };
   if (d.data16) out.deep = { data: orient(d.data16, d.width, d.height, d.orientation), depth: 16 };
   else if (d.dataF32) out.deep = { data: orient(d.dataF32, d.width, d.height, d.orientation), depth: 32 };
   if (d.tiffPages && d.tiffPages.length > 1) {
@@ -139,6 +147,21 @@ async function decodeWithCodecs(bytes: Uint8Array, _name: string, opts: DecodeOp
   if (notes.length) out.notice = notes.join(' ');
   return out;
 }
+
+/** Linear float RGB as 8-bit sRGB into `out` (alpha is left as it is). */
+function encodeLinearSrgb(samples: Float32Array, out: Uint8ClampedArray) {
+  const steps = 16384;
+  const table = new Uint8ClampedArray(steps + 1);
+  for (let i = 0; i <= steps; i++) table[i] = curveValue(srgbProfile.curves[0], i / steps, true) * 255;
+  for (let i = 0; i < out.length; i++)
+    if ((i & 3) !== 3) {
+      const v = samples[i];
+      out[i] = v > 0 ? table[Math.round(Math.min(1, v) * steps)] : 0;
+    }
+}
+/** The data color space signature of an ICC profile ('RGB ', 'GRAY', 'CMYK'...). */
+const iccColorSpace = (icc: Uint8Array) => (icc.length >= 20 ? String.fromCharCode(...icc.subarray(16, 20)) : '');
+const spaceNames: Record<string, string> = { GRAY: 'Gray', CMYK: 'CMYK', 'Lab ': 'Lab' };
 
 /** True when the renderer's color management can use this RGB profile. */
 function usableProfile(icc: Uint8Array | undefined) {
@@ -331,6 +354,14 @@ export async function openFile(e: Editor, blob: Blob, name: string, place = fals
     return true;
   }
   if (isProject || isPsd) {
+    // A project or PSD on Puter that is already open saves back to the same
+    // file: a second tab of it would overwrite one tab's work with the other's.
+    const open = source.kind === 'puter' ? e.sessions.find((x) => x.hasDocument && x.storage.path === source.path) : undefined;
+    if (open) {
+      await e.switchSession(open);
+      e.message(`${name} is already open.`);
+      return true;
+    }
     // The document is named after the file without its extension.
     const psdName = /\.ps[db]$/i.test(name) ? name : name.replace(/\.[^.]+$/, '');
     const loaded = isPsd ? await (await import('../../model/psd')).openPsd(blob, psdName, e.engine) : await deserialize(blob);
@@ -352,9 +383,20 @@ export async function openFile(e: Editor, blob: Blob, name: string, place = fals
     noteRecent(e, name, source);
     e.message(isPsd ? 'PSD opened' : 'Project opened');
     if ('notice' in loaded && loaded.notice) information('PSD import', `<p>${escapeXML(String(loaded.notice))}</p>`);
-    openedFiles.set(s, { blob, name });
+    openedFiles.set(s, { blob, name, path: source.kind === 'puter' ? source.path : undefined });
     void emitAppEvent('open-document', s);
     return true;
+  }
+  // An image file on Puter that Save writes back to (PNG, JPEG, ...): like a
+  // project, a second tab of it would overwrite one tab's work with the other's.
+  const savesBack = source.kind === 'puter' && !!flatSaveFormat(lower);
+  if (savesBack && source.kind === 'puter') {
+    const open = e.sessions.find((x) => x.hasDocument && x.storage.path === source.path);
+    if (open) {
+      await e.switchSession(open);
+      e.message(`${name} is already open.`);
+      return true;
+    }
   }
   let decoded: DecodedFile;
   try {
@@ -390,6 +432,7 @@ export async function openFile(e: Editor, blob: Blob, name: string, place = fals
   s.history.reset(doc);
   s.hasDocument = true;
   s.storage.reset();
+  if (savesBack && source.kind === 'puter') s.storage.path = source.path;
   s.saved = s.doc;
   s.fileName = name;
   e.selected = doc.layers.at(decoded.animation ? 0 : -1)!.id;
@@ -399,7 +442,7 @@ export async function openFile(e: Editor, blob: Blob, name: string, place = fals
   e.update();
   noteRecent(e, name, source);
   e.message(decoded.notice ?? (doc.animation ? `Opened ${name} as a ${doc.animation.frames.length}-frame animation` : `Opened ${name}`));
-  openedFiles.set(s, { blob, name });
+  openedFiles.set(s, { blob, name, path: source.kind === 'puter' ? source.path : undefined });
   void emitAppEvent('open-document', s);
   return true;
 }
