@@ -27,7 +27,9 @@ export function compileSpec(spec: AdjustmentSpec): CompiledLut | null {
     out.curves = { r: comp(r), g: comp(g), b: comp(b) };
   }
   if (c.lut3d) out.lut3d = c.lut3d;
-  if (c.postCurves) out.postCurves = c.postCurves;
+  // A hard step is compared exactly in the shader (a table would blur it).
+  if (c.postStep !== undefined) out.postStep = c.postStep;
+  else if (c.postCurves) out.postCurves = c.postCurves;
   return out.curves || out.lut3d ? out : null;
 }
 
@@ -36,9 +38,10 @@ export function compileSpec(spec: AdjustmentSpec): CompiledLut | null {
 export function compileSpatial(spec: AdjustmentSpec): SpatialFilter | null {
   // Called every frame for every adjustment layer: skip the normalization
   // (which copies payloads such as LUT files) for the color kinds.
-  if (spec?.kind !== 'clarity-dehaze' && spec?.kind !== 'grain') return null;
+  if (spec?.kind !== 'clarity-dehaze' && spec?.kind !== 'grain' && spec?.kind !== 'relight') return null;
   const adj = specAdjustment(spec);
   if (!adj || isIdentityAdjustment(adj)) return null;
+  if (adj.kind === 'relight') return { type: 'relight', params: adj.params };
   if (adj.kind === 'clarity-dehaze') return { type: 'clarity-dehaze', ...clarityDehazeAmounts(adj.params) };
   if (adj.kind === 'grain') {
     const g = grainAmounts(adj.params);

@@ -168,6 +168,32 @@ test('Erase to History restores the history source instead of erasing', async ({
   expect(await layerPixel(page, 100, 60)).toEqual([128, 128, 128, 255]);
 });
 
+test('Alt-drag with the Eraser erases to history for that stroke', async ({ page }) => {
+  await setTool(page, 'brush', { size: 30, hardness: 1 });
+  await page.evaluate(() => window.photoStudio.setForeground('#ff00ff'));
+  await canvasDrag(page, [
+    [60, 60],
+    [140, 60],
+  ]);
+  await setTool(page, 'eraser', { size: 30, hardness: 1 }, { eraserMode: 'brush', eraseToHistory: false });
+  await canvasDrag(
+    page,
+    [
+      [60, 60],
+      [100, 60],
+    ],
+    6,
+    ['Alt'],
+  );
+  expect(await layerPixel(page, 80, 60)).toEqual([128, 128, 128, 255]);
+  // Without Alt the Eraser erases as usual.
+  await canvasDrag(page, [
+    [110, 60],
+    [140, 60],
+  ]);
+  expect((await layerPixel(page, 125, 60))[3]).toBe(0);
+});
+
 test('Alt-click with the Brush picks the foreground color without painting', async ({ page }) => {
   await filledLayer(page, [10, 120, 230, 255]);
   await setTool(page, 'brush');
@@ -386,4 +412,31 @@ test('the Sponge keeps its own Flow apart from the Dodge and Burn Exposure', asy
   await expect(flow).toHaveValue('70');
   await setTool(page, 'burn');
   await expect(page.locator('#tone-exposure')).toHaveValue('10');
+});
+
+test('a quick Mixer Brush click with Sample All Layers is stored as soon as it ends', async ({
+  page,
+}) => {
+  // Reading the layers below a large image outlasts a quick click.
+  await openImage(page, 3000, 2000, '#ffffff', 'large.png');
+  await page.evaluate(() => window.photoStudio.setTool('mixer-brush'));
+  await page.evaluate(() => window.photoStudio.setForeground('#000000'));
+  await page.locator('#mixer-all').check();
+  await idle(page);
+  // Any edit means the layers below must be read again when the stroke starts.
+  await page.evaluate(() =>
+    window.photoStudio.command('Rename', (d) => {
+      d.layers[0].name = 'Photo';
+    }),
+  );
+  await idle(page);
+  const [x, y] = await page.evaluate(() => window.photoStudio.clientPoint(100, 100));
+  await page.mouse.move(x, y);
+  await page.mouse.down();
+  await page.mouse.up();
+  await expect
+    .poll(() => page.evaluate(() => window.photoStudio.history.labels.at(-1)))
+    .toBe('Mixer Brush');
+  await idle(page);
+  expect((await layerPixel(page, 100, 100))[0]).toBeLessThan(200);
 });

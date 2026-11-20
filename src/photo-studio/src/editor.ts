@@ -13,6 +13,7 @@ import { Dock } from './app/dock';
 import { bindCanvas, type CanvasPointer } from './app/pointer';
 import { commands, findCommand, overlays, tools, type Tool } from './app/registry';
 import { brushSizeStep, eventShortcut, platformShortcut } from './app/shortcuts';
+import { SpringTools } from './app/spring-tools';
 import { watchOptionTips } from './app/option-tips';
 import { scrollableRow } from './app/scroll-row';
 import { svg } from './app/icons';
@@ -623,6 +624,9 @@ export class Editor {
     this.el('.canvas-color-mode').textContent = `${this.colorModeLabel} / ${depth}`;
     this.el('#empty').hidden = this.hasDocument;
     this.root.classList.toggle('no-document', !this.hasDocument);
+    // The start screen covers the document area, and the options it dims
+    // ignore the pointer: the keyboard and screen readers skip them too.
+    for (const sel of ['.document-tabs', '.canvas-area', '#tool-options']) this.el(sel).inert = !this.hasDocument;
     this.windows.renderTabs();
     this.options();
     this.toolbar?.render();
@@ -816,7 +820,9 @@ export class Editor {
     this.root.classList.toggle('rulers-hidden', !this.preferences.showRulers);
     if (this.preferences.showRulers) {
       const unit = rulerUnitScale(this.doc, this.preferences.rulerUnits);
-      setMarkup(this.el('#ruler-x'), rulerTicks(viewport.clientWidth, viewport.clientWidth / 2 + this.pan.x - (this.doc.width * this.zoom * aspect) / 2, this.zoom * aspect, false, unit.x));
+      // A flipped view has the image's left edge, the ruler's zero, on the right.
+      const sx = this.zoom * aspect * (this.activeView.flip ? -1 : 1);
+      setMarkup(this.el('#ruler-x'), rulerTicks(viewport.clientWidth, viewport.clientWidth / 2 + this.pan.x - (this.doc.width * sx) / 2, sx, false, unit.x));
       setMarkup(this.el('#ruler-y'), rulerTicks(viewport.clientHeight, viewport.clientHeight / 2 + this.pan.y - (this.doc.height * this.zoom) / 2, this.zoom, true, unit.y));
     }
     this.screenOverlay();
@@ -968,9 +974,14 @@ export class Editor {
     });
     viewport.addEventListener('contextmenu', (e) => {
       e.preventDefault();
+      if (this.hasDocument && this.activeTool?.contextMenu?.(this, e)) return;
       void import('./app/menubar').then(({ showContextMenu }) => showContextMenu(this, e.clientX, e.clientY, this.canvasContextMenu()));
     });
     document.addEventListener('keydown', (e) => this.keyDown(e));
+    // Spring-loaded tools: using the tool or holding its key returns to the previous tool on release.
+    viewport.addEventListener('pointerdown', () => this.springTools.use(), true);
+    document.addEventListener('keyup', (e) => this.springRelease(e.code));
+    window.addEventListener('blur', () => this.springTools.cancel());
     // Window resizes, panel changes and document window layouts all resize the viewport.
     new ResizeObserver(() => {
       this.view();
@@ -1031,7 +1042,10 @@ export class Editor {
       this.el('#viewport').focus({ preventScroll: true });
       return;
     }
-    const typing = !!target.closest('input,textarea,select,[contenteditable="true"],[role="slider"]');
+    // A checkbox or radio button (focused by the click that set it) keeps only
+    // the keys it uses itself; tool keys and shortcuts such as Select All work.
+    const toggle = target instanceof HTMLInputElement && (target.type === 'checkbox' || target.type === 'radio');
+    const typing = toggle ? [' ', 'Enter', 'Tab'].includes(e.key) || e.key.startsWith('Arrow') : !!target.closest('input,textarea,select,[contenteditable="true"],[role="slider"]');
     if (target.closest('dialog')) return;
     // A modal dialog makes the workspace behind it inert: keys that reach the
     // page (the focus fell off a control the dialog rebuilt, or Tab left its
@@ -1084,9 +1098,19 @@ export class Editor {
       void this.runCommand(c.id);
       return;
     }
-    if (!e.metaKey && !e.ctrlKey && !e.altKey && /^[A-Z]$/.test(shortcut.replace('Shift+', '')) && this.toolbar.shortcut(shortcut.replace('Shift+', ''), e.shiftKey)) {
-      e.preventDefault();
-      return;
+    if (!e.metaKey && !e.ctrlKey && !e.altKey && /^[A-Z]$/.test(shortcut.replace('Shift+', ''))) {
+      // Holding a tool key keeps the tool only while it is down: auto-repeat
+      // must neither cycle the group nor restart the hold.
+      if (e.repeat && this.springTools.repeat(e.code)) {
+        e.preventDefault();
+        return;
+      }
+      const previous = this.tool;
+      if (this.toolbar.shortcut(shortcut.replace('Shift+', ''), e.shiftKey)) {
+        e.preventDefault();
+        if (!e.repeat) this.springTools.press(e.code, previous, this.tool, performance.now());
+        return;
+      }
     }
     // [ and ] change the brush size of brush-like tools, with Shift the hardness.
     const brush = this.activeTool?.brush;
@@ -1117,6 +1141,17 @@ export class Editor {
   }
   // The last number key, for two-digit opacity values.
   private digit?: { n: number; at: number };
+  private springTools = new SpringTools();
+  private springRelease(code: string) {
+    const back = this.springTools.release(code, performance.now());
+    if (!back || !tools.has(back) || modalDialogOpen()) return;
+    // A stroke still in progress ends with the temporary tool first.
+    const restore = () => {
+      if (this.toolBusy) window.setTimeout(restore, 50);
+      else if (this.tool !== back) this.setTool(back);
+    };
+    restore();
+  }
 }
 
 /** A text field's caret position, or null where there is none (number fields, buttons). */

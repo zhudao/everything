@@ -6,8 +6,8 @@ import { download } from '../../persistence/puter';
 import { escapeXML } from '../../model/assets';
 import type { Rect } from '../../model/document';
 import { partitionSlices, pieceNames, sliceTableHtml, type Slice, type SliceFormat, type SlicePiece } from '../../model/slices';
-import { formatInfo, prepareExport, type ExportContext, type ExportSettings, type SourceImage } from '../files/encode';
-import { bytesBlob, documentSource, effectiveSettings, encodeOffThread, exportContext, formatBytes, loadSettings } from '../files/pipeline';
+import { formatInfo, type ExportContext, type ExportSettings, type SourceImage } from '../files/encode';
+import { bytesBlob, documentSource, effectiveSettings, encodeOffThread, exportContext, formatBytes, loadSettings, prepareOffThread } from '../files/pipeline';
 import { uniqueName, zipStore, type ZipEntry } from '../files/zip';
 
 export type WebSettings = { format: SliceFormat; quality: number; colors: number; dither: boolean; transparency: boolean; matte: string };
@@ -175,19 +175,38 @@ export async function exportForWeb(e: Editor) {
   let originalUrl = '';
   let pieces = allPieces;
   const ctx: ExportContext = { profile: null };
-  const prepare = async () => {
-    if (prepared && preparedScale === scale) return prepared;
-    const src = await documentSource(e, doc);
-    const s = effectiveSettings(doc, { ...loadSettings(), format: 'png', transparency: true, depth: 8, sizeMode: 'percent', scale, canvasWidth: 0, canvasHeight: 0, convertSrgb: true });
-    prepared = prepareExport(src, s, exportContext(doc));
-    preparedScale = scale;
-    pieces = scalePieces(allPieces, prepared.width / doc.width);
-    const c = new OffscreenCanvas(prepared.width, prepared.height);
-    c.getContext('2d')!.putImageData(new ImageData(new Uint8ClampedArray(prepared.data as Uint8ClampedArray), prepared.width, prepared.height), 0, 0);
-    if (originalUrl) URL.revokeObjectURL(originalUrl);
-    originalUrl = URL.createObjectURL(await c.convertToBlob({ type: 'image/png' }));
-    for (const p of panes) clearPane(p);
-    return prepared;
+  let preparing: { scale: number; job: Promise<SourceImage> } | undefined;
+  const prepare = (): Promise<SourceImage> => {
+    if (prepared && preparedScale === scale) return Promise.resolve(prepared);
+    // Panes ask at the same time: they share one composite and conversion.
+    if (preparing?.scale === scale) return preparing.job;
+    const at = scale;
+    const job = (async () => {
+      const src = await documentSource(e, doc);
+      const s = effectiveSettings(doc, { ...loadSettings(), format: 'png', transparency: true, depth: 8, sizeMode: 'percent', scale: at, canvasWidth: 0, canvasHeight: 0, convertSrgb: true });
+      // Converting a large composite takes a while: the export worker does it.
+      const ready = await prepareOffThread(src, s, exportContext(doc), true);
+      prepared = ready;
+      preparedScale = at;
+      pieces = scalePieces(allPieces, ready.width / doc.width);
+      const c = new OffscreenCanvas(ready.width, ready.height);
+      c.getContext('2d')!.putImageData(new ImageData(new Uint8ClampedArray(ready.data as Uint8ClampedArray), ready.width, ready.height), 0, 0);
+      if (originalUrl) URL.revokeObjectURL(originalUrl);
+      originalUrl = URL.createObjectURL(await c.convertToBlob({ type: 'image/png' }));
+      // Closed while it was prepared: nothing shows it any more.
+      if (closed) {
+        URL.revokeObjectURL(originalUrl);
+        originalUrl = '';
+      }
+      for (const p of panes) clearPane(p);
+      return ready;
+    })();
+    preparing = { scale: at, job };
+    const done = () => {
+      if (preparing?.job === job) preparing = undefined;
+    };
+    job.then(done, done);
+    return job;
   };
   const clearPane = (p: Pane) => {
     for (const x of p.encoded.values()) URL.revokeObjectURL(x.url);
@@ -314,16 +333,20 @@ export async function exportForWeb(e: Editor) {
 
   let timer = 0;
   let closed = false;
+  // While Export encodes, previews wait: encoding a pane again would cancel
+  // the export's own encoding of it.
+  let exporting = false;
   const refresh = () => {
     clearTimeout(timer);
     timer = window.setTimeout(async () => {
+      if (exporting) return;
       try {
         render();
         // The current pane first, so its numbers settle soonest.
         const order = [active, ...visiblePanes().filter((i) => i >= 0 && i !== active)];
         if (view === 'original') await prepare();
         for (const i of order) {
-          if (closed) return;
+          if (closed || exporting) return;
           if (await encodePane(panes[i])) render();
         }
         render();
@@ -423,13 +446,20 @@ export async function exportForWeb(e: Editor) {
     dialog.querySelector('[data-act="cancel"]')!.addEventListener('click', close);
     form.addEventListener('submit', async (ev) => {
       ev.preventDefault();
+      if (exporting) return;
+      exporting = true;
+      clearTimeout(timer);
       const buttons = dialog.querySelectorAll<HTMLButtonElement>('.export-actions button');
       buttons.forEach((b) => (b.disabled = true));
       const total = dialog.querySelector('.web-total')!;
       total.textContent = 'Encoding…';
       try {
         const p = panes[active];
-        await encodePane(p);
+        // A preview that was encoding this pane when Export was pressed
+        // gives way to the export (its own result is dropped).
+        if (!(await encodePane(p)) || !paneComplete(p)) await encodePane(p);
+        if (closed) return;
+        if (!paneComplete(p)) throw new Error('The images could not be encoded; try Export again.');
         const base = field<HTMLInputElement>('base').value.trim().replace(/[\\/:*?"<>|]+/g, '_') || 'image';
         const html = field<HTMLInputElement>('html').checked;
         const names = pieceNames(pieces, base);
@@ -462,6 +492,7 @@ export async function exportForWeb(e: Editor) {
         download(bytesBlob(zip, 'application/zip'), `${base}-web.zip`);
         e.message(`Exported ${pieces.length} image${pieces.length > 1 ? 's' : ''}${html ? ' and an HTML page' : ''} (${formatBytes(zip.length)})`);
       } catch (error) {
+        exporting = false;
         buttons.forEach((b) => (b.disabled = false));
         total.textContent = error instanceof Error ? error.message : String(error);
       }

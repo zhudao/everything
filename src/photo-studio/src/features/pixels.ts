@@ -15,10 +15,11 @@ export function toRGBA8(samples: Uint8Array | Float32Array, width: number, heigh
   for (let i = 0; i < samples.length; i++) data[i] = Math.round(Math.max(0, Math.min(1, samples[i])) * 255);
   return { width, height, data };
 }
-/** Visible composite of the current document as 8-bit RGBA (sample merged). */
-export async function compositeRGBA(e: Editor, doc: PhotoDocument = e.doc): Promise<RGBA8> {
-  const samples = await e.renderer.documentPixels(doc, e.assets);
-  return toRGBA8(samples, doc.width, doc.height);
+/** Visible composite of the current document as 8-bit RGBA (sample merged),
+ * or of a rectangle of it inside the canvas. */
+export async function compositeRGBA(e: Editor, doc: PhotoDocument = e.doc, rect?: IRect): Promise<RGBA8> {
+  const samples = await e.renderer.documentPixels(doc, e.assets, rect);
+  return toRGBA8(samples, rect?.width ?? doc.width, rect?.height ?? doc.height);
 }
 /** Pixels of one layer rendered alone at document size. */
 export async function layerRGBA(e: Editor, l: Layer, doc: PhotoDocument = e.doc): Promise<RGBA8> {
@@ -87,19 +88,22 @@ export type PixelTarget =
  * `resultGrid` results): a preview replaced by the next one, and the last one
  * when the dialog closes, are freed once no render still reads them, instead
  * of staying in memory until a later edit's cleanup. */
+/** Free tiles a live preview showed once no render still reads them (a
+ * preview frame can be queued behind a slow render of a large document). */
+export function retireTiles(e: Editor, ids: string[]) {
+  if (!ids.length) return;
+  const store = e.assets.tiles;
+  const done = () => {
+    for (const id of ids) store.delete(id);
+  };
+  const r = e.renderer;
+  if (r) void r.settle().then(() => requestAnimationFrame(() => void r.settle().then(done)));
+  else done();
+}
 export function previewTiles(e: Editor, base?: TileGrid) {
   const kept = new Set(base ? Object.values(base.tiles) : []);
   let shown: string[] = [];
-  const retire = (ids: string[]) => {
-    if (!ids.length) return;
-    const store = e.assets.tiles;
-    const done = () => {
-      for (const id of ids) store.delete(id);
-    };
-    const r = e.renderer;
-    if (r) void r.settle().then(() => requestAnimationFrame(() => void r.settle().then(done)));
-    else done();
-  };
+  const retire = (ids: string[]) => retireTiles(e, ids);
   return {
     /** Note the grids of the preview now shown; returns the first. */
     show(...grids: TileGrid[]) {
