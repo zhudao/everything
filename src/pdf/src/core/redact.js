@@ -5,6 +5,7 @@ import {
   PDFHexString,
   PDFName,
   PDFNumber,
+  PDFString,
   StandardFontEmbedder,
   StandardFonts,
 } from 'pdf-lib';
@@ -16,7 +17,7 @@ import {
   removeAnnotationThread,
 } from './structure.js';
 import { annotationId } from './links.js';
-import { indexPageText, searchQuery } from './search.js';
+import { foldChar, indexPageText, searchQuery } from './search.js';
 import {
   contentReport,
   filterContent,
@@ -131,7 +132,7 @@ function parseDA(da) {
     ) || [1, 0, 0],
   };
 }
-function readMark(doc, index, ref) {
+function readMark(doc, index, ref, position) {
   const dict = doc.context.lookup(ref);
   if (!(dict instanceof PDFDict) || get(dict, 'Subtype') !== name('Redact')) return null;
   const areas = markAreas(dict);
@@ -142,7 +143,8 @@ function readMark(doc, index, ref) {
   const align = get(dict, 'Q')?.asNumber?.();
   return {
     page: index,
-    id: annotationId(ref),
+    // A dictionary written straight into /Annots is named by its place there ("direct:N").
+    id: annotationId(ref, position),
     ref,
     dict,
     rects: areas,
@@ -160,7 +162,7 @@ function readMark(doc, index, ref) {
 function pageMarks(doc, index) {
   const page = doc.getPage(index);
   return (annotationsOf(page)?.asArray() || [])
-    .map((ref) => readMark(doc, index, ref))
+    .map((ref, position) => readMark(doc, index, ref, position))
     .filter(Boolean);
 }
 
@@ -283,7 +285,10 @@ export function listRedactionMarks(doc) {
 export function removeRedactionMark(doc, pageIndex, id) {
   const mark = pageMarks(doc, pageIndex).find((m) => m.id === id);
   if (!mark) return false;
-  removeAnnotationThread(doc.getPage(pageIndex), mark.ref.toString());
+  removeAnnotationThread(
+    doc.getPage(pageIndex),
+    mark.ref instanceof PDFDict ? mark.id : mark.ref.toString(),
+  );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -394,7 +399,7 @@ function pruneParentTree(doc, root, keys) {
  * Structure elements describe their content with ActualText, Alt, and E. Clear them on elements
  * (and their ancestors) that own marked content which lost glyphs, so the tags cannot repeat it.
  */
-function clearStructText(doc, pageRef, mcids) {
+export function clearStructText(doc, pageRef, mcids) {
   const root = get(doc.catalog, 'StructTreeRoot');
   if (!(root instanceof PDFDict) || !mcids.size) return;
   const pending = [{ node: root, pg: undefined, chain: [] }];
@@ -544,6 +549,9 @@ function redactionPolicy(doc, areas, { codec } = {}) {
     softMasks: true,
     glyph: (quad) => hits(quad),
     path: (bounds) => areas.some(({ rect }) => rectInside(bounds, rect)),
+    // A path partly under the areas (outlined text, a drawn signature) loses what lies under
+    // them; the rest is painted as before.
+    cutPath: (bounds) => areas.map(({ rect }) => rect).filter((rect) => rectsOverlap(bounds, rect)),
     async image({ object, ctm, resources }) {
       const quad = placementQuad(ctm);
       let stream = object,
@@ -844,8 +852,10 @@ const DASH = '\\u2010-\\u2015\\u2212-';
 export const REDACTION_PATTERNS = {
   phone: {
     label: 'Phone numbers',
+    // The first group can be one digit (+33 1 …, 1-800-…, a bracketed trunk 0), and up to four
+    // groups follow it (French numbers are five pairs); the validator bounds the digit count.
     regex: new RegExp(
-      `(?<![\\w+])(?:\\+\\d{1,3}[\\s.${DASH}]?)?(?:\\(\\d{2,4}\\)|\\d{2,4})(?:[\\s.${DASH}]?\\d{2,4}){1,3}(?![\\w])`,
+      `(?<![\\w+])(?:\\+\\d{1,3}[\\s.${DASH}]?)?(?:\\(\\d{1,4}\\)|\\d{1,4})(?:[\\s.${DASH}]?\\d{2,4}){1,4}(?![\\w])`,
       'g',
     ),
     validate: (text) => {
@@ -879,10 +889,14 @@ export const REDACTION_PATTERNS = {
     label: 'Dates',
     regex: new RegExp(
       [
-        `\\b\\d{4}[${DASH}]\\d{1,2}[${DASH}]\\d{1,2}\\b`,
+        // Year first, with one separator throughout (2024-01-05, 2024/01/05, 2024.01.05), not
+        // the start of a longer dotted number.
+        `(?<![\\d./])\\b\\d{4}([/.${DASH}])\\d{1,2}\\1\\d{1,2}\\b(?![/.${DASH}]\\d)`,
         `\\b\\d{1,2}[/.${DASH}]\\d{1,2}[/.${DASH}](?:\\d{4}|\\d{2})\\b`,
         `\\b${MONTH}\\.?\\s+\\d{1,2}(?:st|nd|rd|th)?,?\\s+\\d{4}\\b`,
         `\\b\\d{1,2}(?:st|nd|rd|th)?\\s+${MONTH}\\.?,?\\s+\\d{4}\\b`,
+        // Forms and spreadsheets: 05-Jan-2024, 5-Jan-24.
+        `\\b\\d{1,2}[${DASH}]${MONTH}[${DASH}](?:\\d{4}|\\d{2})\\b`,
       ].join('|'),
       'gi',
     ),
@@ -966,6 +980,58 @@ export function findRedactionMatches(items, query, { measure, wholeWord = false 
   }
   return matches;
 }
+/** A text string of a PDF dictionary entry, or of each of an array's; '' for anything else. */
+function plainText(value) {
+  if (value instanceof PDFString || value instanceof PDFHexString) return value.decodeText();
+  if (value instanceof PDFArray)
+    return value
+      .asArray()
+      .map((_, i) => plainText(value.lookup(i)))
+      .filter(Boolean)
+      .join('\n');
+  return '';
+}
+/**
+ * What was typed into a page's form fields and comments, which the page's own text does not
+ * hold: "Find text & redact" searches it too, and a match marks the whole field or comment,
+ * which applying the mark removes. `query` is as for `findRedactionMatches`. Returns
+ * `[{ text, rects }]` with one rect, the field's or comment's.
+ */
+export function findAnnotationTextRects(doc, pageIndex, query, { wholeWord = false } = {}) {
+  const found = [];
+  for (const ref of annotationsOf(doc.getPage(pageIndex))?.asArray() || []) {
+    const dict = doc.context.lookup(ref);
+    if (!(dict instanceof PDFDict)) continue;
+    const subtype = get(dict, 'Subtype');
+    if (subtype === name('Popup') || subtype === name('Redact')) continue;
+    const rect = numbers(get(dict, 'Rect'));
+    if (rect?.length !== 4 || !rect.every(Number.isFinite)) continue;
+    const texts = [plainText(get(dict, 'Contents'))];
+    // A field's value can sit on the widget or on a parent field above it.
+    if (subtype === name('Widget'))
+      for (let node = dict, depth = 0; node instanceof PDFDict && depth < 32; depth++) {
+        if (node.has(name('V'))) {
+          texts.push(plainText(get(node, 'V')));
+          break;
+        }
+        node = get(node, 'Parent');
+      }
+    const bounds = [
+      Math.min(rect[0], rect[2]),
+      Math.min(rect[1], rect[3]),
+      Math.max(rect[0], rect[2]),
+      Math.max(rect[1], rect[3]),
+    ];
+    for (const text of texts.filter(Boolean))
+      for (const match of findRedactionMatches(
+        [{ str: text, transform: [1, 0, 0, 1, 0, 0], width: 1, height: 1 }],
+        query,
+        { wholeWord },
+      ))
+        found.push({ text: match.text, rects: [bounds] });
+  }
+  return found;
+}
 /**
  * Exact "Find text & redact": search the page's own glyphs (in content order, through Form
  * XObjects, including invisible OCR text) and return one rectangle per matched line run, built
@@ -988,18 +1054,25 @@ export async function findTextRects(
     layout = await pageTextLayout(doc, pageIndex, report);
     cache?.set(pageIndex, layout);
   }
-  const { glyphs, text, original, owner, originalOwner } = layout;
+  const { glyphs, text, original, owner, originalOwner, variants, dropped } = layout;
   const ranges = [];
   if (typeof query === 'string') {
     const needle = searchQuery(query);
     if (!needle) return [];
-    for (let at = text.indexOf(needle); at >= 0; at = text.indexOf(needle, at + needle.length)) {
-      const before = text[at - 1],
-        after = text[at + needle.length];
-      if (wholeWord && (/[\p{L}\p{N}]/u.test(before || '') || /[\p{L}\p{N}]/u.test(after || '')))
-        continue;
-      ranges.push([at, at + needle.length]);
-    }
+    // The text as laid out, and as a reader types what wraps: a word broken at a line end
+    // whole (with its hyphen or without), a Thai or Chinese phrase without the line break.
+    for (const variant of [{ text, owner }, ...variants])
+      for (
+        let at = variant.text.indexOf(needle);
+        at >= 0;
+        at = variant.text.indexOf(needle, at + needle.length)
+      ) {
+        const before = variant.text[at - 1],
+          after = variant.text[at + needle.length];
+        if (wholeWord && (/[\p{L}\p{N}]/u.test(before || '') || /[\p{L}\p{N}]/u.test(after || '')))
+          continue;
+        ranges.push(variant.owner.slice(at, at + needle.length));
+      }
   } else {
     const pattern = query instanceof RegExp ? { regex: query } : query;
     if (!(pattern?.regex instanceof RegExp)) throw new Error('Choose text or a pattern to find.');
@@ -1009,15 +1082,23 @@ export async function findTextRects(
     const regex = new RegExp(pattern.regex.source, flags.includes('i') ? flags : flags + 'i');
     for (const match of text.matchAll(regex)) {
       if (!match[0]) continue;
-      ranges.push([match.index, match.index + match[0].length]);
+      ranges.push(owner.slice(match.index, match.index + match[0].length));
     }
   }
   const matches = [];
-  for (const [start, end] of ranges) {
-    const indices = [...new Set(owner.slice(start, end).filter((i) => i >= 0))].sort(
-      (a, b) => a - b,
-    );
-    if (!indices.length) continue;
+  const seen = new Set();
+  const found = ranges
+    .map((owners) => [...new Set(owners.filter((i) => i >= 0))].sort((a, b) => a - b))
+    .filter((indices) => indices.length)
+    .sort((a, b) => a[0] - b[0] || a.at(-1) - b.at(-1));
+  for (let indices of found) {
+    // A hyphen left out of a word found whole goes with it.
+    const all = new Set(indices);
+    for (const index of dropped) if (indices[0] < index && index < indices.at(-1)) all.add(index);
+    indices = [...all].sort((a, b) => a - b);
+    const key = indices.join(',');
+    if (seen.has(key)) continue;
+    seen.add(key);
     const first = originalOwner.indexOf(indices[0]),
       last = originalOwner.lastIndexOf(indices.at(-1));
     const matchedText = original
@@ -1030,37 +1111,72 @@ export async function findTextRects(
   }
   return matches;
 }
+const LINE_HYPHEN = /[-\u00ad\u2010]$/;
+// Scripts written without spaces between words: a line break inside them may join a phrase.
+const UNSPACED_SCRIPT =
+  /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Thai}\p{Script=Lao}\p{Script=Khmer}\p{Script=Myanmar}\u3000-\u303f\uff00-\uffef]/u;
+
 /** A page's glyphs and the searchable text they make, each character tied to its glyph. */
 async function pageTextLayout(doc, pageIndex, report) {
   const glyphs = await pageGlyphs(doc, pageIndex, report);
+  // How each glyph follows the one before: on the same word (null), after a space ('space'),
+  // or on the next line after a hyphen that breaks a word ('hyphen') or inside a phrase of a
+  // script without spaces ('join').
+  const breaks = glyphs.map((glyph, i) => {
+    if (!i) return null;
+    const { line, gap } = sameLine(glyphs[i - 1], glyph);
+    if (line) return gap ? 'space' : null;
+    const before = glyphs[i - 1].text || '',
+      after = glyph.text || '';
+    const word = before.length > 1 ? before.slice(0, -1) : glyphs[i - 2]?.text || '';
+    if (LINE_HYPHEN.test(before) && /\p{L}$/u.test(word) && /^\p{Ll}/u.test(after)) return 'hyphen';
+    if (UNSPACED_SCRIPT.test(before.at(-1) || '') && UNSPACED_SCRIPT.test(after[0] || ''))
+      return 'join';
+    return 'space';
+  });
   // Lay the glyphs out as text, with a space wherever the pen jumps (words, lines, columns).
-  let text = '',
-    original = '';
-  const owner = [],
-    originalOwner = [];
-  const push = (char, index) => {
-    original += char;
-    originalOwner.push(index);
-    if (/\s/.test(char)) {
-      if (text && !text.endsWith(' ')) {
-        text += ' ';
+  // `wrap` lays out what wraps as a reader types it: 'hyphen' keeps a line-end hyphen, 'whole'
+  // leaves it out (the glyphs it leaves out are added to `dropped`).
+  const layOut = (wrap, dropped) => {
+    let text = '',
+      original = '';
+    const owner = [],
+      originalOwner = [];
+    const push = (char, index) => {
+      original += char;
+      originalOwner.push(index);
+      if (/\s/.test(char)) {
+        if (text && !text.endsWith(' ')) {
+          text += ' ';
+          owner.push(index);
+        }
+        return;
+      }
+      // Folded once per distinct character, as the Find bar does: a page repeats a few hundred
+      // of them, and folding each glyph afresh paused a search of a few hundred pages.
+      for (const folded of foldChar(char)) {
+        text += folded;
         owner.push(index);
       }
-      return;
-    }
-    for (const folded of searchQuery(char)) {
-      text += folded;
-      owner.push(index);
-    }
+    };
+    glyphs.forEach((glyph, i) => {
+      const kind = breaks[i];
+      if (kind === 'space' || (kind && !wrap)) push(' ', -1);
+      let chars = glyph.text;
+      if (wrap === 'whole' && breaks[i + 1] === 'hyphen') {
+        chars = chars.slice(0, -1);
+        if (!chars) dropped?.add(i);
+      }
+      for (const char of chars) push(char, i);
+    });
+    return { text, original, owner, originalOwner };
   };
-  glyphs.forEach((glyph, i) => {
-    if (i) {
-      const { line, gap } = sameLine(glyphs[i - 1], glyph);
-      if (!line || gap) push(' ', -1);
-    }
-    for (const char of glyph.text) push(char, i);
-  });
-  return { glyphs, text, original, owner, originalOwner };
+  const layout = layOut(null);
+  const dropped = new Set();
+  const variants = breaks.some((kind) => kind === 'hyphen' || kind === 'join')
+    ? [layOut('whole', dropped), layOut('hyphen')]
+    : [];
+  return { glyphs, ...layout, variants, dropped };
 }
 /** Every glyph a page draws, in content order, with its quad, box, and text. */
 async function pageGlyphs(doc, pageIndex, report) {

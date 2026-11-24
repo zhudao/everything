@@ -26,7 +26,7 @@
 //   - Extra fields, file attributes, UTF-8 flags. These are not load-bearing
 //     for PPTX as consumed by .pptx readers.
 
-import { type ZipOptions, unzipSync, zipSync } from "fflate";
+import { deflateSync, unzipSync } from "fflate";
 
 export interface ZipEntry {
   /** Path inside the archive, forward-slash separated (`ppt/slides/slide1.xml`). */
@@ -83,10 +83,21 @@ export const shouldStore = (name: string): boolean =>
 /**
  * Reads a ZIP archive (a `.pptx` file is a ZIP) and returns entries in
  * central-directory order. Throws if `input` is not a valid ZIP.
+ *
+ * `snapshot`: `input` is an archive `writeZip` returned, its bytes unchanged
+ * since. Entries whose bytes are still in memory are then returned as they
+ * are, and the others with their compression known.
  */
-export const readZip = (input: Uint8Array): ZipReadResult => {
+export const readZip = (
+  input: Uint8Array,
+  { snapshot = false }: { snapshot?: boolean } = {},
+): ZipReadResult => {
+  const known = snapshot ? archives.get(input) : undefined;
   const paths = new Map<string, string>();
   const partNames = new Set<string>();
+  // Every entry, in the order the library would list them, and the bytes
+  // of those an archive written here still has in memory.
+  const listed: Record<string, Uint8Array | null> = {};
   const obj = unzipSync(input, {
     filter: ({ name }) => {
       // Repair Windows archive member separators without changing part bodies.
@@ -98,13 +109,22 @@ export const readZip = (input: Uint8Array): ZipReadResult => {
         partNames.add(key);
       }
       paths.set(name, path);
-      return true;
+      // An archive written here (an undo step's snapshot) holds bytes that
+      // are still in memory, unchanged, when the deck being edited still
+      // has that part: they are taken as they are rather than unpacked.
+      const kept = known?.get(name)?.data.deref() ?? null;
+      listed[name] = kept;
+      return !kept;
     },
   });
   const entries: ZipEntry[] = [];
-  for (const name of Object.keys(obj)) {
-    const data = obj[name];
-    if (data === undefined) continue;
+  for (const name of Object.keys(listed)) {
+    const data = listed[name] ?? obj[name];
+    if (data === undefined || data === null) continue;
+    // Bytes unpacked from an archive written here were compressed for it;
+    // the next save reuses that work.
+    const entry = known?.get(name);
+    if (entry && !written.has(data)) written.set(data, entry.written);
     entries.push({ name: paths.get(name)!, data });
   }
   return { entries };
@@ -118,15 +138,201 @@ export const readZip = (input: Uint8Array): ZipReadResult => {
 /** DEFLATE compression level. 0 stores uncompressed; 9 is best compression. */
 export type CompressionLevel = 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9;
 
+// What writing an entry's bytes came to: their CRC, and for a deflated entry
+// the compressed bytes at the level used. A package's part bytes are
+// replaced, never changed in place, when a part is written (see
+// parts/package.ts), so an unchanged part is not compressed again on the next
+// save: an edit to one slide of a large deck re-deflates that slide, not
+// every slide, chart and workbook, and stored media is not checksummed again.
+interface Written {
+  crc: number;
+  level: CompressionLevel;
+  compressed: Uint8Array | null;
+}
+const written = new WeakMap<Uint8Array, Written>();
+// What each archive written here holds, by entry name, for as long as the
+// archive is kept: a package read back from it (the undo history keeps its
+// snapshots as archives) takes the parts the deck in memory still shares
+// with it as they are, unpacks only the others, and starts with every
+// part's compressed bytes known, so the first edit after an undo compresses
+// only what it changed. Each entry's bytes are held weakly: an archive
+// keeps no part alive that no deck holds any more.
+const archives = new WeakMap<
+  Uint8Array,
+  Map<string, { written: Written; data: WeakRef<Uint8Array> }>
+>();
+
+// CRC-32 eight bytes at a time ("slicing by 8"): table k gives a byte's
+// contribution k bytes further on. The same checksum as one byte at a time,
+// several times faster on the megabytes of pictures a deck carries.
+let crcTables: Int32Array | null = null;
+const crc32 = (data: Uint8Array): number => {
+  let t = crcTables;
+  if (!t) {
+    t = new Int32Array(8 * 256);
+    for (let n = 0; n < 256; n++) {
+      let c = n;
+      for (let k = 0; k < 8; k++) c = c & 1 ? -306674912 ^ (c >>> 1) : c >>> 1;
+      t[n] = c;
+    }
+    for (let n = 0; n < 256; n++)
+      for (let k = 1; k < 8; k++) {
+        const c = t[(k - 1) * 256 + n]!;
+        t[k * 256 + n] = t[c & 255]! ^ (c >>> 8);
+      }
+    crcTables = t;
+  }
+  let c = -1;
+  let i = 0;
+  const end = data.length - (data.length % 8);
+  for (; i < end; i += 8) {
+    const a =
+      c ^
+      (data[i]! |
+        (data[i + 1]! << 8) |
+        (data[i + 2]! << 16) |
+        (data[i + 3]! << 24));
+    c =
+      t[1792 + (a & 255)]! ^
+      t[1536 + ((a >>> 8) & 255)]! ^
+      t[1280 + ((a >>> 16) & 255)]! ^
+      t[1024 + (a >>> 24)]! ^
+      t[768 + data[i + 4]!]! ^
+      t[512 + data[i + 5]!]! ^
+      t[256 + data[i + 6]!]! ^
+      t[data[i + 7]!]!;
+  }
+  for (; i < data.length; i++) c = t[(c ^ data[i]!) & 255]! ^ (c >>> 8);
+  return ~c >>> 0;
+};
+
+const entryBytes = (data: Uint8Array, level: CompressionLevel): Written => {
+  const hit = written.get(data);
+  if (hit && hit.level === level) return hit;
+  const entry: Written = {
+    // A stored entry's checksum carries over whatever the level.
+    crc: hit ? hit.crc : crc32(data),
+    level,
+    compressed: level ? deflateSync(data, { level }) : null,
+  };
+  written.set(data, entry);
+  return entry;
+};
+
+const put16 = (out: Uint8Array, at: number, v: number): void => {
+  out[at] = v & 255;
+  out[at + 1] = (v >>> 8) & 255;
+};
+const put32 = (out: Uint8Array, at: number, v: number): void => {
+  out[at] = v & 255;
+  out[at + 1] = (v >>> 8) & 255;
+  out[at + 2] = (v >>> 16) & 255;
+  out[at + 3] = (v >>> 24) & 255;
+};
+const dosTime = (date: Date): number => {
+  const y = date.getFullYear() - 1980;
+  if (y < 0 || y > 119) throw new Error("date not in range 1980-2099");
+  return (
+    ((y << 25) |
+      ((date.getMonth() + 1) << 21) |
+      (date.getDate() << 16) |
+      (date.getHours() << 11) |
+      (date.getMinutes() << 5) |
+      (date.getSeconds() >> 1)) >>>
+    0
+  );
+};
+const ENCODER = new TextEncoder();
+
 export const writeZip = (
   entries: ReadonlyArray<ZipEntry>,
   options: { level?: CompressionLevel } = {},
 ): Uint8Array => {
   const defaultLevel: CompressionLevel = options.level ?? 6;
-  const obj: Record<string, [Uint8Array, ZipOptions]> = {};
-  for (const e of entries) {
-    const level: CompressionLevel = shouldStore(e.name) ? 0 : defaultLevel;
-    obj[e.name] = [e.data, { level }];
+  // A name given twice keeps its first place and its last bytes.
+  const byName = new Map<string, Uint8Array>();
+  for (const e of entries) byName.set(e.name, e.data);
+  // A part left without bytes (media added without its picture) is left
+  // out, as the archive library this replaces did, rather than failing the
+  // whole save.
+  for (const [name, data] of byName)
+    if (!(data instanceof Uint8Array)) byName.delete(name);
+  const time = dosTime(new Date());
+  const files: {
+    name: Uint8Array;
+    utf8: boolean;
+    data: Uint8Array;
+    size: number;
+    crc: number;
+    method: number;
+    offset: number;
+  }[] = [];
+  let offset = 0;
+  let central = 0;
+  const contents = new Map<
+    string,
+    { written: Written; data: WeakRef<Uint8Array> }
+  >();
+  for (const [name, data] of byName) {
+    const level: CompressionLevel = shouldStore(name) ? 0 : defaultLevel;
+    const entry = entryBytes(data, level);
+    const { crc, compressed } = entry;
+    contents.set(name, { written: entry, data: new WeakRef(data) });
+    const encoded = ENCODER.encode(name);
+    if (encoded.length > 65535) throw new Error("filename too long");
+    const body = compressed ?? data;
+    files.push({
+      name: encoded,
+      utf8: encoded.length !== name.length,
+      data: body,
+      size: data.length,
+      crc,
+      method: compressed ? 8 : 0,
+      offset,
+    });
+    offset += 30 + encoded.length + body.length;
+    central += 46 + encoded.length;
   }
-  return zipSync(obj);
+  const out = new Uint8Array(offset + central + 22);
+  const header = (
+    at: number,
+    f: (typeof files)[number],
+    centralEntry: boolean,
+  ): number => {
+    put32(out, at, centralEntry ? 0x02014b50 : 0x04034b50);
+    at += 4;
+    if (centralEntry) {
+      out[at++] = 20;
+      out[at++] = 0;
+    }
+    out[at] = 20;
+    at += 2;
+    out[at++] = 0;
+    out[at++] = f.utf8 ? 8 : 0;
+    put16(out, at, f.method);
+    at += 2;
+    put32(out, at, time);
+    put32(out, at + 4, f.crc);
+    put32(out, at + 8, f.data.length);
+    put32(out, at + 12, f.size);
+    put16(out, at + 16, f.name.length);
+    at += 20;
+    if (centralEntry) {
+      // Comment length, disk, attributes: all zero.
+      put32(out, at + 10, f.offset);
+      at += 14;
+    }
+    out.set(f.name, at);
+    return at + f.name.length;
+  };
+  for (const f of files) out.set(f.data, header(f.offset, f, false));
+  let at = offset;
+  for (const f of files) at = header(at, f, true);
+  put32(out, at, 0x06054b50);
+  put16(out, at + 8, files.length);
+  put16(out, at + 10, files.length);
+  put32(out, at + 12, central);
+  put32(out, at + 16, offset);
+  archives.set(out, contents);
+  return out;
 };

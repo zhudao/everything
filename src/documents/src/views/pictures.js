@@ -6,7 +6,7 @@
  */
 import '../styles/pictures.css';
 import '../styles/drawing-handles.css';
-import { el, isComposing, amountInRange } from '../ui/dom.js';
+import { el, isComposing, amountInRange, collapsedUntilOpened } from '../ui/dom.js';
 import { commandIconEl } from '../ui/ribbon.js';
 import { openMenu, closeMenu } from '../ui/menu.js';
 import { toast } from '../ui/toast.js';
@@ -16,7 +16,7 @@ import { galleryItems } from './insert-gallery.js';
 import { formatDrawing, formatDrawings, drawingKind, drawingParts, currentDrawingXml } from '../engine/drawing-format.js';
 import { describeDrawing, setFill, setOutline, setEffects, set3d, setGeometry, setTransform, setBlipEffects, setCrop, setBodyProperties, setDocProperties, writeFrame, readFrame, themeColors,
   child, childrenOf, A, WP, R } from '../engine/drawing-xml.js';
-import { frameOf, offsetsFor, moveDrawings, alignmentMoves, arrangeDrawings, POSITION_PRESETS, presetPosition } from '../engine/drawing-arrange.js';
+import { frameOf, offsetsFor, moveDrawings, alignmentMoves, arrangeDrawings, POSITION_PRESETS } from '../engine/drawing-arrange.js';
 import { groupDrawings, ungroupDrawing, groupUnavailable } from '../engine/drawing-groups.js';
 import { EMU_PER_PX, isPositionedImage, normalizedRotation, ANGLE_PER_DEGREE } from '../engine/images.js';
 import { SHAPE_PRESETS, LINE_PRESETS } from '../engine/authored-shapes.js';
@@ -76,8 +76,15 @@ export function createPictures({ editor, pkg, error, onChange = () => {}, base =
     return set.length > 1 ? set : selected() ? [selected()] : [];
   };
   const fail = e => { error(e instanceof Error ? e : new Error(String(e))); editor()?.focus(); };
-  const friendly = (e, label) => /could not be created|pictures with|drawing|unsupported/i.test(e?.message || '') && !/Select|changed/.test(e.message)
+  // A drawing the reader refuses after an edit raises the file-opening notice ("This document contains …
+  // The original file has not been changed."); "Select the … again" and "The document changed while …" stay as they are.
+  const friendly = (e, label) => /could not be created|pictures with|drawing|unsupported/i.test(e?.message || '') && !/^Select |^The document changed/.test(e.message)
     ? new Error(`${label}: this formatting is not available for this object yet.`) : e;
+  // A picture is either turned or wrapped with text, not both (the reader keeps text-wrapped pictures upright):
+  // a turned one floats in front of or behind the text.
+  const TURNED_WRAP_HINT = 'Rotated pictures float in front of or behind text';
+  const pictureTurned = image => isPicture(image) && (!!normalizedRotation(image.rotation) || (image.retainedDrawing || image.shell) && !!((describe(image)?.transform?.rotation || 0) % 360));
+  const textWrappedPicture = image => isPicture(image) && !!image.anchor && image.anchor.wrap !== 'none';
 
   /**
    * Rewrite the selected drawing (or `image`) with `edit(drawing, context)`; reports failures. Edits run
@@ -201,6 +208,7 @@ export function createPictures({ editor, pkg, error, onChange = () => {}, base =
   }
   async function rotateBy(degrees, label) {
     const image = selected(), engine = ready(); if (!engine || !image) return false;
+    if (textWrappedPicture(image)) { fail(new Error('To rotate this picture, set its wrapping to In Front of Text or Behind Text.')); return false; }
     if (!image.retainedDrawing && image.kind !== 'chart' && !image.shell && formattableModel(image)) {
       engine.finishComposition();
       return engine.execute(() => engine.model.setImageProperties({ rotation: (((image.rotation || 0) + degrees * 60000) % 21600000 + 21600000) % 21600000 }));
@@ -222,7 +230,8 @@ export function createPictures({ editor, pkg, error, onChange = () => {}, base =
     const locked = keepAspect ?? (image.aspectLocked !== false && (isPicture(image) || image.aspectLocked));
     const patch = { [key]: value, [other]: locked && image[key] ? Math.max(1, Math.round(value * image[other] / image[key])) : image[other] };
     if (patch.width > 22 * IN || patch.height > 22 * IN) { fail(new Error('Sizes must be at most 22 inches.')); return false; }
-    if (!image.retainedDrawing && !image.shell) { engine.finishComposition(); return engine.execute(() => engine.model.setImageProperties(patch)); }
+    // A chart's frame (a graphic frame without shape properties) is sized as its handles size it.
+    if (!image.retainedDrawing && (!image.shell || image.kind === 'chart')) { engine.finishComposition(); return engine.execute(() => engine.model.setImageProperties(patch)); }
     return apply('Size', props((sp, parts) => resizeFrame(parts.frame, sp, patch.width, patch.height)));
   }
 
@@ -257,9 +266,13 @@ export function createPictures({ editor, pkg, error, onChange = () => {}, base =
     if (current === mode) return false;
     const place = !image.anchor ? inlinePlace(engine, image) : null;
     const anchor = image.anchor;
-    // Wrapped drawings measure from the column and paragraph; keep the drawing where it is on the page.
+    // A wrapped drawing whose position the new wrapping cannot hold is measured from its column and paragraph
+    // instead, where it is on the page. Square, tight and through wrapping hold page and margin positions and
+    // alignment (a Position preset's), so those keep them; top-and-bottom wrapping measures down from the paragraph.
+    const sided = ['square', 'tight', 'through'].includes(mode);
+    const heldBySide = anchor && ['column', 'page', 'margin'].includes(anchor.horizontal) && ['paragraph', 'page', 'margin', 'topMargin', 'bottomMargin'].includes(anchor.vertical) && !(anchor.yAlign && anchor.vertical === 'paragraph') && anchor.xPercentage === undefined && anchor.yPercentage === undefined;
     let position = null;
-    if (mode !== 'inline' && anchor && ['square', 'tight', 'through', 'topAndBottom'].includes(mode) && (anchor.horizontal !== 'column' || anchor.vertical !== 'paragraph' || anchor.xAlign || anchor.yAlign || anchor.xPercentage !== undefined || anchor.yPercentage !== undefined)) {
+    if (mode !== 'inline' && anchor && (sided || mode === 'topAndBottom') && !(sided && heldBySide) && (anchor.horizontal !== 'column' || anchor.vertical !== 'paragraph' || anchor.xAlign || anchor.yAlign || anchor.xPercentage !== undefined || anchor.yPercentage !== undefined)) {
       const f = frameOf(engine, image);
       if (f) {
         const zero = offsetsFor(engine, { ...f, image: { ...image, anchor: { ...anchor, horizontal: 'column', vertical: 'paragraph' } } }, f.x, f.y);
@@ -292,22 +305,14 @@ export function createPictures({ editor, pkg, error, onChange = () => {}, base =
   async function positionPreset(preset) {
     const image = selected(), engine = ready(); if (!engine || !image) return false;
     if (!formattable(image)) { fail(new Error('This object keeps its position.')); return false; }
-    const page = engine.layout.pages?.[engine.caretPageIndex ?? 0] || engine.layout.page;
-    const frame = image.anchor ? frameOf(engine, image) : null;
-    const size = { width: image.width / EMU_PER_PX, height: image.height / EMU_PER_PX };
-    const target = presetPosition(page, size, preset);
-    let place;
-    if (frame) {
-      const at = offsetsFor(engine, { ...frame, image: { ...image, anchor: { ...image.anchor, horizontal: 'column', vertical: 'paragraph' } } }, target.x, target.y);
-      place = at;
-    } else {
-      const layout = engine.selectionLayout || engine.layout;
-      const line = layout.lines.find(l => l.fragments.some(f => f.image === image));
-      const top = line ? Math.min(...layout.lines.filter(l => l.paragraphId === line.paragraphId && l.page === line.page).map(l => l.y)) : page.top;
-      place = { x: Math.round((target.x - (line?.columnLeft ?? page.left)) * EMU_PER_PX), y: Math.round((target.y - top) * EMU_PER_PX) };
-    }
+    // Aligned to the margins of its page (§20.4.2.1 align), as Word writes these presets: an offset from the
+    // anchor paragraph would carry the picture down with that paragraph when the text above it wraps around
+    // the picture or grows.
+    const [, , h, v] = preset;
+    const horizontal = { relativeFrom: 'margin', align: h === 0 ? 'left' : h === 1 ? 'right' : 'center' };
+    const vertical = { relativeFrom: 'margin', align: v === 0 ? 'top' : v === 1 ? 'bottom' : 'center' };
     const order = image.anchor?.order ?? Math.max(0, ...runImages(engine.model).map(i => i.anchor?.order || 0)) + 1;
-    return apply('Position', async drawing => writeFrame(drawing, { horizontal: { relativeFrom: 'column', offset: place.x }, vertical: { relativeFrom: 'paragraph', offset: place.y },
+    return apply('Position', async drawing => writeFrame(drawing, { horizontal, vertical,
       wrap: { type: 'square', side: 'bothSides', distances: { T: 0, B: 0, L: 114300, R: 114300 } }, behind: false, order }));
   }
   function arrange(direction) {
@@ -643,8 +648,9 @@ export function createPictures({ editor, pkg, error, onChange = () => {}, base =
   function wrapItems() {
     const image = selected(), mode = wrapModeOf(image), ok = !!image && editable();
     const chartLike = !!image && !formattable(image), cell = inTableCell(image);
-    const option = (label, value, icon) => ({ label, icon, radio: true, checked: mode === value, disabled: !ok || chartLike && !['inline', 'square', 'topAndBottom', 'behind', 'front'].includes(value) || cell && WRAPPING.includes(value) && mode !== value,
-      ...(cell && WRAPPING.includes(value) && mode !== value ? { hint: CELL_HINT } : {}), onSelect: () => setWrap(value) });
+    const turned = WRAPPING.includes(mode) ? false : pictureTurned(image);
+    const option = (label, value, icon) => ({ label, icon, radio: true, checked: mode === value, disabled: !ok || chartLike && !['inline', 'square', 'topAndBottom', 'behind', 'front'].includes(value) || (cell || turned) && WRAPPING.includes(value) && mode !== value,
+      ...(cell && WRAPPING.includes(value) && mode !== value ? { hint: CELL_HINT } : turned && WRAPPING.includes(value) ? { hint: TURNED_WRAP_HINT } : {}), onSelect: () => setWrap(value) });
     const moves = movesWithText(image);
     const canFix = !!image?.anchor && image.anchor.wrap === 'none';
     return [option('In Line with Text', 'inline', 'wrapInline'), option('Square', 'square', 'wrapSquare'), option('Tight', 'tight', 'wrapTight'), option('Through', 'through', 'wrapThrough'),
@@ -655,11 +661,11 @@ export function createPictures({ editor, pkg, error, onChange = () => {}, base =
       { separator: true }, { label: 'More Layout Options…', icon: 'position', disabled: !ok, onSelect: () => openSizePosition('wrapping') }];
   }
   function positionItems() {
-    const image = selected(), ok = !!image && editable() && formattable(image) && !inTableCell(image);
+    const image = selected(), turned = pictureTurned(image), ok = !!image && editable() && formattable(image) && !inTableCell(image) && !turned;
     const grid = el('div.menu-custom-grid.pic-position-grid', { role: 'group', 'aria-label': 'With Text Wrapping', dataset: { columns: '3' } },
       ...POSITION_PRESETS.map(preset => el('button.swatch.pic-position-item', { type: 'button', role: 'menuitem', tabindex: -1, disabled: !ok, 'aria-label': `Position in ${preset[1]} with Square Text Wrapping`, title: `Position in ${preset[1]} with Square Text Wrapping`,
         onclick: () => { closeMenu(); positionPreset(preset); } }, positionThumb(preset[2], preset[3]))));
-    return [{ label: 'In Line with Text', radio: true, checked: wrapModeOf(image) === 'inline', disabled: !image || !editable() || !formattable(image), onSelect: () => setWrap('inline') }, { header: inTableCell(image) ? `With Text Wrapping (${CELL_HINT.toLowerCase()})` : 'With Text Wrapping' }, { custom: grid },
+    return [{ label: 'In Line with Text', radio: true, checked: wrapModeOf(image) === 'inline', disabled: !image || !editable() || !formattable(image), onSelect: () => setWrap('inline') }, { header: inTableCell(image) ? `With Text Wrapping (${CELL_HINT.toLowerCase()})` : turned ? `With Text Wrapping (${TURNED_WRAP_HINT.toLowerCase()})` : 'With Text Wrapping' }, { custom: grid },
       { separator: true }, { label: 'More Layout Options…', disabled: !image || !editable(), onSelect: () => openSizePosition('position') }];
   }
   const floating = () => !!selected() && isPositionedImage(selected()) && editable();
@@ -700,7 +706,8 @@ export function createPictures({ editor, pkg, error, onChange = () => {}, base =
   }
   function rotateItems() {
     const image = selected(), ok = editable() && !!image && image.kind !== 'chart' && (formattable(image) || !image.retainedDrawing);
-    return [{ label: 'Rotate Right 90°', icon: 'rotateRight', disabled: !ok, onSelect: () => rotateBy(90, 'Rotate') }, { label: 'Rotate Left 90°', icon: 'rotateLeft', disabled: !ok, onSelect: () => rotateBy(-90, 'Rotate') },
+    const upright = textWrappedPicture(image), turn = { disabled: !ok || upright, ...(ok && upright ? { hint: 'For pictures in front of or behind text' } : {}) };
+    return [{ label: 'Rotate Right 90°', icon: 'rotateRight', ...turn, onSelect: () => rotateBy(90, 'Rotate') }, { label: 'Rotate Left 90°', icon: 'rotateLeft', ...turn, onSelect: () => rotateBy(-90, 'Rotate') },
       { label: 'Flip Vertical', icon: 'flipVertical', disabled: !ok, onSelect: () => (image.shell || image.retainedDrawing ? flip('flipV') : flipModel('flipV')) },
       { label: 'Flip Horizontal', icon: 'flipHorizontal', disabled: !ok, onSelect: () => (image.shell || image.retainedDrawing ? flip('flipH') : flipModel('flipH')) },
       { separator: true }, { label: 'More Rotation Options…', disabled: !ok, onSelect: () => openSizePosition('size') }];
@@ -814,9 +821,14 @@ export function createPictures({ editor, pkg, error, onChange = () => {}, base =
     };
     const sizeGroup = (id, priority, { crop = false, noun = 'Picture' } = {}) => {
       const spin = (key, label) => {
+        // Enter applies the amount, and the browser's own change event for the same amount (on Enter or when the
+        // field is left) does not apply it a second time.
+        let entered = null;
+        const commit = () => { if (!amountInRange(input)) { input.reportValidity(); return; } setSize(key, Number(input.value)); };
         const input = el('input.canvas-spacing.ribbon-number', { type: 'number', step: 0.01, min: 0.01, max: 22, 'aria-label': `${noun} ${label.toLowerCase()} (in)`,
-          onchange: () => { if (!amountInRange(input)) { input.reportValidity(); return; } setSize(key, Number(input.value)); },
-          onkeydown: e => { if (e.key === 'Enter' && !isComposing(e)) { e.preventDefault(); input.dispatchEvent(new Event('change')); } } });
+          oninput: () => { entered = null; },
+          onchange: () => { if (entered !== null && input.value === entered) { entered = null; return; } entered = null; commit(); },
+          onkeydown: e => { if (e.key === 'Enter' && !isComposing(e)) { e.preventDefault(); entered = input.value; commit(); } } });
         states.push(input);
         sizeInputs.push({ input, key });
         return el('label.ribbon-spin', { title: label }, kit.commandIconEl(key === 'height' ? 'shapeHeight' : 'shapeWidth', 16), el('span.ribbon-spin-label.visually-hidden', {}, label), input, el('span.ribbon-spin-unit', {}, 'in'));
@@ -856,7 +868,7 @@ export function createPictures({ editor, pkg, error, onChange = () => {}, base =
     pictureGallery.append(...pictureStyleButtons.map(i => i.button));
     const pictureStylesMore = command('More Picture Styles', 'more', e => openMenu({ anchor: pictureStylesMore, label: 'Picture Styles', pointer: !!e?.detail, onClose: e?.detail ? kit.focusEditor : null,
       items: kit.inDocument(galleryItems([{ columns: 5, items: presets.PICTURE_STYLES.map(style => ({ label: style.name, preview: styleThumb(pictureSource(ready(), selected()), style, palette()), onSelect: () => commands.pictureStyle(style) })) }], { size: 'small', label: 'Picture Styles' })) }));
-    pictureStylesMore.classList.add('ribbon-gallery-more'); pictureStylesMore.setAttribute('aria-haspopup', 'menu');
+    pictureStylesMore.classList.add('ribbon-gallery-more'); collapsedUntilOpened(pictureStylesMore, 'menu');
     track(pictureStylesMore, pic);
     const border = menuButton('Picture Border', 'pictureBorder', () => outlineItems('Picture Border'), { size: 'small', text: 'Picture Border' });
     const effects = menuButton('Picture Effects', 'pictureEffects', () => effectsItems('Picture Effects'), { size: 'small', text: 'Picture Effects' });
@@ -897,7 +909,7 @@ export function createPictures({ editor, pkg, error, onChange = () => {}, base =
     renderShapeGallery();
     const shapeStylesMore = command('More Shape Styles', 'more', e => openMenu({ anchor: shapeStylesMore, label: 'Shape Styles', pointer: !!e?.detail, onClose: e?.detail ? kit.focusEditor : null,
       items: kit.inDocument(galleryItems(presets.SHAPE_STYLE_KINDS.map(k => ({ header: k.name, columns: 7, items: presets.shapeStyles(!!theme()).filter(s => s.kind === k.id).map(style => ({ label: style.name, preview: shapeStyleThumb(style, palette(), { width: 36, height: 28, text: 'Abc' }), onSelect: () => commands.shapeStyle(style) })) })), { size: 'small', label: 'Shape Styles' })) }));
-    shapeStylesMore.classList.add('ribbon-gallery-more'); shapeStylesMore.setAttribute('aria-haspopup', 'menu');
+    shapeStylesMore.classList.add('ribbon-gallery-more'); collapsedUntilOpened(shapeStylesMore, 'menu');
     track(shapeStylesMore, () => editable() && (isShape(selected())));
     const fillButton = menuButton('Shape Fill', 'shapeFill', () => fillItems('Shape Fill'), { size: 'small', text: 'Shape Fill' });
     const outlineButton = menuButton('Shape Outline', 'shapeOutline', () => outlineItems('Shape Outline'), { size: 'small', text: 'Shape Outline' });
@@ -1015,7 +1027,7 @@ export function createPictures({ editor, pkg, error, onChange = () => {}, base =
         return false;
       };
       engine.canRotateDrawing = image => !!image && image.kind !== 'chart' && !image.flatLine && !image.flatGroup && !image.anchor?.relativeSize
-        && (!image.anchor || isPositionedImage(image)) && (!image.retainedDrawing && !image.shell || formattable(image));
+        && (!image.anchor || isPositionedImage(image)) && (!image.retainedDrawing && !image.shell || formattable(image)) && !textWrappedPicture(image);
       engine.canCropDrawing = image => isPicture(image) && formattable(image) && engine.session.path === null && !(describe(image)?.transform?.rotation);
       engine.cropInfo = image => {
         const info = describe(image) || {};

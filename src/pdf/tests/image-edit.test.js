@@ -99,7 +99,8 @@ it('isolates one placement inside nested shared Form XObjects and keeps other pa
   const doc = await fixture(),
     image = inspectImages(doc, 0)[0].object;
   const inner = doc.context.register(
-    doc.context.flateStream('q 80 0 0 60 40 140 cm /Picture Do Q', {
+    // A dot beside the picture keeps the form from standing for the picture alone.
+    doc.context.flateStream('0 0 1 1 re f q 80 0 0 60 40 140 cm /Picture Do Q', {
       Type: 'XObject',
       Subtype: 'Form',
       BBox: [0, 0, 400, 400],
@@ -392,7 +393,7 @@ it('replaces only one occurrence through nested shared forms and preserves all p
   const doc = await fixture(),
     image = inspectImages(doc, 0)[0].object;
   const inner = doc.context.register(
-    doc.context.flateStream('80 0 0 60 40 240 cm /Picture Do', {
+    doc.context.flateStream('0 0 1 1 re f 80 0 0 60 40 240 cm /Picture Do', {
       Type: 'XObject',
       Subtype: 'Form',
       BBox: [0, 0, 400, 400],
@@ -571,4 +572,187 @@ it('moves, turns, resizes and replaces a picture together with a clip of its own
   editImage(doc, 0, replaced, { remove: true });
   expect(inspectImages(doc, 0)).toHaveLength(2);
   expect(pageSource(page)).not.toContain('200 40 100 100 re');
+});
+
+it('moves, deletes and replaces a translucent picture that Chrome wraps in a form its own size', async () => {
+  const doc = await fixture(),
+    image = inspectImages(doc, 0)[0].object;
+  const imageRef = doc.context.getObjectRef(image);
+  const form = (content) =>
+    doc.context.register(
+      doc.context.flateStream(content, {
+        Type: 'XObject',
+        Subtype: 'Form',
+        BBox: [0, 0, 82, 62],
+        Group: { Type: 'Group', S: 'Transparency', I: true },
+        Resources: {
+          ExtGState: { G3: { Type: 'ExtGState', ca: 0.5 } },
+          XObject: { X7: imageRef },
+        },
+      }),
+    );
+  const translucent = form('q 80 0 0 -60 1 61 cm /G3 gs /X7 Do Q');
+  // Chrome itself makes the group translucent where it is drawn: the second page does so.
+  const opaque = form('q 80 0 0 -60 1 61 cm /X7 Do Q');
+  // A form with more than the picture in it keeps holding the picture within its frame.
+  const busy = form('0 0 1 1 re f q 80 0 0 -60 1 61 cm /X7 Do Q');
+  const page = doc.getPage(0);
+  page.node.set(
+    PDFName.of('Resources'),
+    doc.context.obj({ XObject: { X13: translucent, X14: busy } }),
+  );
+  page.node.set(
+    PDFName.of('Contents'),
+    doc.context.register(
+      doc.context.flateStream('q 1 0 0 1 40 240 cm /X13 Do Q q 1 0 0 1 240 240 cm /X14 Do Q'),
+    ),
+  );
+  const second = doc.addPage([400, 400]);
+  second.node.set(
+    PDFName.of('Resources'),
+    doc.context.obj({
+      XObject: { X13: translucent, X15: opaque },
+      ExtGState: { G1: { Type: 'ExtGState', ca: 0.4 } },
+    }),
+  );
+  second.node.set(
+    PDFName.of('Contents'),
+    doc.context.register(doc.context.flateStream('/X13 Do q /G1 gs /X15 Do Q')),
+  );
+  expect(inspectImages(doc, 1).map((entry) => entry.opacity)).toEqual([0.5, 0.4]);
+  const [picture, held] = inspectImages(doc, 0);
+  expect(picture).toMatchObject({ editable: true, path: [], opacity: 0.5 });
+  expect(picture.transform).toEqual([80, 0, 0, -60, 41, 301]);
+  expect(constrainImage(picture, [80, 0, 0, -60, 141, 201])).toEqual([80, 0, 0, -60, 141, 201]);
+  expect(constrainImage(held, [80, 0, 0, -60, 341, 201])).not.toEqual([80, 0, 0, -60, 341, 201]);
+  const other = await raster(await doc.save(), 1);
+  editImage(doc, 0, picture, { transform: [80, 0, 0, -60, 141, 201] });
+  let moved = inspectImages(await PDFDocument.load(await doc.save()), 0)[0];
+  moved.transform.forEach((n, i) => expect(n).toBeCloseTo([80, 0, 0, -60, 141, 201][i], 8));
+  expect(moved.opacity).toBe(0.5);
+  // The form is shared with the second page, which stays as it was.
+  expect((await raster(await doc.save(), 1)).pixels).toEqual(other.pixels);
+  // A replacement is as translucent as the picture it replaces.
+  await replaceImage(doc, 0, inspectImages(doc, 0)[0], replacementFile());
+  moved = inspectImages(await PDFDocument.load(await doc.save()), 0)[0];
+  expect(moved.object.getContents()).not.toEqual(image.getContents());
+  expect(moved.opacity).toBe(0.5);
+  editImage(doc, 0, inspectImages(doc, 0)[0], { remove: true });
+  expect(inspectImages(doc, 0)).toHaveLength(1);
+  expect((await raster(await doc.save(), 1)).pixels).toEqual(other.pixels);
+});
+
+it('moves a turned picture that Word clips to a four-sided outline instead of a rectangle', async () => {
+  const doc = await fixture(),
+    image = inspectImages(doc, 0)[0].object,
+    page = doc.getPage(0);
+  page.node.set(
+    PDFName.of('Resources'),
+    doc.context.obj({ XObject: { Im: doc.context.getObjectRef(image) } }),
+  );
+  page.node.set(
+    PDFName.of('Contents'),
+    doc.context.register(
+      doc.context.flateStream(
+        '0.8 0.9 0.7 rg 0 0 400 400 re f ' +
+          // A quarter turn, its outline closed by repeating its first corner.
+          'q 40 300 m 100 300 l 100 220 l 40 220 l 40 300 l h W* n 0 -80 60 0 40 300 cm /Im Do Q ' +
+          // An eighth of a turn, inside a turned frame wider than the picture.
+          'q 200 100 m 300 200 l 350 150 l 250 50 l h W n q 40 40 -20 20 265 95 cm /Im Do Q Q ' +
+          // A four-sided outline that is no parallelogram stays a reason to leave it alone.
+          'q 250 250 m 330 250 l 330 330 l 260 320 l h W n 60 0 0 60 260 260 cm /Im Do Q',
+      ),
+    ),
+  );
+  const [turned, framed, odd] = inspectImages(doc, 0);
+  expect([turned.editable, framed.editable, odd.editable]).toEqual([true, true, false]);
+  // The outline enclosing only the turned picture moves with it.
+  expect(turned.clips).toEqual([]);
+  expect(constrainImage(turned, [0, -80, 60, 0, 200, 390])).toEqual([0, -80, 60, 0, 200, 390]);
+  // A frame wider than its picture, alone in its group, is the picture's own and goes with it.
+  const moved = [...framed.transform];
+  moved[4] += 60;
+  moved[5] -= 60;
+  expect(constrainImage(framed, moved)).toEqual(moved);
+  const before = await raster(await doc.save());
+  editImage(doc, 0, turned, { transform: [0, -80, 60, 0, 200, 390] });
+  const after = await raster(await doc.save());
+  const at = (r, x, y) => [...r.pixels.slice((y * 400 + x) * 4, (y * 400 + x) * 4 + 3)];
+  // The picture shows where it went, and its old place shows the page behind it.
+  expect(at(after, 230, 50)).toEqual(at(before, 70, 140));
+  expect(at(after, 70, 140)).toEqual(at(before, 10, 10));
+});
+
+// Word tags each picture as a figure with its alternate text. Deleting the picture left the
+// figure in the tags, read out by screen readers and flagged by the accessibility check.
+it('takes a deleted picture or shape out of the tags when nothing else was in its figure', async () => {
+  const { inspectPaths, editPath } = await import('../src/core/path-edit.js');
+  const source = await PDFDocument.create(),
+    image = await source.embedPng(imagePng());
+  let doc = source;
+  const page = doc.addPage([400, 400]);
+  page.node.set(
+    PDFName.of('Resources'),
+    doc.context.obj({ XObject: { Im: image.ref, Im2: image.ref } }),
+  );
+  page.node.set(
+    PDFName.of('Contents'),
+    doc.context.register(
+      doc.context.stream(
+        [
+          '/P <</MCID 0>> BDC 0 0 1 rg 10 10 20 20 re f q 20 0 0 20 300 300 cm /Im2 Do Q EMC',
+          '/Figure <</MCID 1>> BDC q 80 0 0 60 40 200 cm /Im Do Q EMC',
+          '/Figure <</MCID 2>> BDC q 1 0 0 rg 200 100 80 60 re f Q EMC',
+        ].join('\n'),
+      ),
+    ),
+  );
+  page.node.set(PDFName.of('StructParents'), doc.context.obj(0));
+  const element = (role, mcid, alt) =>
+    doc.context.register(
+      doc.context.obj({
+        Type: 'StructElem',
+        S: role,
+        Pg: page.ref,
+        K: mcid,
+        ...(alt && { Alt: alt }),
+      }),
+    );
+  const paragraph = element('P', 0),
+    logo = element('Figure', 1, 'Company logo'),
+    box = element('Figure', 2, 'Red box');
+  const root = doc.context.obj({
+    Type: 'StructTreeRoot',
+    K: doc.context.obj({ Type: 'StructElem', S: 'Document', K: [paragraph, logo, box] }),
+    ParentTree: { Nums: [0, [paragraph, logo, box]] },
+  });
+  doc.catalog.set(PDFName.of('StructTreeRoot'), doc.context.register(root));
+  doc = await PDFDocument.load(await doc.save());
+  const kids = () =>
+    doc.catalog
+      .lookup(PDFName.of('StructTreeRoot'))
+      .lookup(PDFName.of('K'))
+      .lookup(PDFName.of('K'))
+      .asArray()
+      .map((ref) => ref.toString());
+  const parents = () =>
+    doc.catalog
+      .lookup(PDFName.of('StructTreeRoot'))
+      .lookup(PDFName.of('ParentTree'))
+      .lookup(PDFName.of('Nums'))
+      .lookup(1)
+      .asArray()
+      .map((ref) => ref.toString());
+  const figure = inspectImages(doc, 0).find((entry) => entry.transform[0] === 80);
+  editImage(doc, 0, figure, { remove: true });
+  expect(kids()).toEqual([paragraph.toString(), box.toString()]);
+  expect(parents()).toEqual([paragraph.toString(), 'null', box.toString()]);
+  const shape = inspectPaths(doc, 0).find((entry) => entry.bounds[0] === 200);
+  editPath(doc, 0, shape, { remove: true });
+  expect(kids()).toEqual([paragraph.toString()]);
+  // A picture that shares its tag with other content leaves the tag as it is.
+  const shared = inspectImages(doc, 0).find((entry) => entry.transform[0] === 20);
+  editImage(doc, 0, shared, { remove: true });
+  expect(kids()).toEqual([paragraph.toString()]);
+  expect(parents()).toEqual([paragraph.toString(), 'null', 'null']);
 });

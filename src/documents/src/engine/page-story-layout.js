@@ -1,5 +1,5 @@
 import { measurePageStory, storyContentKey, layoutSerializer } from './page-story-measure.js';
-import { pageStoryPath } from './page-stories.js';
+import { pageStoryPath, pageStoryVariant } from './page-stories.js';
 import { positionedImageFrame } from './positioned-images.js';
 import { resolveDrawingCollisions } from './drawing-collisions.js';
 import { isPositionedImage } from './images.js';
@@ -17,6 +17,9 @@ export function layoutPageStories(body, definition, sectionSettings, measure, nu
   const watermarks = [];
   const borderMargins = [];
   const positions = [];
+  // Each story's laid-out column widths (twips / 15), by table id: the ribbon's Width box, border drags and
+  // column commands read them as they do the body's.
+  const tableWidths = {};
   if (!definition) return { lines, borders, cells, tableBorders, floatingObjects, paragraphFrames, unsupported, borderMargins, watermarks };
   const resolved = new Map(), storyKeys = new WeakMap();
   // A measurer that remembers stories resolves their styles only when it measures one it has not seen.
@@ -40,9 +43,12 @@ export function layoutPageStories(body, definition, sectionSettings, measure, nu
     }
   });
   const numbers = pageNumberSequence(body.pageSections, definition, body.numberingApproximations), pageNumbers = numbers;
+  // Which header and footer each page shows, also where that story is missing or empty (editing cues name it).
+  const pageVariants = [];
   for (let page = 0; page < body.pageCount; page++) {
     const section = body.pageSections[page], settings = sectionSettings[section], geometry = referencePageGeometry(body.pages[page]);
     if (section === null) continue;
+    pageVariants[page] = { section, variant: pageStoryVariant(definition, section, numbers[page], firstPages.get(section) === page) };
     for (const kind of ['header', 'footer']) {
       const path = pageStoryPath(definition, section, kind, numbers[page], firstPages.get(section) === page);
       const story = path && definition.stories[path];
@@ -57,7 +63,7 @@ export function layoutPageStories(body, definition, sectionSettings, measure, nu
         const { placed, trim, storyGeometry, positions: storyPositions } = measurePageStory({ ...story, paragraphs: storyParagraphs(path, story) }, { ...geometry, storyKind: kind }, measure, numbering,
           { pageNumber: numbers[page], pageCount: body.pageCount, sectionPageCount: counts.get(section), pageNumbering: definition.sections[section].pageNumbering },
           { drawingLayouts, onUnsupported: bestEffort ? error => unsupported.push({ path, page, message: error.message }) : undefined, storyKeys, ...styleOptions, numberingKey, contentKey: storyContentKey(definition, path) });
-        positions.push({ path, page, positions: storyPositions });
+        positions.push({ path, page, positions: storyPositions, ...pageVariants[page] });
         const y = kind === 'header' ? settings.header / 15 : geometry.height - settings.footer / 15 - placed.endY + trim;
         const frames = new Map((placed.paragraphFrames || []).map(f=>[f.frameId,f]));
         const shiftY = item => item.frameId && frames.get(item.frameId)?.vAnchor !== 'text' ? 0 : y;
@@ -79,6 +85,7 @@ export function layoutPageStories(body, definition, sectionSettings, measure, nu
         resolveDrawingCollisions(objects, body.pages);
         objects.sort((a, b) => a.image.anchor.order - b.image.anchor.order);
         lines.push(...storyLines); cells.push(...storyCells); floatingObjects.push(...objects);
+        Object.assign(tableWidths[path] ||= {}, placed.tableWidths);
         tableBorders.push(...placed.tableBorders.map(border => ({ ...shifted(border),
           ...(border.clip ? { clip: border.clip.map(([x, top]) => [x, top + y]) } : {}) })));
         for (const border of placed.paragraphBorders) borders.push({ ...shifted(border),
@@ -109,6 +116,7 @@ export function layoutPageStories(body, definition, sectionSettings, measure, nu
         const top = y, shifted = item => ({ ...item, page: area.page, pageStory: note.path, y: item.y + top, ...(item.cellClip ? { cellClip: shiftCellClip(item.cellClip, top) } : {}) });
         lines.push(...placed.lines.map(line => ({ ...shifted(line), storyGeometry, baseline: line.baseline + top })));
         cells.push(...placed.cells.map(shifted));
+        Object.assign(tableWidths[note.path] ||= {}, placed.tableWidths);
         tableBorders.push(...placed.tableBorders.map(border => ({ ...shifted(border), ...(border.clip ? { clip: border.clip.map(([x, t]) => [x, t + top]) } : {}) })));
         for (const border of placed.paragraphBorders) borders.push({ ...shifted(border), ...(border.clip ? { clip: border.clip.map(([x, t]) => [x, t + top]) } : {}) });
         y += placed.endY;
@@ -118,5 +126,5 @@ export function layoutPageStories(body, definition, sectionSettings, measure, nu
       }
     }
   }
-  return { lines, borders, cells, tableBorders, floatingObjects, paragraphFrames, unsupported, borderMargins, positions, watermarks };
+  return { lines, borders, cells, tableBorders, floatingObjects, paragraphFrames, unsupported, borderMargins, positions, watermarks, pageVariants, tableWidths };
 }

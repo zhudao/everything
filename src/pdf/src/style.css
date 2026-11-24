@@ -66,6 +66,11 @@
 * {
   box-sizing: border-box;
 }
+html {
+  /* Phones keep the app's type sizes in landscape instead of enlarging them. */
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+}
 body {
   margin: 0;
   background: var(--page);
@@ -511,6 +516,12 @@ puter-user-menu::part(apps-panel) {
 .file-row + .file-row {
   border-top: 1px solid var(--border);
 }
+/* A long library lays out only the rows on screen, so searching it stays quick. The size
+   stands in for a row's content (its padding and border are added), until it is first shown. */
+.file-row {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 38px;
+}
 .file-row:hover {
   background: var(--page);
 }
@@ -561,7 +572,9 @@ puter-user-menu::part(apps-panel) {
 .home-footer .text-btn {
   font-size: 11px;
 }
-.dropping:after {
+/* Full screen shows one element alone, so the outline is drawn in it too. */
+.dropping:after,
+.dropping :fullscreen:after {
   content: 'Drop a PDF, or pictures, to open them';
   position: fixed;
   inset: 12px;
@@ -834,13 +847,21 @@ puter-user-menu::part(apps-panel) {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+/* On the narrowest phones the letters close up, so CONFIDENTIAL is read whole, not cut short. */
+@media (max-width: 380px) {
+  .stamp-chip {
+    letter-spacing: 0.02em;
+    padding-inline: 4px;
+  }
+}
 .stamp-chip:hover {
   background: var(--surface-2);
 }
-.stamp-chip[aria-pressed='true'] {
-  box-shadow:
-    0 0 0 2px var(--surface),
-    0 0 0 4px var(--accent);
+/* The chosen preset is filled with its own color, not ringed: a ring in the accent color drew it
+   as the keyboard focus, beside the Text field that has it. */
+.stamp-chip[aria-pressed='true'],
+.stamp-chip[aria-pressed='true']:hover {
+  background: color-mix(in srgb, var(--stamp-color, var(--strong)) 28%, transparent);
 }
 .stamp-preview-wrap {
   position: relative;
@@ -1114,8 +1135,11 @@ puter-user-menu::part(apps-panel) {
 .text-object-selected {
   pointer-events: none;
 }
+/* A finger moves the selected text; on any other it scrolls or zooms the page. */
 .select-text-objects .text-target {
   cursor: move;
+}
+.select-text-objects .text-target.text-movable {
   touch-action: none;
 }
 .text-targets.select-text-objects {
@@ -1446,6 +1470,16 @@ puter-user-menu::part(apps-panel) {
 }
 .thumbnail > span {
   font-size: 10px;
+  /* A long page label ("Appendix B-12") takes up to two lines rather than widening the panel,
+     so the number that tells it from the next page's stays in sight. */
+  max-width: 100%;
+  text-align: center;
+  overflow-wrap: anywhere;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  overflow: hidden;
 }
 .workspace {
   background: var(--canvas);
@@ -1505,6 +1539,10 @@ puter-user-menu::part(apps-panel) {
   pointer-events: auto;
   touch-action: none;
   cursor: crosshair;
+}
+/* Text and notes are added with a tap; a finger scrolls or zooms the page meanwhile. */
+.drawing-overlay.active.tap-to-place {
+  touch-action: auto;
 }
 .page-caption {
   font-size: 10px;
@@ -1634,6 +1672,17 @@ puter-user-menu::part(apps-panel) {
   z-index: 3;
   pointer-events: none;
 }
+/*
+ * Comments and links outside a cropped page are not shown, and their targets must not run on
+ * past it and give the workspace room to scroll; the margin leaves focus rings at the edges.
+ */
+.highlight-targets,
+.note-targets,
+.link-targets,
+.annotation-targets {
+  overflow: clip;
+  overflow-clip-margin: 4px;
+}
 .highlight-target {
   position: absolute;
   border: 0;
@@ -1676,6 +1725,26 @@ puter-user-menu::part(apps-panel) {
 }
 .link-target:hover,
 .link-target:focus-visible {
+  outline: 2px solid var(--brand);
+  outline-offset: 1px;
+  background: color-mix(in srgb, var(--brand) 8%, transparent);
+}
+/* A link over wrapped words: only its parts, one for each line, take the pointer and show. */
+.link-target.is-parted {
+  pointer-events: none;
+}
+.link-target.is-parted:hover,
+.link-target.is-parted:focus-visible {
+  outline: none;
+  background: transparent;
+}
+.link-part {
+  position: absolute;
+  border-radius: 2px;
+  pointer-events: auto;
+}
+.link-target.is-parted:hover .link-part,
+.link-target.is-parted:focus-visible .link-part {
   outline: 2px solid var(--brand);
   outline-offset: 1px;
   background: color-mix(in srgb, var(--brand) 8%, transparent);
@@ -1816,6 +1885,17 @@ puter-user-menu::part(apps-panel) {
   outline: 2px solid var(--brand);
   outline-offset: -2px;
 }
+/* Targets are see-through, so dimming them while a save runs changed nothing in view but had the
+   browser repaint every one of them, thousands on a page of shapes. A hovered one dims as before. */
+.image-target:disabled,
+.path-target:disabled {
+  opacity: 1;
+}
+.image-target:disabled:hover,
+.path-target:disabled:hover {
+  background: color-mix(in srgb, var(--brand) 3.6%, transparent);
+  outline-color: color-mix(in srgb, var(--brand) 40%, transparent);
+}
 /* The move control is clipped to the object's outline, which would also clip an outset ring. */
 .image-move:focus-visible {
   background: color-mix(in srgb, var(--brand) 9%, transparent);
@@ -1955,8 +2035,37 @@ dialog.leave-save-dialog {
 .dialog-actions {
   flex: none;
 }
+/* On a phone, buttons too wide for one row fill the rows they wrap onto, rather than one hanging
+   at the right of a row of its own over the other. */
+@media (max-width: 520px) {
+  .dialog-actions > .btn {
+    flex: 1 1 auto;
+  }
+}
+/* A short window (a phone turned sideways, a zoomed-in laptop) keeps the title and the actions
+   close, so the body, which scrolls, keeps more of the little height there is. */
+@media (max-height: 500px) {
+  dialog {
+    max-height: calc(100dvh - 16px);
+  }
+  .dialog-head {
+    padding: 8px 16px;
+  }
+  .dialog-body {
+    padding: 14px 18px;
+  }
+  .dialog-actions {
+    padding: 0 18px 10px;
+  }
+}
 .dialog-body .stack > .btn {
   justify-content: flex-start;
+}
+/* A job's progress (recognizing text, exporting, comparing) spans the dialog in the app's own
+   color, rather than a short bar in the browser's. */
+.dialog-body progress {
+  width: 100%;
+  accent-color: var(--accent);
 }
 .dialog-body label {
   display: block;
@@ -2161,6 +2270,14 @@ dialog.signature-dialog {
   /* The pad is white paper in both themes, so the hint keeps the light theme's gray. */
   color: #62615c;
 }
+.signature-type-status {
+  margin: 0;
+  font-size: 13px;
+  color: var(--danger);
+}
+.signature-type-status:empty {
+  display: none;
+}
 .signature-preview {
   display: block;
   width: 100%;
@@ -2253,7 +2370,16 @@ dialog.signature-dialog {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 14px;
+  gap: 6px 14px;
+  /* A key too long to sit beside its name (on the smallest phones) goes under it, at the end,
+     rather than past the edge of the list. */
+  flex-wrap: wrap;
+}
+.shortcut-list > div > span {
+  flex: 1 1 0;
+}
+.shortcut-list kbd {
+  margin-inline-start: auto;
 }
 kbd {
   font-size: 11px;
@@ -2283,9 +2409,18 @@ kbd {
   font-size: 13px;
   text-align: center;
   line-height: 1.5;
+  /* A file name without spaces breaks rather than running past the edge of a phone. */
+  overflow-wrap: anywhere;
   /* It holds no controls, and on a phone it can sit over the selection dock for a few
      seconds: taps go through to whatever it covers. */
   pointer-events: none;
+}
+/* Wider than a phone, the page controls float 16px above the foot of the page view, up to 56px;
+   a message of two lines sat over their top edge, and an error stays until the next press. */
+@media (min-width: 761px) {
+  #toast {
+    bottom: calc(66px + var(--safe-bottom));
+  }
 }
 @media (min-width: 1450px) {
   .home-main {
@@ -2407,6 +2542,13 @@ kbd {
   .file-table-head > span:nth-child(2) {
     display: none;
   }
+  /* A finger has no tooltip to show a shortened name, and names that differ only at the end
+     (Report 2025 Q1, Report 2025 Q2) looked the same: the whole name shows, over several lines
+     if need be. */
+  .file-open span {
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
   .editor-topbar {
     height: 58px;
     min-height: 58px;
@@ -2494,8 +2636,11 @@ kbd {
   .find-bar .input {
     font-size: 12px;
   }
+  /* The count takes only the room its words need, which the find box (and on the smallest
+     phones the Close button, pushed past the edge) needs more. */
   .search-count {
     font-size: 10px;
+    min-width: 0;
   }
   /* Until there is a count to show, its room goes to the find box, whose prompt was cut short. */
   .search-count:empty {
@@ -2510,6 +2655,11 @@ kbd {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+  /* A long account name gives way on the smallest phones, rather than pushing Settings off the
+     edge of the screen. */
+  .header-right {
+    min-width: 0;
   }
   .editor-topbar .icon-btn {
     min-width: 30px;
@@ -2551,6 +2701,42 @@ kbd {
     padding-inline: 18px;
   }
 }
+/* iOS Safari zooms into a focused field whose text is under 16px, and leaves the page zoomed in
+   once the field is done with. On touch phones, upright or sideways, the app's fields take 16px
+   text, as the system's own fields do. Fields on the page itself (a PDF's form) keep the size
+   the page gives them. */
+@media (pointer: coarse) and (max-width: 760px), (pointer: coarse) and (max-height: 500px) {
+  :is(
+    input:not(
+      [type='checkbox'],
+      [type='radio'],
+      [type='range'],
+      [type='color'],
+      [type='file'],
+      [type='button'],
+      [type='submit'],
+      [type='reset'],
+      [type='image']
+    ),
+    select,
+    textarea
+  ):not(.workspace *) {
+    font-size: 16px !important;
+  }
+}
+/* The larger text still leaves the whole "Search PDFs" in view beside the sort order. */
+@media (pointer: coarse) and (max-width: 380px) {
+  .library-tools {
+    gap: 6px;
+  }
+  .sort-select {
+    padding-inline: 0 4px;
+  }
+  .search-input {
+    padding-left: 32px;
+    padding-right: 8px;
+  }
+}
 @media (prefers-reduced-motion: reduce) {
   *,
   *:before,
@@ -2570,6 +2756,10 @@ kbd {
   }
   .paper {
     forced-color-adjust: none;
+  }
+  /* The dividers are drawn as a background, which forced colors paint over with the canvas. */
+  .menu-sep {
+    background: CanvasText;
   }
 }
 
@@ -2742,6 +2932,41 @@ kbd {
 .form-widget.has-draft {
   outline-color: var(--brand);
 }
+/* A filled-in field with a format (an amount, a date) shows its value formatted, as the page
+   will draw it, while another field has the focus. */
+.form-shown {
+  display: none;
+}
+.form-widget.has-draft.is-formatted:not(:focus-within) .form-control {
+  color: transparent;
+}
+.form-widget.has-draft.is-formatted:not(:focus-within) .form-shown {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  padding: 1px 2px;
+  overflow: hidden;
+  font: var(--field-font-size) / 1.2 sans-serif;
+  white-space: pre;
+  color: var(--field-ink);
+  pointer-events: none;
+}
+/* A total shows what the fields filled in so far work out to, over the page's old value and
+   inside the field's border. */
+.form-widget.is-calculated .form-shown {
+  position: absolute;
+  inset: 1px;
+  display: flex;
+  align-items: center;
+  padding: 0 1px;
+  overflow: hidden;
+  font: var(--field-font-size) / 1.2 sans-serif;
+  white-space: pre;
+  color: var(--field-ink);
+  background: var(--field-background);
+  pointer-events: none;
+}
 /* The field an error above the page is about. */
 .form-widget:has(.form-control[aria-invalid='true']),
 .form-widget:has(.form-control[aria-invalid='true']):focus-within {
@@ -2762,6 +2987,13 @@ kbd {
   opacity: 1;
   color: var(--field-ink);
   background: var(--field-background);
+}
+/* A form's Print or Reset button, or a signature field, keeps the PDF's own drawing; the
+   focus outline marks it. */
+.form-widget.form-button .form-control,
+.form-widget.form-signature .form-control {
+  opacity: 0;
+  cursor: pointer;
 }
 .form-checkbox .form-control,
 .form-radio .form-control {

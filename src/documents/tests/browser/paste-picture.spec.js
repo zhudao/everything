@@ -57,6 +57,29 @@ test('a picture dropped on the page is inserted where it lands', async ({ page }
   await expect(page.getByText('Drop pictures on the page to insert them')).toHaveCount(0);
 });
 
+test('text dropped on the page from another application goes in where it lands, with its formatting', async ({ page }) => {
+  await page.goto('/mock.html#/new');
+  await expect(page.getByRole('button', { name: 'Bold', exact: true })).toBeEnabled();
+  await input(page).fill('Alpha bravo\nCharlie');
+  const box = await page.locator('canvas.canvas-page').first().boundingBox();
+  const at = await page.evaluate(() => { const e = window.__docs.current.view.engine, line = e.selectionLayout.lines[0]; return { x: line.stops.find(s => s.offset === 6).x * e.zoom, y: (line.y + line.height / 2) * e.zoom }; });
+  const drop = (text, html) => page.locator('canvas.canvas-page').first().evaluate((canvas, { x, y, text, html }) => {
+    const data = new DataTransfer(); data.setData('text/plain', text); if (html) data.setData('text/html', html);
+    const point = { dataTransfer: data, clientX: x, clientY: y, bubbles: true, cancelable: true };
+    const over = new DragEvent('dragover', point), drop = new DragEvent('drop', point);
+    canvas.dispatchEvent(over); canvas.dispatchEvent(drop);
+    return over.defaultPrevented && drop.defaultPrevented;
+  }, { x: box.x + at.x, y: box.y + at.y, text, html });
+  expect(await drop('new', '<b>new</b>')).toBe(true);
+  await expect(input(page)).toHaveValue('Alpha newbravo\nCharlie');
+  expect(await page.evaluate(() => window.__docs.current.view.engine.model.paragraphs[0].runs.map(r => [r.text, !!r.bold]))).toEqual([['Alpha ', false], ['new', true], ['bravo', false]]);
+  await expect(input(page)).toBeFocused();
+  // One step to undo, as a paste is.
+  await input(page).press('ControlOrMeta+z'); await expect(input(page)).toHaveValue('Alpha bravo\nCharlie');
+  expect(await drop('plain ', '')).toBe(true);
+  await expect(input(page)).toHaveValue('Alpha plain bravo\nCharlie');
+});
+
 test('a pasted picture larger than the session holds is scaled down, as Insert > Pictures does', async ({ page }) => {
   await page.goto('/mock.html#/new');
   await expect(page.getByRole('button', { name: 'Bold', exact: true })).toBeEnabled();
@@ -164,5 +187,63 @@ test('a cropped, flipped picture copied and pasted keeps its crop, flip and fram
   const xml = strFromU8(unzipSync(readFileSync(path))['word/document.xml']);
   expect(xml.match(/<a:srcRect l="0" t="0" r="50000" b="0"\/>/g)).toHaveLength(2);
   expect(xml.match(/<a:xfrm flipH="1"/g)).toHaveLength(2);
+  expect(errors).toEqual([]);
+});
+
+test('a floating picture copied and pasted in the document keeps its wrapping, beside the original, not in line', async ({ page }, info) => {
+  const errors = []; page.on('pageerror', e => errors.push(e.message));
+  await page.goto('/mock.html#/new');
+  await expect(page.getByRole('button', { name: 'Bold', exact: true })).toBeEnabled();
+  await input(page).fill('First paragraph of the text.\nSecond paragraph, beside the picture.\nThird paragraph.');
+  await input(page).evaluate((el, bytes) => {
+    el.focus(); el.setSelectionRange(29, 29); el.dispatchEvent(new Event('select'));
+    const data = new DataTransfer(); data.items.add(new File([new Uint8Array(bytes)], 'image.png', { type: 'image/png' }));
+    el.dispatchEvent(new ClipboardEvent('paste', { clipboardData: data, bubbles: true, cancelable: true }));
+  }, png);
+  await expect.poll(() => pictures(page)).toBe(1);
+  await page.locator('#ribbon-panel-picture').getByRole('button', { name: 'Wrap Text', exact: true }).click();
+  await page.getByRole('menuitemradio', { name: 'Square' }).click();
+  const anchors = () => page.evaluate(() => window.__docs.current.view.engine.model.paragraphs.flatMap(p => p.runs).filter(r => r.image)
+    .map(({ image: { id, anchor } }) => ({ id, wrap: anchor?.wrap || null, x: anchor?.x ?? null, y: anchor?.y ?? null })));
+  await expect.poll(async () => (await anchors())[0]?.wrap).toBe('square');
+  const [original] = await anchors();
+  const copy = () => page.evaluate(() => {
+    const e = window.__docs.current.view.engine, data = new DataTransfer();
+    e.input.dispatchEvent(new ClipboardEvent('copy', { clipboardData: data, bubbles: true, cancelable: true }));
+    return data.getData('text/html');
+  });
+  const paste = html => input(page).evaluate((el, html) => {
+    const data = new DataTransfer(); data.setData('text/html', html); data.setData('text/plain', '');
+    el.dispatchEvent(new ClipboardEvent('paste', { clipboardData: data, bubbles: true, cancelable: true }));
+  }, html);
+  const html = await copy();
+  // Other applications still get the image.
+  expect(html).toMatch(/^<img src="data:image\/png;base64,/);
+  // Pasted over the selected picture, the copy floats with the same wrapping a quarter inch down and right, and is selected.
+  await paste(html);
+  await expect.poll(async () => (await anchors()).length).toBe(2);
+  const [, pasted] = await anchors();
+  expect(pasted).toMatchObject({ wrap: 'square', x: original.x + 228600, y: original.y + 228600 });
+  expect(pasted.id).not.toBe(original.id);
+  expect(await page.evaluate(() => window.__docs.current.view.engine.model.selectedImage?.id)).toBe(pasted.id);
+  // A further paste goes past that copy too.
+  await paste(html);
+  await expect.poll(async () => (await anchors()).length).toBe(3);
+  expect((await anchors())[2]).toMatchObject({ wrap: 'square', x: original.x + 2 * 228600, y: original.y + 2 * 228600 });
+  // One undo takes a paste back.
+  await input(page).press('ControlOrMeta+z');
+  await expect.poll(async () => (await anchors()).length).toBe(2);
+  // A copy from another document's editor is the picture alone, inserted in line.
+  await paste(html.replace(/(&quot;token&quot;:&quot;)[^&]+/, '$1another'));
+  await expect.poll(async () => (await anchors()).length).toBe(3);
+  expect((await anchors()).filter(a => a.wrap === null)).toHaveLength(1);
+  const download = page.waitForEvent('download');
+  await downloadDocx(page);
+  const path = info.outputPath('floating-paste.docx');
+  await (await download).saveAs(path);
+  const xml = strFromU8(unzipSync(readFileSync(path))['word/document.xml']);
+  expect(xml.match(/<wp:wrapSquare /g)).toHaveLength(2);
+  const ids = [...xml.matchAll(/<wp:docPr id="(\d+)"/g)].map(m => m[1]);
+  expect(new Set(ids).size).toBe(3);
   expect(errors).toEqual([]);
 });

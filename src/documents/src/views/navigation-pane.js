@@ -40,6 +40,25 @@ export function createNavigationPane(api) {
   const headingEmpty = el('p.field-hint', {}, 'Create an interactive outline of your document. It is a great way to keep track of where you are or quickly move your content around. To get started, apply heading styles to the headings in your document.');
   const pageGrid = el('div.nav-pages', { role: 'list', 'aria-label': 'Pages' });
   const resultList = el('ol.nav-results', { 'aria-label': 'Search results' });
+  // The pages and the results are each one Tab stop, as the headings are: the arrows, Home and End move along them.
+  // Tabbing through every page or result (hundreds in a long document) to leave the pane took as many presses.
+  const settle = (list, selector) => {
+    const items = [...list.querySelectorAll(selector)];
+    const stop = items.find(item => item === document.activeElement) || items.find(item => item.hasAttribute('aria-current')) || items[0];
+    for (const item of items) { const index = item === stop ? 0 : -1; if (item.tabIndex !== index) item.tabIndex = index; }
+  };
+  for (const [list, selector] of [[pageGrid, '.nav-page'], [resultList, '.nav-result']]) {
+    list.addEventListener('focusin', () => settle(list, selector));
+    list.addEventListener('keydown', e => {
+      if (isComposing(e) || e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
+      const items = [...list.querySelectorAll(selector)], at = items.indexOf(document.activeElement);
+      const next = { ArrowDown: at + 1, ArrowRight: at + 1, ArrowUp: at - 1, ArrowLeft: at - 1, Home: 0, End: items.length - 1 }[e.key];
+      if (at < 0 || next === undefined) return;
+      e.preventDefault();
+      const target = items[Math.max(0, Math.min(items.length - 1, next))];
+      target.focus(); target.scrollIntoView?.({ block: 'nearest' });
+    });
+  }
   const resultEmpty = el('p.field-hint');
   const panels = {
     headings: el('div.nav-panel', { role: 'tabpanel', id: 'nav-panel-headings', 'aria-labelledby': 'nav-tab-headings' }, headingEmpty, headingList),
@@ -141,7 +160,8 @@ export function createNavigationPane(api) {
               while (entries[target] && (entries[target].level > entry.level || entries[target].inTable)) target += step;
               if (entries[target]) { actions().move(entry.id, entries[target].id, step < 0 ? 'before' : 'after'); refocus(entry.id); }
             }
-          } }, el('span', {}, entry.text));
+          // A Hebrew or Arabic heading reads right-to-left, its closing punctuation at its left end.
+          } }, el('span', { dir: 'auto' }, entry.text));
         const row = el('div.nav-heading-row', { style: { paddingInlineStart: `${4 + (entry.level - 1) * 14}px` } }, toggle, heading);
         if (editable() && !entry.inTable) dragHeading(row, heading, entry);
         rows.push(el('li', { role: 'none' }, row));
@@ -251,9 +271,10 @@ export function createNavigationPane(api) {
         item.setAttribute('aria-label', `Page ${i + 1}`);
         item.lastChild.textContent = String(i + 1);
         if (i === currentPage) item.setAttribute('aria-current', 'page'); else item.removeAttribute('aria-current');
-        const thumb = item.firstChild, ratio = source.height / source.width || 1.294, scale = window.devicePixelRatio || 1;
+        // A page's shape from its size on screen: a page far from the view has given up its pixels (releasePages).
+        const thumb = item.firstChild, ratio = parseFloat(source.style.height) / parseFloat(source.style.width) || source.height / source.width || 1.294, scale = window.devicePixelRatio || 1;
         const width = Math.round(THUMB_WIDTH * scale), height = Math.round(THUMB_WIDTH * ratio * scale);
-        if (!all && thumb.source === source && thumb.width === width && thumb.height === height && !paintedPages.has(i)) return;
+        if (!all && thumb.source === source && (thumb.width === width && thumb.height === height && !paintedPages.has(i) || !source.width)) return;
         thumb.source = source;
         thumb.width = width; thumb.height = height;
         thumb.style.width = `${THUMB_WIDTH}px`; thumb.style.height = `${Math.round(THUMB_WIDTH * ratio)}px`;
@@ -262,6 +283,7 @@ export function createNavigationPane(api) {
         if (source.width) ctx.drawImage(source, 0, 0, thumb.width, thumb.height);
       });
       paintedPages.clear();
+      settle(pageGrid, '.nav-page');
     });
   }
   function renderResults() {
@@ -288,11 +310,12 @@ export function createNavigationPane(api) {
       }
       // The row chooses the match at its place in the list when clicked, so a kept row chooses the moved match.
       const next = el('li', { dataset: { key } }, el('button.nav-result', { type: 'button', 'aria-current': i === current ? 'true' : null, onclick: () => { current = i; api.selectMatch(matches[i]); status.textContent = `Result ${i + 1} of ${matches.length}`; renderResults(); } },
-        parts[0], el('mark', {}, parts[1]), parts[2]));
+        el('span', { dir: 'auto' }, parts[0], el('mark', {}, parts[1]), parts[2])));
       if (row) row.replaceWith(next); else resultList.append(next);
     });
     while (resultList.children.length > shown.length) resultList.lastChild.remove();
     if (focused >= 0) (resultList.querySelectorAll('.nav-result')[Math.min(focused, matches.length - 1)] || search).focus();
+    settle(resultList, '.nav-result');
   }
   function render() {
     if (node.hidden) return;
@@ -331,6 +354,8 @@ export function createNavigationPane(api) {
     /** The text searched for last, for Find Next. */
     get query() { return search.value; },
     get tab() { return tab; },
+    /** Whether the pane shows page thumbnails, which draw every page. */
+    get showsPages() { return !node.hidden && tab === 'pages'; },
     select,
   };
 }

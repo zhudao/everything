@@ -56,6 +56,7 @@ export function createRibbon({
     class: "ribbon-tabs",
     role: "tablist",
     "aria-label": "Ribbon tabs",
+    onscroll: () => markOverflow(tablist),
   });
   const collapse = el(
     "button",
@@ -351,6 +352,42 @@ export function createRibbon({
     // task on, so the press that opened it does not.
     document.addEventListener("keydown", onKey, true);
     setTimeout(() => document.addEventListener("pointerdown", close, true));
+    // Inside, the keys work as in a menu: the arrows, Home and End move
+    // between the commands (a box keeps its arrows, as does a gallery that
+    // moves through its own items), and Tab past either end closes the
+    // drop-down and goes back to its button.
+    pop.addEventListener("keydown", (e) => {
+      if (e.defaultPrevented || e.altKey || e.ctrlKey || e.metaKey) return;
+      const all = focusables(pop);
+      const at = all.indexOf(document.activeElement);
+      if (at < 0) return;
+      if (e.key === "Tab") {
+        if (e.shiftKey ? at > 0 : at < all.length - 1) return;
+        e.preventDefault();
+        close();
+        anchor.focus();
+        return;
+      }
+      if (e.target.matches("input, select, textarea")) return;
+      const step = {
+        ArrowRight: at + 1,
+        ArrowDown: at + 1,
+        ArrowLeft: at - 1,
+        ArrowUp: at - 1,
+        Home: 0,
+        End: all.length - 1,
+      }[e.key];
+      if (step === undefined) return;
+      e.preventDefault();
+      e.stopPropagation();
+      all[(step + all.length) % all.length].focus();
+    });
+    // The keyboard leaving it any other way closes it too.
+    pop.addEventListener("focusout", (e) => {
+      const to = e.relatedTarget;
+      if (!to || pop.contains(to) || to.closest?.(".menu")) return;
+      if (pop.isConnected) close();
+    });
     pop.addEventListener("click", (e) => {
       if (e.target.closest("button:not([aria-haspopup])")) setTimeout(close);
     });
@@ -1063,6 +1100,7 @@ export function createRibbon({
 
   // ---- Fitting: fold groups, last first, until the panel fits ----
   function fit() {
+    markOverflow(tablist);
     const panel = panels.get(active);
     if (!panel || panel.hidden || !panel.isConnected) return;
     fitGroups(panel);
@@ -1111,7 +1149,25 @@ export function createRibbon({
       }
     }
   }
-  // Which edges of a panel that scrolls sideways have more beyond them.
+  // A tab that does not fit the row (a contextual tab arriving on a tablet
+  // or a phone) is brought into view, without moving the page, as far as the
+  // chosen tab's name stays in view too; past that, the faded edge says more
+  // tabs lie beyond.
+  function reveal(button) {
+    const r = button.getBoundingClientRect();
+    const row = tablist.getBoundingClientRect();
+    const current = tabButtons.get(active)?.getBoundingClientRect();
+    if (r.right > row.right) {
+      const room = current ? Math.max(0, current.left - row.left) : Infinity;
+      tablist.scrollLeft += Math.min(r.right - row.right + 8, room);
+    } else if (r.left < row.left) {
+      const room = current ? Math.max(0, row.right - current.right) : Infinity;
+      tablist.scrollLeft -= Math.min(row.left - r.left + 8, room);
+    }
+    markOverflow(tablist);
+  }
+  // Which edges of a panel (or of the row of tabs) that scrolls sideways have
+  // more beyond them.
   function markOverflow(panel) {
     const end = panel.scrollWidth - panel.clientWidth;
     panel.classList.toggle("more-before", end > 1 && panel.scrollLeft > 1);
@@ -1125,6 +1181,8 @@ export function createRibbon({
   }
   const observer = new ResizeObserver(() => fit());
   observer.observe(body);
+  observer.observe(tablist);
+  let contextualShown = new Set();
 
   function refresh() {
     const focused = document.activeElement;
@@ -1149,6 +1207,10 @@ export function createRibbon({
       (t) => t.contextual && !tabButtons.get(t.id).hidden,
     );
     tablist.classList.toggle("has-contextual", contextual.length > 0);
+    const arrived = contextual.find((t) => !contextualShown.has(t.id));
+    contextualShown = new Set(contextual.map((t) => t.id));
+    if (arrived) reveal(tabButtons.get(arrived.id));
+    else markOverflow(tablist);
     if (activeHidden) select(tabs.find((t) => !t.contextual)?.id || "home");
     // A control switched off under the keyboard focus hands it on rather
     // than dropping it onto the page.
@@ -1180,11 +1242,14 @@ export function createRibbon({
       observer.disconnect();
     },
     // Every command, for searching: label, the tab it is on, and a way to
-    // run it or open its menu.
+    // run it or open its menu. A contextual tab that is not showing (Picture
+    // Format with no picture chosen) and a hidden group offer nothing.
     commands() {
       const out = [];
-      for (const tab of tabs)
-        for (const group of tab.groups)
+      for (const tab of tabs) {
+        if (tab.visible && !tab.visible()) continue;
+        for (const group of tab.groups) {
+          if (group.visible && !group.visible()) continue;
           (function walk(items) {
             for (const item of items) {
               if (!item) continue;
@@ -1194,13 +1259,16 @@ export function createRibbon({
               out.push({ item, tab, group });
             }
           })(group.items);
+        }
+      }
       return out;
     },
     closeMenus: closeMenu,
   };
 }
 
-// Screen tips follow the pointer over any element that declares one.
+// Screen tips follow the pointer over any element that declares one, and
+// the keyboard's focus to one.
 let tipNode = null,
   tipTimer = 0,
   tipFor = null;
@@ -1210,11 +1278,8 @@ function hideTip() {
   tipNode = null;
   tipFor = null;
 }
-document.addEventListener("pointerover", (e) => {
-  const target = e.target.closest?.("[data-tip-title]");
-  if (target === tipFor) return;
+function scheduleTip(target) {
   hideTip();
-  if (!target || e.pointerType === "touch") return;
   tipFor = target;
   tipTimer = setTimeout(() => {
     if (!target.isConnected || document.querySelector(".menu")) return;
@@ -1226,9 +1291,33 @@ document.addEventListener("pointerover", (e) => {
     );
     document.body.append(tipNode);
     const r = target.getBoundingClientRect();
-    tipNode.style.left = `${Math.max(4, Math.min(r.left, document.documentElement.clientWidth - tipNode.offsetWidth - 8))}px`;
-    tipNode.style.top = `${r.bottom + 6}px`;
+    const root = document.documentElement;
+    tipNode.style.left = `${Math.max(4, Math.min(r.left, root.clientWidth - tipNode.offsetWidth - 8))}px`;
+    // Under the command, or over it where the window ends below (the
+    // status bar's buttons).
+    const below = r.bottom + 6;
+    tipNode.style.top = `${
+      below + tipNode.offsetHeight > root.clientHeight - 4
+        ? Math.max(4, r.top - 6 - tipNode.offsetHeight)
+        : below
+    }px`;
   }, 650);
+}
+document.addEventListener("pointerover", (e) => {
+  const target = e.target.closest?.("[data-tip-title]");
+  if (target === tipFor) return;
+  hideTip();
+  if (!target || e.pointerType === "touch") return;
+  scheduleTip(target);
+});
+document.addEventListener("focusin", (e) => {
+  const target = e.target.closest?.("[data-tip-title]");
+  if (!target || target === tipFor || !e.target.matches(":focus-visible"))
+    return;
+  scheduleTip(target);
+});
+document.addEventListener("focusout", (e) => {
+  if (tipFor && tipFor.contains(e.target)) hideTip();
 });
 document.addEventListener("pointerdown", hideTip, true);
 document.addEventListener("keydown", hideTip, true);

@@ -1,8 +1,10 @@
 // Presentation I/O: load, save, and create.
 
+import type { ContentTypes } from "../../internal/opc/index.ts";
 import {
   type BlankDeckAspect,
   OpcPackage,
+  type Part,
   buildBlankDeck,
 } from "../../internal/parts/index.ts";
 import {
@@ -33,12 +35,19 @@ const normalize = async (input: PresentationInput): Promise<Uint8Array> => {
 
 /**
  * Loads an existing `.pptx` and returns a `PresentationData` value.
+ *
+ * `snapshot`: `input` is bytes `savePresentation` returned, unchanged
+ * since (an undo history keeps such snapshots). Parts the decks in memory
+ * still hold are then shared rather than unpacked again, and their
+ * compression is reused on the next save. Parts are never changed in
+ * place, so sharing them is safe.
  */
 export const loadPresentation = async (
   input: PresentationInput,
+  options: { snapshot?: boolean } = {},
 ): Promise<PresentationData> => {
   const bytes = await normalize(input);
-  const pkg = OpcPackage.load(bytes);
+  const pkg = OpcPackage.load(bytes, options);
   return {
     [INTERNAL_PACKAGE]: pkg,
     [FIELD_DATE]: Date.now(),
@@ -83,3 +92,43 @@ export const savePresentation = (
 ): Promise<Uint8Array> => {
   return Promise.resolve(pres[INTERNAL_PACKAGE].save());
 };
+
+/**
+ * A presentation as it stood when {@link snapshotPresentation} took it: its
+ * parts, in order, with the bytes each held then. The bytes are the ones the
+ * presentation itself holds (parts are replaced, never changed in place), so
+ * a snapshot costs only what later edits replace, and an undo history of
+ * snapshots holds each version of a part once.
+ */
+export interface PresentationSnapshot {
+  readonly parts: ReadonlyArray<Readonly<Part>>;
+  readonly contentTypes: Readonly<ContentTypes>;
+}
+
+/** Takes a {@link PresentationSnapshot} of `pres`, without serializing it. */
+export const snapshotPresentation = (
+  pres: PresentationData,
+): PresentationSnapshot => {
+  const pkg = pres[INTERNAL_PACKAGE];
+  return Object.freeze({
+    parts: Object.freeze(pkg.parts.map((part) => Object.freeze({ ...part }))),
+    contentTypes: structuredClone(pkg.contentTypes),
+  });
+};
+
+/**
+ * A presentation made from a {@link PresentationSnapshot}, as
+ * `loadPresentation` would read it from the bytes `savePresentation`
+ * wrote at the time. It shares the snapshot's part bytes; the snapshot
+ * stays as it was whatever is done to the presentation.
+ */
+export const restorePresentation = (
+  snapshot: PresentationSnapshot,
+): PresentationData => ({
+  [INTERNAL_PACKAGE]: OpcPackage.fromParts(
+    snapshot.parts,
+    snapshot.contentTypes as ContentTypes,
+  ),
+  [FIELD_DATE]: Date.now(),
+  _slidesCache: null,
+});

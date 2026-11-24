@@ -207,6 +207,25 @@ export function icon(name, size = 18, { plain = false } = {}) {
 const APPLE = /Mac|iPhone|iPad|iPod/.test(
   globalThis.navigator?.platform || globalThis.navigator?.userAgent || '',
 );
+/**
+ * Whether a key press belongs to the text field it was typed in on an Apple device, where Control
+ * with a letter is the field's own editing key in every app: ⌃D deletes forward, ⌃F and ⌃B move
+ * by a character, ⌃P and ⌃N by a line, ⌃O opens a line, ⌃L centers it. The app's shortcuts there
+ * are the ⌘ ones; Control elsewhere (Windows and Linux) is left to them.
+ */
+export function fieldEditingKey(e) {
+  if (!APPLE || !e.ctrlKey || e.metaKey || e.altKey) return false;
+  if (!/^Key[BDFLOP]$/.test(e.code)) return false;
+  const field = e.target;
+  return (
+    !!field?.isContentEditable ||
+    field instanceof HTMLTextAreaElement ||
+    (field instanceof HTMLInputElement &&
+      !['checkbox', 'radio', 'range', 'color', 'button', 'submit', 'reset', 'file'].includes(
+        field.type,
+      ))
+  );
+}
 const MAC_KEYS = { Ctrl: '⌃', Alt: '⌥', Shift: '⇧', Mod: '⌘', Plus: '+', Minus: '−' };
 const PC_KEYS = { Mod: 'Ctrl', Plus: 'Plus', Minus: 'Minus' };
 const ARIA_KEYS = {
@@ -288,12 +307,18 @@ export function iconButton(label, glyph, onClick, attrs = {}) {
 }
 let toastTimer,
   toastDismiss,
-  toastSequence = 0;
-export function toast(message, { error = false } = {}) {
+  toastSequence = 0,
+  toastError = false;
+/**
+ * Show a message for a few seconds; an error stays until the next press or key. `persist` keeps
+ * a progress message ("Opening…") up until dismissToast() takes it down. Returns its number.
+ */
+export function toast(message, { error = false, persist = false } = {}) {
   const node = document.querySelector('#toast');
   clearTimeout(toastTimer);
   toastDismiss?.abort();
   const sequence = ++toastSequence;
+  toastError = error;
   if (error) {
     const dialog = [...document.querySelectorAll('dialog[open]')].at(-1);
     const feedback = dialog?.querySelector('.dialog-error');
@@ -302,7 +327,7 @@ export function toast(message, { error = false } = {}) {
       feedback.hidden = false;
       feedback.scrollIntoView({ block: 'nearest' });
       node.hidden = true;
-      return;
+      return sequence;
     }
   }
   // Full screen shows only its own element, so the message moves in there while it lasts.
@@ -323,6 +348,7 @@ export function toast(message, { error = false } = {}) {
   requestAnimationFrame(() => {
     if (sequence === toastSequence && !node.hidden) node.textContent = message;
   });
+  if (persist) return sequence;
   toastTimer = setTimeout(() => {
     if (!error) {
       node.hidden = true;
@@ -338,6 +364,22 @@ export function toast(message, { error = false } = {}) {
     for (const type of ['pointerdown', 'keydown'])
       window.addEventListener(type, hide, { capture: true, signal: dismiss.signal });
   }, 5500);
+  return sequence;
+}
+/**
+ * Take down an error message still on screen. A view that replaces the one it was about (a PDF
+ * that opens after another could not) does so: dropped from the desktop, the new file brings no
+ * press or key to the page, and "This PDF could not be opened" stayed over the PDF that had.
+ */
+export function dismissErrorToast() {
+  if (toastError) dismissToast(toastSequence);
+}
+/** Take down the message `toast()` numbered, unless another has replaced it since. */
+export function dismissToast(sequence) {
+  if (sequence !== toastSequence) return;
+  clearTimeout(toastTimer);
+  toastDismiss?.abort();
+  document.querySelector('#toast').hidden = true;
 }
 let dialogSequence = 0,
   dialogGeneration = 0;

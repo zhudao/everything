@@ -106,6 +106,7 @@ button {
 /* Main regions receive focus after screen changes and from the skip link;
    they are not controls, so the next Tab press shows focus instead. */
 #main:focus,
+#view-host:focus,
 #inspector:focus {
   outline: none;
 }
@@ -763,6 +764,10 @@ puter-user-menu::part(apps-panel) {
   display: flex;
   flex-direction: column;
   overflow: hidden;
+  /* Never scrolled, not even by a view bringing its current page into
+     view: a phone's larger touch targets reach a few pixels past the status
+     bar, and scrolling to them lifted the title bar off the top. */
+  overflow: clip;
 }
 /* The editor's top bar has two rows: the title row holds the back button,
    the mark, the title with its save status, and the presentation's actions;
@@ -1661,18 +1666,10 @@ puter-user-menu::part(apps-panel) {
 .inline-editor .para {
   min-height: 1.2em;
 }
-/* List paragraphs show their marker while edited; numbers count up. */
-.inline-editor {
-  counter-reset: item;
-}
-.inline-editor .para[data-list="bullet"]::before {
-  content: "•\00a0";
-}
-.inline-editor .para[data-list="number"] {
-  counter-increment: item;
-}
-.inline-editor .para[data-list="number"]::before {
-  content: counter(item) ".\00a0";
+/* List paragraphs show their marker while edited: the bullet, or the
+   number, the slide shows. */
+.inline-editor .para[data-marker]::before {
+  content: attr(data-marker) "\00a0";
 }
 .notes-area {
   background: var(--page);
@@ -1942,6 +1939,14 @@ puter-user-menu::part(apps-panel) {
   font-size: 13px;
   line-height: 1.7;
 }
+.dialog-field-error {
+  margin: 6px 0 0;
+  color: var(--danger);
+  font-size: 13px;
+}
+.dialog-body .input[aria-invalid="true"] {
+  border-color: var(--danger);
+}
 .dialog-body label {
   display: block;
   font-size: 12px;
@@ -2043,6 +2048,12 @@ puter-user-menu::part(apps-panel) {
 }
 .menu-item.checked {
   color: var(--accent);
+}
+/* On the tint of a hovered or focused item the accent is a shade darker,
+   to stay readable. */
+.menu-item.checked:hover,
+.menu-item.checked:focus {
+  color: color-mix(in srgb, var(--accent) 85%, var(--ink));
 }
 .menu-icon {
   width: 18px;
@@ -2194,8 +2205,9 @@ kbd {
 .presenter-stage.ended {
   background: #000;
 }
-.presenter-stage.ended .presenter-slide,
-.presenter-stage.ended .presenter-links {
+/* The end screen shows only its message: nothing of the last slide (its
+   animated objects, media, cameras or ink) stays over it. */
+.presenter-stage.ended .presenter-frame > :not(.presenter-end) {
   visibility: hidden;
 }
 .presenter-end {
@@ -2430,6 +2442,24 @@ body:has(.presenter[open]) #toast {
 }
 #toast.visible {
   opacity: 1;
+}
+/* The message lets taps and drags through to what it covers (the navigator,
+   on phones); its button takes them, and holds the message while pointed at. */
+#toast.visible .toast-close {
+  pointer-events: auto;
+}
+#toast .toast-close {
+  width: 24px;
+  min-width: 24px;
+  height: 24px;
+  min-height: 24px;
+  margin: -4px -9px -4px 8px;
+  padding: 0;
+  vertical-align: middle;
+  color: inherit;
+}
+#toast .toast-close:hover:not(:disabled) {
+  background: color-mix(in srgb, currentColor 16%, transparent);
 }
 #print-slides {
   display: none;

@@ -1,4 +1,11 @@
 import { waitFor } from '../lib/abort.js';
+import {
+  MAX_FILE_SIZE,
+  MAX_IMAGE_SIZE,
+  MAX_PNG_PIXELS,
+  MAX_PAGES,
+  safeName,
+} from './file-limits.js';
 import { rememberStreamProtection } from './stream-filters.js';
 import {
   PDFDocument,
@@ -45,15 +52,16 @@ import {
 } from 'pdf-lib';
 import { textStyleBits } from './paragraph-data.js';
 import { textDecorationQuads } from './text-decoration.js';
-import { inheritPdfVersion, loadPdfDocument, savePdf } from './version.js';
+import { dropUsageRights, inheritPdfVersion, loadPdfDocument, savePdf } from './version.js';
 import { sweepUnreferenced } from './compress.js';
 import { removePageStructure } from './struct-tree.js';
-import { shiftPageLabels } from './page-labels.js';
+import { pageLabelSpecs, setPageLabels, shiftPageLabels } from './page-labels.js';
 import { retargetDeletedPages, stabilizeLocalDestinations } from './destinations.js';
 import { addHighlight, rectQuad } from './highlight.js';
 import { checkedFontData } from './font-data.js';
 import { CjkFace, cjkRegions, cjkScriptName, hasCjkText, hasKoreanText } from './cjk-fonts.js';
 import { normalizeJpegPadding } from './jpeg.js';
+import { closeOpenStates } from './page-state.js';
 import {
   prepareImageOrientation,
   imageOrientationMatrix,
@@ -61,7 +69,22 @@ import {
 } from './image-orientation.js';
 import { reorientNotes } from './notes.js';
 import { flattenFields, redrawnFieldTexts, requireFlattenedPages } from './flatten.js';
-import { decimalMark, numberFormat, simpleCalculation, typedNumber } from './form-format.js';
+import {
+  dateFormat,
+  decimalMark,
+  emailValidation,
+  formulaCalculation,
+  isEmailAddress,
+  numberFormat,
+  printedDate,
+  rangeValidation,
+  simpleCalculation,
+  specialDigits,
+  specialFormat,
+  timeOnly,
+  typedDate,
+  typedNumber,
+} from './form-format.js';
 import {
   choiceAppearanceProvider,
   prepareFieldAppearance,
@@ -101,29 +124,7 @@ import {
   repairForm,
 } from './structure.js';
 
-export const MAX_FILE_SIZE = 100 * 1024 * 1024;
-export const MAX_IMAGE_SIZE = 20 * 1024 * 1024;
-/** The most pixels a PNG may unpack to: an 8000 by 6000 photo, about 200 MB as it is placed. */
-export const MAX_PNG_PIXELS = 50 * 1000 * 1000;
-export const MAX_PAGES = 1000;
-const nameEncoder = new TextEncoder();
-export function safeName(value) {
-  const clean = String(value || '')
-    .replace(/[\x00-\x1f\x7f/\\:*?"<>|]/g, ' ')
-    .trim()
-    .replace(/\.pdf$/i, '')
-    .trim();
-  let name = '',
-    bytes = 0;
-  // Leave room for export suffixes within filesystem limits, without cutting a code point.
-  for (const char of clean) {
-    const size = nameEncoder.encode(char).length;
-    if (bytes + size > 180) break;
-    name += char;
-    bytes += size;
-  }
-  return `${name.trim() || 'Untitled'}.pdf`;
-}
+export { MAX_FILE_SIZE, MAX_IMAGE_SIZE, MAX_PNG_PIXELS, MAX_PAGES, safeName };
 export function normalizeRect(a, b) {
   return {
     x: Math.min(a.x, b.x),
@@ -243,6 +244,28 @@ function pageGeometry(doc) {
   return parts.join('\n');
 }
 
+/** The page objects of a document's pages, in order, as "12 0". */
+const pageObjects = (doc) =>
+  doc.getPages().map(({ ref }) => `${ref.objectNumber} ${ref.generationNumber}`);
+
+/** Whether a field of the form holds a signature (a dictionary with the bytes it covers). */
+function hasSignatures(doc) {
+  const form = doc.catalog.lookup(PDFName.of('AcroForm'));
+  const fields = form instanceof PDFDict ? form.lookup(PDFName.of('Fields')) : null;
+  const pending = fields instanceof PDFArray ? [...fields.asArray()] : [];
+  const seen = new Set();
+  while (pending.length && seen.size < 100000) {
+    const field = doc.context.lookup(pending.pop());
+    if (!(field instanceof PDFDict) || seen.has(field)) continue;
+    seen.add(field);
+    const value = field.lookup(PDFName.of('V'));
+    if (value instanceof PDFDict && value.has(PDFName.of('ByteRange'))) return true;
+    const kids = field.lookup(PDFName.of('Kids'));
+    if (kids instanceof PDFArray) pending.push(...kids.asArray());
+  }
+  return false;
+}
+
 /** Transactions retain original bytes, commit only on success, and bound undo memory. */
 export class PdfSession {
   constructor(bytes) {
@@ -256,6 +279,10 @@ export class PdfSession {
     // laying them out as it did instead of waiting to read every page's size again.
     this.geometry = 0;
     this.nextGeometry = 1;
+    // Which page objects ("12 0") the pages are, in order, when known: a page moved, added or
+    // removed keeps or loses its object, so views can follow each page through the change.
+    // Unknown for a file as opened (or rewritten whole) until its first edit reads them.
+    this.pages = null;
   }
   get dirty() {
     return this.revision !== this.savedRevision;
@@ -263,10 +290,28 @@ export class PdfSession {
   markSaved(revision = this.revision) {
     this.savedRevision = revision;
   }
-  async change(operation, { signal, canCommit, streamProtection, saveOptions } = {}) {
+  /**
+   * `incremental`: an edit that only fills in fields. A signed PDF then keeps its bytes, the
+   * values appended as a revision of their own, as Acrobat saves them: rewritten whole, the
+   * file no longer matched what its signatures cover, and every signature showed as invalid.
+   */
+  async change(
+    operation,
+    { signal, canCommit, streamProtection, saveOptions, incremental = false } = {},
+  ) {
     // Reconciliation must see the original Info timestamps, not pdf-lib's load time.
     const doc = await waitFor(() => loadPdfDocument(this.bytes, { updateMetadata: false }), signal);
     signal?.throwIfAborted();
+    // The pages as they were, read from the document the edit loads anyway, so the revision
+    // kept for Undo knows them too.
+    this.pages ??= pageObjects(doc);
+    const revision =
+      incremental && hasSignatures(doc)
+        ? (await waitFor(() => import('./pdf-incremental.js'), signal)).trackRevision(
+            this.bytes,
+            doc,
+          )
+        : null;
     // Read before the repairs, which can move or resize pages as much as the operation can.
     const geometry = pageGeometry(doc);
     repairDocument(doc);
@@ -275,6 +320,8 @@ export class PdfSession {
     const changed = await waitFor(() => operation(doc), signal);
     signal?.throwIfAborted();
     if (changed === false) return false;
+    // Usage rights stay valid over values appended to the file.
+    if (!revision) dropUsageRights(doc);
     if (!doc.getPageCount() || doc.getPageCount() > MAX_PAGES)
       throw new Error('Keep between 1 and 1,000 pages in the PDF.');
     // Load XML support only for documents that actually carry an XMP packet.
@@ -283,6 +330,13 @@ export class PdfSession {
       (await waitFor(() => import('./details.js'), signal)).synchronizeDocumentMetadata(doc);
     signal?.throwIfAborted();
     if (!synchronized) doc.setModificationDate(new Date());
+    if (revision) {
+      const bytes = await waitFor(() => revision.finish(), signal);
+      signal?.throwIfAborted();
+      if (!bytes || (canCommit && !canCommit())) return false;
+      this.adopt(bytes, { sameGeometry: true, pages: pageObjects(doc) });
+      return;
+    }
     // pdf-lib writes every object it holds, referenced or not. Without this sweep each edit left
     // the content it replaced in the file, so files grew with every change and deleted pages or
     // replaced text stayed recoverable from the saved PDF.
@@ -303,13 +357,16 @@ export class PdfSession {
     const bytes = await waitFor(() => savePdf(doc, saveOptions), signal);
     signal?.throwIfAborted();
     if (canCommit && !canCommit()) return false;
-    this.adopt(bytes, { sameGeometry: geometry !== null && geometry === pageGeometry(doc) });
+    this.adopt(bytes, {
+      sameGeometry: geometry !== null && geometry === pageGeometry(doc),
+      pages: pageObjects(doc),
+    });
   }
   /** Make `next` the current bytes and keep the previous ones in history. */
-  adopt(next, { sameGeometry = false } = {}) {
+  adopt(next, { sameGeometry = false, pages = null } = {}) {
     if (next.length > MAX_FILE_SIZE)
       throw new Error('This edit would exceed the 100 MB PDF limit.');
-    this.past.push({ bytes: this.bytes, revision: this.revision, geometry: this.geometry });
+    this.past.push(this.state());
     while (
       this.past.length > 25 ||
       (this.past.length > 1 &&
@@ -319,19 +376,31 @@ export class PdfSession {
     this.bytes = next;
     this.revision = this.nextRevision++;
     if (!sameGeometry) this.geometry = this.nextGeometry++;
+    this.pages = pages;
     this.future = [];
+  }
+  /** The page objects of a revision still at hand (current, or in Undo or Redo), if known. */
+  pagesAt(revision) {
+    if (revision === this.revision) return this.pages;
+    return (
+      [...this.past, ...this.future].find((state) => state.revision === revision)?.pages ?? null
+    );
+  }
+  state() {
+    const { bytes, revision, geometry, pages } = this;
+    return { bytes, revision, geometry, pages };
   }
   undo() {
     const prev = this.past.pop();
     if (!prev) return false;
-    this.future.push({ bytes: this.bytes, revision: this.revision, geometry: this.geometry });
+    this.future.push(this.state());
     Object.assign(this, prev);
     return true;
   }
   redo() {
     const next = this.future.pop();
     if (!next) return false;
-    this.past.push({ bytes: this.bytes, revision: this.revision, geometry: this.geometry });
+    this.past.push(this.state());
     Object.assign(this, next);
     return true;
   }
@@ -667,8 +736,20 @@ export async function insertPdfPages(
     copyPageStandIns(copier, source, doc),
   );
   const position = Math.min(Math.max(after + 1, 0), doc.getPageCount());
+  const labelsBefore = pageLabelSpecs(doc);
   copied.forEach((page, k) => ownGeometry(doc.insertPage(position + k, page)));
-  shiftPageLabels(doc, position, copied.length);
+  // Pages from a PDF with labels of its own keep them ("A-1", "A-2"), and the pages around
+  // them keep theirs; pages without labels carry on the numbering where they land.
+  const sourceLabels = pageLabelSpecs(source);
+  if (sourceLabels) {
+    const before = labelsBefore || new Array(position).fill(null);
+    setPageLabels(doc, [
+      ...before.slice(0, position),
+      ...indices.map((index) => sourceLabels[index]),
+      ...(labelsBefore ? labelsBefore.slice(position) : []),
+      ...new Array(labelsBefore ? 0 : doc.getPageCount() - position - indices.length).fill(null),
+    ]);
+  } else shiftPageLabels(doc, position, copied.length);
   pruneCopiedResources(doc, copied);
   const indexToRef = new Map(indices.map((index, k) => [index, copied[k].ref]));
   relinkCopiedPages(doc, copied, indexToRef);
@@ -953,7 +1034,11 @@ export async function addText(
   const angle = (rotation * Math.PI) / 180,
     c = Math.cos(angle),
     s = Math.sin(angle);
-  if (underline || strikethrough) {
+  const decorated = underline || strikethrough;
+  // The lines of new text stay one block, as they were typed: edited, moved and deleted together
+  // rather than line by line.
+  const block = decorated || lines.length > 1;
+  if (block) {
     const width = Math.max(1, ...widths),
       leading = size * 1.35;
     const items = lines.flatMap((_, i) => (i ? [-1, 1] : [1]));
@@ -979,7 +1064,7 @@ export async function addText(
     rotate: degrees(rotation),
     lineHeight: size * 1.35,
   });
-  if (underline || strikethrough) {
+  if (decorated) {
     page.pushOperators(
       PDFOperator.of('BMC', [PDFName.of('PuterTextDecoration')]),
       pushGraphicsState(),
@@ -1001,13 +1086,9 @@ export async function addText(
           fill(),
         );
     }
-    page.pushOperators(
-      popGraphicsState(),
-      PDFOperator.of('EMC'),
-      PDFOperator.of('EMC'),
-      popGraphicsState(),
-    );
+    page.pushOperators(popGraphicsState(), PDFOperator.of('EMC'));
   }
+  if (block) page.pushOperators(PDFOperator.of('EMC'), popGraphicsState());
 }
 /**
  * The bundled faces flattening needs for fields it draws anew whose text the standard font
@@ -1050,18 +1131,26 @@ export function assertSupportedText(font, text) {
     })
     .join('');
   if (missing.size) {
-    // Name what to change; a character that shows nothing is named by its code.
-    const names = [...missing].slice(0, 3).map((char) =>
-      /^[\p{L}\p{M}\p{N}\p{P}\p{S}]+$/u.test(char)
-        ? // Isolate a right-to-left letter, or the message reorders around it: “ر” ,“م”.
-          `“${RTL.test(char) ? `\u2068${char}\u2069` : char}”`
-        : `U+${char.codePointAt(0).toString(16).toUpperCase().padStart(4, '0')}`,
-    );
-    const list =
-      names.length > 1 ? `${names.slice(0, -1).join(', ')} or ${names.at(-1)}` : names[0];
-    throw new Error(`This font does not support ${list} in this text.`);
+    const error = new Error(`This font does not support ${characterList(missing)} in this text.`);
+    error.missing = missing;
+    throw error;
   }
   return spelled;
+}
+/**
+ * Up to three characters named for a message: “Q”, “Z” or “٠”. A character that shows nothing is
+ * named by its code.
+ */
+export function characterList(chars, conjunction = 'or') {
+  const names = [...chars].slice(0, 3).map((char) =>
+    /^[\p{L}\p{M}\p{N}\p{P}\p{S}]+$/u.test(char)
+      ? // Isolate a right-to-left letter, or the message reorders around it: “ر” ,“م”.
+        `“${RTL.test(char) ? `\u2068${char}\u2069` : char}”`
+      : `U+${char.codePointAt(0).toString(16).toUpperCase().padStart(4, '0')}`,
+  );
+  return names.length > 1
+    ? `${names.slice(0, -1).join(', ')} ${conjunction} ${names.at(-1)}`
+    : names[0];
 }
 /**
  * The triangle at the tip of an arrow from `from` to `to` drawn with a stroke `width`, in the
@@ -1210,7 +1299,8 @@ export const isJpeg = (bytes) => bytes[0] === 255 && bytes[1] === 216 && bytes[2
 /** Decode a PNG or JPEG into the document, translating parser failures into user-facing errors. */
 export async function embedImage(doc, bytes) {
   if (bytes?.length > MAX_IMAGE_SIZE) throw new Error('Choose an image smaller than 20 MB.');
-  const invalid = () => new Error('Choose a valid PNG or JPEG image.');
+  const invalid = () =>
+    Object.assign(new Error('Choose a valid PNG or JPEG image.'), { code: 'invalid-image' });
   if (!(bytes instanceof Uint8Array) || !bytes.length) throw invalid();
   // A PNG is unpacked in full to be placed, and a small file can hold an enormous picture of
   // one color; its header says the size before any of it is unpacked.
@@ -1272,6 +1362,7 @@ export function drawOrientedImage(page, embedded, { x, y, width, height, rotatio
 export async function addImage(doc, index, bytes) {
   const image = await embedOrientedImage(doc, bytes);
   const page = doc.getPage(index);
+  closeOpenStates(page);
   const box = visibleBox(page);
   const rotation = pageRotation(page);
   const sideways = rotation === 90 || rotation === 270;
@@ -1612,6 +1703,8 @@ export function listFields(doc) {
         multiline: !!(flags & AcroTextFlags.Multiline),
         password: !!(flags & AcroTextFlags.Password),
         spellcheck: !(flags & (AcroTextFlags.DoNotSpellCheck | AcroTextFlags.Password)),
+        // A date or time field's pattern, shown while it is empty.
+        ...(dateFormat(field) && { placeholder: dateFormat(field) }),
       };
     }
     if (field instanceof PDFCheckBox) {
@@ -1682,36 +1775,77 @@ const CALCULATIONS = {
   MAX: (numbers) => Math.max(...numbers),
 };
 /**
- * Work out the form's own simple calculations (sums, products, averages, minimums, and
- * maximums of other fields) in its calculation order, as Acrobat does after a value changes.
- * Returns the fields whose values changed.
+ * Work out the form's own calculations (sums, products, averages, minimums, and maximums of
+ * other fields, and formulas such as Qty * Price) in its calculation order, as Acrobat does
+ * after a value changes. Values are read with `read(field)` and results handed to
+ * `write(field, value)`; returns the fields whose values changed.
  */
-function recalculate(doc, fields) {
+function calculate(
+  doc,
+  fields,
+  read,
+  write,
+  names = new Map(fields.map((field) => [field, formFieldName(field)])),
+  scripts = new Map(),
+) {
   const order = doc.getForm().acroForm.dict.lookup(PDFName.of('CO'));
   if (!(order instanceof PDFArray)) return [];
-  const names = new Map(fields.map((field) => [field, formFieldName(field)]));
+  // Fields by reference, dictionary, name and the groups above them, found in one step each:
+  // a large form's totals were otherwise looked up field by field on every key typed.
+  const byObject = new Map();
+  const byName = new Map();
+  const under = new Map();
+  fields.forEach((field) => {
+    for (const key of [field.ref, field.acroField.dict])
+      if (!byObject.has(key)) byObject.set(key, field);
+    const name = names.get(field);
+    if (!byName.has(name)) byName.set(name, field);
+    const parts = name.split('.');
+    for (let i = 1; i <= parts.length; i++) {
+      const group = parts.slice(0, i).join('.');
+      if (!under.has(group)) under.set(group, []);
+      under.get(group).push(field);
+    }
+  });
+  const position = new Map(fields.map((field, i) => [field, i]));
   const changed = [];
   for (const entry of order.asArray()) {
-    const target = doc.context.lookup(entry);
-    const field = fields.find((f) => f.ref === entry || f.acroField.dict === target);
+    const field = byObject.get(entry) ?? byObject.get(doc.context.lookup(entry));
     if (!(field instanceof PDFTextField)) continue;
     try {
-      const calculation = simpleCalculation(field);
-      if (!calculation) continue;
-      const sources = fields.filter((other) =>
-        calculation.names.some(
-          (name) =>
-            other !== field &&
-            (names.get(other) === name || names.get(other).startsWith(`${name}.`)),
-        ),
-      );
-      if (!sources.length) continue;
+      let value;
+      // A document only read (the preview) keeps its fields' scripts read once.
+      if (!scripts.has(field)) {
+        const simple = simpleCalculation(field);
+        scripts.set(field, { simple, formula: simple ? null : formulaCalculation(field) });
+      }
+      const { simple: calculation, formula } = scripts.get(field);
       // A value that is not a number counts as zero, as in Acrobat.
-      const numbers = sources.map((source) => typedNumber(calculationInput(source)) ?? 0);
-      const value = String(CALCULATIONS[calculation.operation](numbers));
-      if (textValue(field) === value) continue;
-      prepareFieldAppearance(field, doc.getForm());
-      field.setText(value);
+      const number = (source) => typedNumber(read(source)) ?? 0;
+      if (calculation) {
+        // The fields named, and those under a group named, in the form's order.
+        const sources = [...new Set(calculation.names.flatMap((name) => under.get(name) ?? []))]
+          .filter((other) => other !== field)
+          .sort((a, b) => position.get(a) - position.get(b));
+        if (!sources.length) continue;
+        value = String(CALCULATIONS[calculation.operation](sources.map(number)));
+      } else if (formula) {
+        // A formula (Qty * Price) reads each field it names; one the form lacks stops it.
+        const values = new Map();
+        for (const name of formula.names) {
+          let source = byName.get(name);
+          if (source === field)
+            source = fields.find((other) => other !== field && names.get(other) === name);
+          if (!source) break;
+          values.set(name, number(source));
+        }
+        if (values.size < formula.names.length) continue;
+        const result = formula.evaluate(values);
+        // Dividing by an empty field leaves nothing to show.
+        value = Number.isFinite(result) ? String(result) : '';
+      } else continue;
+      if (read(field) === value) continue;
+      write(field, value);
       changed.push(field);
     } catch {
       // A calculation that cannot be worked out leaves its field as it is.
@@ -1719,14 +1853,159 @@ function recalculate(doc, fields) {
   }
   return changed;
 }
-export async function fillFields(doc, values) {
+function recalculate(doc, fields) {
+  return calculate(doc, fields, calculationInput, (field, value) => {
+    prepareFieldAppearance(field, doc.getForm());
+    field.setText(value);
+  });
+}
+const previewFields = new WeakMap();
+/**
+ * The values the form's calculations would give with `values` (field name to value, as the
+ * page drafts them) filled in, without changing the document: field name to value, for the
+ * calculated fields whose values would change.
+ */
+export function previewCalculations(doc, values) {
+  // The document is only read here, so its fields are read once.
+  if (!previewFields.has(doc)) {
+    const fields = formFields(doc);
+    previewFields.set(doc, {
+      fields,
+      names: new Map(fields?.map((field) => [field, formFieldName(field)])),
+      scripts: new Map(),
+      saved: new Map(),
+    });
+  }
+  const { fields, names, scripts, saved } = previewFields.get(doc);
+  if (!fields) return new Map();
+  const typed = new Map();
+  for (const field of fields) {
+    const value = values[names.get(field)];
+    if (value !== undefined)
+      typed.set(
+        field,
+        Array.isArray(value) ? String(value[0] ?? '').split(CHOICE_STATE)[0] : String(value),
+      );
+  }
+  const results = new Map();
+  const read = (field) => {
+    if (typed.has(field)) return typed.get(field);
+    if (!saved.has(field)) saved.set(field, calculationInput(field));
+    return saved.get(field);
+  };
+  const write = (field, value) => typed.set(field, value);
+  for (const field of calculate(doc, fields, read, write, names, scripts))
+    results.set(names.get(field), typed.get(field));
+  return results;
+}
+/**
+ * Reset form fields to their default values (DV), or empty them, as a form's Reset button does
+ * (a ResetForm action: `fields` names and `refs` object references, PDF.js's "12R", of the
+ * fields to reset, or with `include` false of those to leave; none means every field). A
+ * named group resets the fields under it. Returns false when nothing changed.
+ */
+/** The fields a reset (a form's own Reset button, pushButtonAction) takes back. */
+function resetChosen(doc, { fields: names = [], refs = [], include = true } = {}) {
   const fields = formFields(doc);
+  if (!fields) throw new Error(DAMAGED_FORM);
+  const refName = (ref) =>
+    ref instanceof PDFRef
+      ? `${ref.objectNumber}R${ref.generationNumber ? ref.generationNumber : ''}`
+      : null;
+  const listed = (field) => {
+    const fieldName = formFieldName(field);
+    if (names.some((name) => fieldName === name || fieldName.startsWith(`${name}.`))) return true;
+    // The field, or a group above it, by reference.
+    for (let ref = field.ref, seen = 0; ref instanceof PDFRef && seen < 64; seen++) {
+      if (refs.includes(refName(ref))) return true;
+      ref = doc.context.lookup(ref)?.get?.(PDFName.of('Parent'));
+    }
+    return false;
+  };
+  return fields.filter((field) => !(names.length || refs.length) || listed(field) === include);
+}
+/** The names of the fields a reset takes back to their default values. */
+export const resetFieldNames = (doc, action) => resetChosen(doc, action).map(formFieldName);
+export async function resetFields(doc, action) {
+  const chosen = resetChosen(doc, action);
+  // Each field's value without its own: the default value, or nothing.
+  const keys = [PDFName.of('V'), PDFName.of('I')];
+  const kept = chosen.map((field) =>
+    keys.map((key) => [field, key, field.acroField.dict.get(key)]),
+  );
+  for (const [field, key] of kept.flat()) field.acroField.dict.delete(key);
+  let defaults;
+  try {
+    const wanted = new Set(chosen.map(formFieldName));
+    defaults = listFields(doc).filter(
+      (field) => wanted.has(field.name) && field.type !== 'unsupported' && !field.readOnly,
+    );
+  } finally {
+    for (const [field, key, value] of kept.flat())
+      if (value !== undefined) field.acroField.dict.set(key, value);
+  }
+  return fillFields(
+    doc,
+    Object.fromEntries(defaults.map(({ name, value }) => [name, value ?? []])),
+  );
+}
+/** The date a date field's message shows as an example, in the field's pattern. */
+const EXAMPLE_DATE = new Date(Date.UTC(2025, 2, 15, 14, 30));
+/**
+ * Put widgets on the pages that the form's field list leaves out (as tools that combine PDFs
+ * often do) back in it, when they are fields of these names: other readers, PDF.js among
+ * them, still offer them to fill in. Returns whether any was added.
+ */
+function adoptOrphanFields(doc, names) {
+  const wanted = new Set(names);
+  const fields = doc.getForm().acroForm.dict.lookup(PDFName.of('Fields'));
+  if (!(fields instanceof PDFArray) || !wanted.size) return false;
+  const listed = new Set(fields.asArray());
+  let adopted = false;
+  for (const page of doc.getPages())
+    for (const ref of annotationsOf(page)?.asArray() ?? []) {
+      let dict = doc.context.lookup(ref);
+      if (!(dict instanceof PDFDict) || dict.lookup(PDFName.of('Subtype')) !== PDFName.of('Widget'))
+        continue;
+      // The topmost field above the widget, and the widget's full name.
+      let top = ref;
+      const parts = [];
+      for (let depth = 0; dict instanceof PDFDict && depth < 64; depth++) {
+        const part = dict.lookup(PDFName.of('T'));
+        if (part instanceof PDFString || part instanceof PDFHexString)
+          parts.unshift(part.decodeText());
+        const parent = dict.get(PDFName.of('Parent'));
+        if (!(parent instanceof PDFRef)) break;
+        top = parent;
+        dict = doc.context.lookup(parent);
+      }
+      if (!(top instanceof PDFRef) || listed.has(top) || !wanted.has(parts.join('.'))) continue;
+      fields.push(top);
+      listed.add(top);
+      adopted = true;
+    }
+  return adopted;
+}
+export async function fillFields(doc, values) {
+  let fields = formFields(doc);
   if (!fields) throw new Error(DAMAGED_FORM);
   const form = doc.getForm();
   const byName = new Map();
-  for (const field of fields) {
-    const name = formFieldName(field);
-    if (!byName.has(name)) byName.set(name, field);
+  const index = () => {
+    for (const field of fields) {
+      const name = formFieldName(field);
+      if (!byName.has(name)) byName.set(name, field);
+    }
+  };
+  index();
+  if (
+    adoptOrphanFields(
+      doc,
+      Object.keys(values).filter((name) => !byName.has(name)),
+    )
+  ) {
+    fields = formFields(doc) ?? fields;
+    index();
   }
   let changed = false;
   const changedText = new Map();
@@ -1749,8 +2028,66 @@ export async function fillFields(doc, values) {
           // The field it is about, for the page to point at it.
           { field: name },
         );
+      // A date or time field takes one it can read in its pattern's order, as Acrobat's does.
+      const pattern = dateFormat(field);
+      if (String(value).trim() && pattern && !typedDate(value, pattern))
+        throw Object.assign(
+          new Error(
+            `Enter a ${timeOnly(pattern) ? 'time' : 'date'} in ${fieldTooltip(field) || name}, such as ${printedDate(EXAMPLE_DATE, pattern)}.`,
+          ),
+          { field: name },
+        );
+      // A number outside the field's range is refused; text that is no number is not checked.
+      const range = rangeValidation(field);
+      const number = range && String(value).trim() ? typedNumber(value, format) : null;
+      if (
+        number !== null &&
+        ((range.min !== null && number < range.min) || (range.max !== null && number > range.max))
+      )
+        throw Object.assign(
+          new Error(
+            `Enter a number ${
+              range.min === null
+                ? `of at most ${range.max}`
+                : range.max === null
+                  ? `of at least ${range.min}`
+                  : `from ${range.min} to ${range.max}`
+            } in ${fieldTooltip(field) || name}.`,
+          ),
+          { field: name },
+        );
+      if (String(value).trim() && emailValidation(field) && !isEmailAddress(value))
+        throw Object.assign(
+          new Error(
+            `Enter an email address in ${fieldTooltip(field) || name}, such as name@example.com.`,
+          ),
+          { field: name },
+        );
+      // A ZIP Code, phone, or Social Security number field takes its digits, as in Acrobat.
+      const special = specialFormat(field);
+      if (String(value).trim() && special && specialDigits(value, special) === null)
+        throw Object.assign(
+          new Error(
+            `Enter ${special.name} in ${fieldTooltip(field) || name}, such as ${special.example}.`,
+          ),
+          { field: name },
+        );
+      // A value the file held over the field's limit can be shortened, though not to fit.
+      const limit = textMaxLength(field)?.asNumber();
+      if (limit >= 0 && String(value).length > limit)
+        throw Object.assign(
+          new Error(
+            `Enter at most ${limit} ${limit === 1 ? 'character' : 'characters'} in ${fieldTooltip(field) || name}.`,
+          ),
+          { field: name },
+        );
       prepareFieldAppearance(field, form);
+      const flags = field.acroField.dict.get(PDFName.of('Ff'));
       field.setText(value);
+      // pdf-lib clears the rich-text flag, writing flags a field without them did not have:
+      // a change to the field's definition to a signature over the form.
+      if (!flags && field.acroField.dict.get(PDFName.of('Ff'))?.asNumber?.() === 0)
+        field.acroField.dict.delete(PDFName.of('Ff'));
       // An explicit empty value overrides inherited/default values; deleting /V does not.
       if (value === '') field.acroField.setValue(PDFHexString.fromText(''));
       // A rich-text field also carries its value as RV, which viewers show in preference; a
@@ -1869,7 +2206,12 @@ export async function fillFields(doc, values) {
   for (const field of changedFields) {
     const text = changedText.get(field) ?? '';
     const font = await embedFont(doc, 'regular', text);
-    assertSupportedText(font, text);
+    try {
+      assertSupportedText(font, text);
+    } catch (error) {
+      // The field with the character, for the page to point at it and not at every change.
+      throw Object.assign(error, { field: formFieldName(field) });
+    }
     fonts.set(field, font);
   }
   for (const { field, labels, options } of changedChoices) {

@@ -5,6 +5,7 @@
 import { test, expect } from "@playwright/test";
 import { readFile } from "node:fs/promises";
 import { strFromU8, unzipSync } from "fflate";
+import { P, createDeck } from "../src/model.js";
 
 test.setTimeout(120_000);
 
@@ -218,6 +219,67 @@ test("icons are inserted as SVG pictures, restyled, and converted to shapes", as
   expect(saved.slide()).not.toContain("<p:pic>");
 });
 
+test("an icon converted to a shape keeps its turn and its place behind other objects", async ({
+  page,
+}) => {
+  const pres = createDeck("blank");
+  const slide = P.getSlides(pres)[0];
+  // A 1×1 PNG stands in for the icon's picture.
+  const png = Uint8Array.from(
+    atob(
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==",
+    ),
+    (c) => c.charCodeAt(0),
+  );
+  const svg = new TextEncoder().encode(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#000000" stroke-width="2"><path d="M4 4L20 20M4 20L20 4"/></svg>',
+  );
+  const icon = P.addSlideVectorPicture(
+    slide,
+    { png, svg },
+    { x: P.inches(2), y: P.inches(2), w: P.inches(2), h: P.inches(2) },
+  );
+  P.setShapeObjectData(icon, { type: "icon", name: "cross" });
+  P.setShapeRotation(icon, 30);
+  P.setShapeFlip(icon, { horizontal: true });
+  P.addSlideShape(slide, {
+    preset: "rect",
+    x: P.inches(3),
+    y: P.inches(3),
+    w: P.inches(3),
+    h: P.inches(3),
+    name: "Cover",
+  });
+  await start(page);
+  await page.goto("/#/home");
+  const choose = page.waitForEvent("filechooser");
+  await page.getByRole("button", { name: "Import PPTX", exact: true }).click();
+  await (
+    await choose
+  ).setFiles({
+    name: "Icon.pptx",
+    mimeType:
+      "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    buffer: Buffer.from(await P.savePresentation(pres)),
+  });
+  const hit = page.locator(".object-hit").first();
+  await expect(hit).toBeVisible();
+  const box = await hit.boundingBox();
+  await page.mouse.click(box.x + box.width * 0.3, box.y + box.height * 0.3);
+  await expect(
+    page.getByRole("tab", { name: "Graphics Format" }),
+  ).toBeVisible();
+  await tab(page, "Graphics Format");
+  await command(page, "graphics-convert");
+  await expect(page.getByRole("tab", { name: "Graphics Format" })).toBeHidden();
+  const saved = await download(page);
+  const xml = saved.slide();
+  expect(xml).toContain("<a:custGeom>");
+  // The converted shape comes before the cover in the tree, so behind it.
+  expect(xml.indexOf("<a:custGeom>")).toBeLessThan(xml.indexOf('name="Cover"'));
+  expect(xml).toMatch(/<a:xfrm rot="1800000" flipH="1">/);
+});
+
 test("the Icons dialog takes one Tab for its categories and one for its icons", async ({
   page,
 }) => {
@@ -283,6 +345,48 @@ test("equations are pictures that keep their source and reopen for editing", asy
     .toContain("Equation: \\frac{a}{b}");
 });
 
+// A long equation's picture was drawn wider than a canvas can be, and the
+// equation was refused: "The picture could not be drawn."
+test("a long equation goes in", async ({ page }) => {
+  await start(page);
+  await command(page, "equation");
+  const dialog = page.getByRole("dialog", { name: "Equation" });
+  const source = Array.from({ length: 300 }, (_, i) => `a_{${i}}`).join("+");
+  await dialog.getByLabel("Equation (TeX-style)").fill(source);
+  await dialog.getByRole("button", { name: "Insert", exact: true }).click();
+  await expect(page.locator(".object-hit")).toHaveCount(1);
+});
+
+test("editing an equation keeps alt text written for it", async ({ page }) => {
+  await start(page);
+  await command(page, "equation");
+  const dialog = page.getByRole("dialog", { name: "Equation" });
+  await dialog.getByLabel("Equation (TeX-style)").fill("a^2+b^2=c^2");
+  await dialog.getByRole("button", { name: "Insert", exact: true }).click();
+  await expect(page.locator(".object-hit")).toHaveCount(1);
+  // Alt text of the person's own, from the Alt Text command.
+  await tab(page, "Review");
+  await command(page, "alt-text");
+  const altDialog = page.getByRole("dialog", { name: "Alt Text" });
+  await altDialog
+    .getByRole("textbox", { name: "Alt text" })
+    .fill("Pythagorean theorem");
+  await altDialog.getByRole("button", { name: "Done" }).click();
+  await expect
+    .poll(async () => (await download(page)).slide())
+    .toContain('descr="Pythagorean theorem"');
+  await page.locator(".object-hit").first().dblclick();
+  const edit = page.getByRole("dialog", { name: "Edit Equation" });
+  await edit.getByLabel("Equation (TeX-style)").fill("a^2+b^2=c^3");
+  await edit.getByRole("button", { name: "Update" }).click();
+  await expect
+    .poll(async () => (await download(page)).slide())
+    .toContain("c^3");
+  expect((await download(page)).slide()).toContain(
+    'descr="Pythagorean theorem"',
+  );
+});
+
 test("video plays on the canvas and in the slide show, with its playback settings saved", async ({
   page,
 }) => {
@@ -332,6 +436,35 @@ test("video plays on the canvas and in the slide show, with its playback setting
   await page.keyboard.press("Space");
   await expect(page.locator(".presenter-media.playing")).toHaveCount(1);
   await expect(page.locator(".presenter-end")).toBeHidden();
+});
+
+test("a video hidden while not playing goes away again when it ends", async ({
+  page,
+}) => {
+  await start(page);
+  const video = await webm(page);
+  await choose(page, () => command(page, "video"), {
+    name: "clip.webm",
+    mimeType: "video/webm",
+    buffer: video,
+  });
+  await expect(page.locator(".object-hit")).toHaveCount(1);
+  await tab(page, "Playback");
+  await command(page, "playback-hide");
+  await expect(
+    page.locator('[data-command="playback-hide"]').first(),
+  ).toBeChecked();
+  await page.getByRole("button", { name: "Present", exact: true }).click();
+  await expect(page.locator(".presenter-counter")).toHaveText("1 / 1");
+  await page.keyboard.press("Space");
+  const media = page.locator(".presenter-media");
+  await expect(media).toHaveClass(/playing/);
+  await expect
+    .poll(() => media.locator("video").evaluate((v) => v.ended), {
+      timeout: 10_000,
+    })
+    .toBe(true);
+  await expect(media).not.toHaveClass(/playing/);
 });
 
 test("a video's bytes are let go once another presentation opens", async ({
@@ -387,6 +520,42 @@ test("the table picker sizes a table with the arrow keys", async ({ page }) => {
   const { slide } = await download(page);
   expect(slide().match(/<a:gridCol /g)).toHaveLength(3);
   expect(slide().match(/<a:tr /g)).toHaveLength(2);
+});
+
+// A video file holding only sound was placed as a video with a blank
+// picture: an empty box on the slide and in the slide show.
+test("a video file holding only sound goes in as a sound with its speaker", async ({
+  page,
+}) => {
+  await start(page);
+  const data = await page.evaluate(async () => {
+    const ctx = new AudioContext();
+    const tone = ctx.createOscillator();
+    const out = ctx.createMediaStreamDestination();
+    tone.connect(out);
+    tone.start();
+    const rec = new MediaRecorder(out.stream, { mimeType: "audio/webm" });
+    const chunks = [];
+    rec.ondataavailable = (e) => chunks.push(e.data);
+    rec.start(100);
+    await new Promise((r) => setTimeout(r, 800));
+    rec.stop();
+    await new Promise((r) => (rec.onstop = r));
+    tone.stop();
+    return [...new Uint8Array(await new Blob(chunks).arrayBuffer())];
+  });
+  await choose(page, () => command(page, "video"), {
+    name: "talk.webm",
+    mimeType: "video/webm",
+    buffer: Buffer.from(data),
+  });
+  await expect(page.locator(".object-hit")).toHaveCount(1);
+  const saved = await download(page);
+  expect(saved.slide()).toContain("<a:audioFile");
+  expect(saved.slide()).not.toContain("<a:videoFile");
+  expect(saved.rels()).toMatch(/relationships\/audio"/);
+  const types = strFromU8(saved.files["[Content_Types].xml"]);
+  expect(types).toMatch(/audio\/webm/);
 });
 
 test("audio from a file and from a recording is saved as media", async ({
@@ -493,6 +662,40 @@ test("media playing on the canvas stops when the slide show starts", async ({
   expect(await sounding()).toBe(0);
 });
 
+test("media set to loop keeps playing on the canvas", async ({ page }) => {
+  await page.addInitScript(() => {
+    const play = HTMLMediaElement.prototype.play;
+    window.played = [];
+    HTMLMediaElement.prototype.play = function () {
+      window.played.push(this);
+      return play.call(this);
+    };
+  });
+  const sounding = () =>
+    page.evaluate(
+      () => [...new Set(window.played)].filter((m) => !m.paused).length,
+    );
+  await start(page);
+  await choose(
+    page,
+    async () => {
+      await commandMenu(page, "audio", "Audio sources");
+      await page.getByRole("menuitem", { name: "Audio from File…" }).click();
+    },
+    { name: "tone.wav", mimeType: "audio/wav", buffer: wav(0.5) },
+  );
+  await tab(page, "Playback");
+  await command(page, "playback-loop");
+  await expect(
+    page.locator('[data-command="playback-loop"]').first(),
+  ).toBeChecked();
+  await command(page, "playback-play");
+  await expect.poll(sounding).toBe(1);
+  // Well past the end of the half-second sound, it is still playing.
+  await page.waitForTimeout(1500);
+  expect(await sounding()).toBe(1);
+});
+
 test("header and footer apply to every slide", async ({ page }) => {
   await start(page);
   await command(page, "insert-new-slide");
@@ -595,6 +798,41 @@ test("a summary zoom jumps to its slide and returns", async ({ page }) => {
   await expect(page.locator(".presenter-counter")).toHaveText("3 / 4");
   await page.keyboard.press("ArrowRight");
   await expect(page.locator(".presenter-counter")).toHaveText("1 / 4");
+});
+
+// In a deck with sections, the summary slide joined the section before it,
+// so zooming into that section played the summary slide as part of it.
+test("a summary zoom of a later section starts a section of its own", async ({
+  page,
+}) => {
+  await start(page);
+  for (let i = 0; i < 3; i++) await page.keyboard.press("Meta+Shift+N");
+  await expect(page.locator(".slide-item")).toHaveCount(4);
+  await page.locator(".slide-item").nth(2).locator(".slide-thumb").click();
+  await tab(page, "Home");
+  await command(page, "section");
+  await page.getByRole("menuitem", { name: "Add Section" }).click();
+  await page.getByRole("dialog").getByRole("textbox").fill("Later");
+  await page.getByRole("dialog").getByRole("button").last().click();
+  await tab(page, "Insert");
+  await command(page, "insert-zoom");
+  await page.getByRole("menuitem", { name: "Summary Zoom…" }).click();
+  const dialog = page.getByRole("dialog", { name: "Insert Summary Zoom" });
+  await expect(dialog.getByRole("checkbox")).toHaveCount(2);
+  await dialog.getByRole("checkbox").first().uncheck();
+  await dialog.getByRole("button", { name: "Insert", exact: true }).click();
+  await expect(page.locator(".slide-item")).toHaveCount(5);
+  const { files } = await download(page);
+  const pres = strFromU8(files["ppt/presentation.xml"]);
+  const sections = [
+    ...pres.matchAll(/<p14:section name="([^"]*)"[^>]*>(.*?)<\/p14:section>/g),
+  ].map(([, name, body]) => [name, (body.match(/<p14:sldId /g) || []).length]);
+  expect(sections.map(([name]) => name)).toEqual([
+    expect.any(String),
+    "Summary Section",
+    "Later",
+  ]);
+  expect(sections.map(([, n]) => n)).toEqual([2, 1, 2]);
 });
 
 test("action buttons get a default action and action settings", async ({
@@ -707,6 +945,44 @@ test("a picture the album can't use is left out, not the whole album", async ({
   );
 });
 
+// A JPEG photo turned black and white was redrawn as a PNG, many times its
+// size in the file (a 400 KB photo took 2.9 MB).
+test("a black and white album keeps its JPEG photos as JPEGs", async ({
+  page,
+}) => {
+  await start(page);
+  const jpeg = Buffer.from(
+    await page.evaluate(async () => {
+      const c = document.createElement("canvas");
+      c.width = 640;
+      c.height = 480;
+      const g = c.getContext("2d");
+      for (let i = 0; i < 600; i++) {
+        g.fillStyle = `hsl(${i % 360},60%,50%)`;
+        g.fillRect((i * 37) % 640, (i * 53) % 480, 40, 30);
+      }
+      const blob = await new Promise((r) => c.toBlob(r, "image/jpeg", 0.85));
+      return [...new Uint8Array(await blob.arrayBuffer())];
+    }),
+  );
+  await command(page, "photo-album");
+  const dialog = page.getByRole("dialog", { name: "Photo Album" });
+  await choose(
+    page,
+    () => dialog.getByRole("button", { name: "Add Pictures…" }).click(),
+    [{ name: "photo.jpg", mimeType: "image/jpeg", buffer: jpeg }],
+  );
+  await dialog.getByLabel("All pictures black and white").check();
+  await dialog.getByRole("button", { name: "Create" }).click();
+  await expect(page.locator(".slide-item")).toHaveCount(3);
+  const { files } = await download(page);
+  const media = Object.keys(files).filter((n) => n.startsWith("ppt/media/"));
+  expect(media).toHaveLength(1);
+  expect(media[0]).toMatch(/\.jpe?g$/);
+  expect([...files[media[0]].subarray(0, 3)]).toEqual([0xff, 0xd8, 0xff]);
+  expect(files[media[0]].length).toBeLessThan(jpeg.length * 2);
+});
+
 test("objects are embedded as packages and handed back on opening", async ({
   page,
 }) => {
@@ -751,4 +1027,43 @@ test("screenshots insert a capture, or a clipped region of it", async ({
   await expect(page.locator(".object-hit")).toHaveCount(2);
   const saved = await download(page);
   expect(saved.slide().match(/<p:pic>/g)).toHaveLength(2);
+});
+
+// A zoom kept the picture of its target slide as it was when inserted.
+test("a slide zoom's picture follows its target slide, in the same undo step", async ({
+  page,
+}) => {
+  await start(page);
+  await command(page, "insert-new-slide");
+  await command(page, "insert-new-slide");
+  await page.locator(".slide-item").first().locator(".slide-thumb").click();
+  await command(page, "insert-zoom");
+  await page.getByRole("menuitem", { name: "Slide Zoom…" }).click();
+  const dialog = page.getByRole("dialog", { name: "Insert Slide Zoom" });
+  await dialog.getByRole("checkbox").nth(2).check();
+  await dialog.getByRole("button", { name: "Insert", exact: true }).click();
+  await expect(page.locator('.object-hit[aria-label*="Zoom"]')).toHaveCount(1);
+  // The zoom's picture on slide 1, as saved.
+  const picture = async () => {
+    const saved = await download(page);
+    const id = /<a:blip r:embed="(rId\d+)"/.exec(
+      saved.slide(1).split("Slide Zoom 1")[1],
+    )[1];
+    const target = new RegExp(`Id="${id}"[^>]*Target="([^"]+)"`).exec(
+      saved.rels(1),
+    )[1];
+    return Buffer.from(
+      saved.files[`ppt/${target.replace(/^(\.\.\/|\/ppt\/)/, "")}`],
+    ).toString("base64");
+  };
+  const before = await picture();
+  // The target slide gets a dark background.
+  await page.locator(".slide-item").nth(2).locator(".slide-thumb").click();
+  await page.getByRole("tab", { name: "Design", exact: true }).click();
+  await command(page, "background-styles");
+  await page.getByRole("menuitem", { name: "Style 12" }).click();
+  await expect.poll(picture, { timeout: 15_000 }).not.toBe(before);
+  // One undo takes the background and the new picture back.
+  await page.keyboard.press("ControlOrMeta+z");
+  await expect.poll(picture, { timeout: 15_000 }).toBe(before);
 });

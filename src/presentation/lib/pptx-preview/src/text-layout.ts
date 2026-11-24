@@ -77,6 +77,11 @@ export interface RenderSlideOptions {
   /** Which text path to use. Defaults to 'foreignObject' (the browser path)
    *  so existing callers are unaffected; the harness opts into 'svg'. */
   readonly textLayout?: TextLayoutMode;
+  /** Whether a typeface is installed where the slide is drawn. A bullet in a
+   *  symbol typeface that is missing (Wingdings, Symbol) is drawn as the
+   *  Unicode character it shows, in the text's typeface, rather than as the
+   *  letter that stands for it. Omitted, every typeface counts as installed. */
+  readonly hasFont?: (family: string) => boolean;
   /** Resolves authored typefaces for SVG text and measurement. */
   readonly resolveFontFamily?: (
     family: string | null | undefined,
@@ -202,6 +207,9 @@ export interface PieceInput {
   readonly kerning?: "normal" | "none";
   readonly fillHex: string;
   readonly fillOpacity?: number;
+  /** Names the run's own shadow and glow (`data-fx` on its text), so they
+   *  can be drawn for its text alone. */
+  readonly effectKey?: string;
   /** `'wavy'` covers every `ST_TextUnderlineType` wavy variant (`wavy`,
    *  `wavyDbl`, `wavyHeavy`) — SVG/resvg has no `text-decoration-style`
    *  support, so the engine draws it as an explicit path (see `wavyPath`). */
@@ -211,6 +219,10 @@ export interface PieceInput {
   readonly underlineHex?: string;
   /** A double underline (`dbl`), drawn as two lines. */
   readonly underlineDouble?: boolean;
+  /** A thick (`…Heavy`) underline, drawn twice as heavy. */
+  readonly underlineHeavy?: boolean;
+  /** Dots and dashes of a dotted or dashed underline, in line widths. */
+  readonly underlineDashes?: readonly number[];
   /** A double strikethrough (`dblStrike`), drawn as two lines. */
   readonly strikeDouble?: boolean;
   /** Text outline (`<a:ln>` on the run). */
@@ -218,6 +230,8 @@ export interface PieceInput {
   readonly strokeWidthPx?: number;
   readonly strokeOpacity?: number;
   readonly superSub: 0 | 1 | -1; // 1 superscript, -1 subscript
+  /** Text highlight color (`<a:highlight>`), painted behind the run. */
+  readonly highlightHex?: string;
   readonly href: string | null;
   readonly isBreak: boolean; // <a:br>
 }
@@ -234,7 +248,7 @@ export interface BulletInput {
 }
 
 export interface ParaInput {
-  readonly align: "left" | "center" | "right" | "justify";
+  readonly align: "left" | "center" | "right" | "justify" | "distribute";
   readonly marLpx: number;
   readonly marRpx: number;
   readonly firstIndentPx: number; // first-line indent (negative = hanging)
@@ -272,7 +286,7 @@ export interface ParaInput {
  *  90° clockwise (reading top-to-bottom, columns right-to-left); `cw270` is the
  *  opposite 270° rotation (columns left-to-right). `upright` is `wordArtVert` —
  *  glyphs stay upright and stack one per line (render-slide pre-splits the runs
- *  one code point per line), so it lays out like `none` with no rotation. */
+ *  one character per line), so it lays out like `none` with no rotation. */
 export type VerticalLayout = "none" | "cw90" | "cw270" | "upright";
 
 export interface ColumnLayout {
@@ -294,6 +308,9 @@ export interface TextBodyInput {
   /** spcFirstLastPara includes the outer paragraph margins and the last
    * line's full advance in the bounds used for anchoring and autofit. */
   readonly includeOuterSpacing?: boolean;
+  /** `anchorCtr`: the smallest box holding the text is centered across the
+   *  layout frame, its lines keeping their alignment within it. */
+  readonly anchorCenter?: boolean;
   /** Vertical text direction; omitted / 'none' is the default horizontal flow. */
   readonly vert?: VerticalLayout;
   /** Multi-column body (`numCol`/`spcCol`); null / omitted is single column. */
@@ -302,6 +319,16 @@ export interface TextBodyInput {
    *  place in the layout, so a paragraph painted alone sits exactly where it
    *  does in the whole body. Null / omitted paints them all. */
   readonly visibleParagraphs?: ReadonlySet<number> | null;
+  /** East Asian vertical text (`eaVert`): the layout turns a quarter turn
+   *  like `cw90`, but ideographs, kana and hangul stand upright in their
+   *  columns while Latin text and brackets lie along them. */
+  readonly uprightEastAsian?: boolean;
+  /** Stacked text (`upright`) whose columns run right to left
+   *  (`wordArtVertRtl`); otherwise they run left to right. */
+  readonly stackRightToLeft?: boolean;
+  /** Turned text (`cw90`) whose lines follow one another left to right
+   *  (`mongolianVert`) rather than right to left. */
+  readonly linesLeftToRight?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -341,6 +368,15 @@ export interface Line {
   textAnchor: "start" | "middle" | "end";
   /** The paragraph's base direction is right-to-left. */
   rtl?: boolean;
+  /** Width a justified line is spread to: set on each line of a justified
+   *  paragraph that ends where the text wrapped (not on its last line, nor
+   *  on one that ends at a line break). */
+  justifyWidth?: number;
+  /** Width a distributed line is spread to, by spacing out its characters:
+   *  set on every line of a distributed paragraph. */
+  distributeWidth?: number;
+  /** Stand East Asian characters upright in a turned line (eaVert). */
+  uprightEastAsian?: boolean;
   bullet: { x: number; baselineDy: number; b: BulletInput } | null;
 }
 
@@ -643,6 +679,7 @@ const placeTabs = (
   lineLeft: number,
   origin: number,
   para: ParaInput,
+  measureWidth: (text: string, piece: PieceInput) => number,
 ): void => {
   const stops = [...(para.tabStops ?? [])].sort((a, b) => a.posPx - b.posPx);
   const step =
@@ -673,7 +710,12 @@ const placeTabs = (
           const point = next.text.search(/[.,]/);
           if (point >= 0) {
             pointSeen = true;
-            beforePoint += (next.width * point) / Math.max(1, next.text.length);
+            // The decimal point itself sits at the stop: measure the text
+            // before it, as glyph widths differ ("1" and "." are narrow).
+            beforePoint +=
+              point > 0
+                ? measureWidth(next.text.slice(0, point), next.piece)
+                : 0;
           } else beforePoint += next.width;
         }
       }
@@ -768,11 +810,12 @@ export const layoutCore = (
       const hasText = para.pieces.some((p) => !p.isBreak && p.text !== "");
       const bullet = para.bullet && hasText ? para.bullet : null;
       // Picture bullets reserve a square of `sizePx` plus a trailing space;
-      // glyph bullets reserve the measured "<glyph> " width.
+      // glyph bullets reserve their measured width: text that has no room
+      // after one starts right where it ends, as in the desktop app.
       const bulletLead = bullet
         ? bullet.imageHref
           ? bullet.sizePx + mWidth(" ", bulletSpec(bullet))
-          : mWidth(`${bullet.text} `, bulletSpec(bullet))
+          : mWidth(bullet.text, bulletSpec(bullet))
         : 0;
 
       // Break units can span formatted runs. Pre-split units wider than a full
@@ -807,7 +850,9 @@ export const layoutCore = (
           : (isFirst ? firstLeft : wrapLeft) + bulletLead;
         const availableW = wrapRight - lineLeft;
         if (toks.some((t) => t.text === "\t"))
-          placeTabs(toks, lineLeft, contentLeft, para);
+          placeTabs(toks, lineLeft, contentLeft, para, (text, piece) =>
+            mWidth(text, specOf(piece)),
+          );
         let unbreakableOverflowW = 0;
         let ascent = 0;
         let descent = 0;
@@ -876,6 +921,9 @@ export const layoutCore = (
           anchorX: lineLeft,
           textAnchor: "start",
           ...(para.rtl ? { rtl: true } : {}),
+          ...(input.uprightEastAsian && (input.vert ?? "none") === "cw90"
+            ? { uprightEastAsian: true }
+            : {}),
           bullet: null,
         };
         if (para.align === "center") {
@@ -922,6 +970,9 @@ export const layoutCore = (
             ? Math.max(0.75 * line.advance, line.advance - descent)
             : 0.75 * line.advance;
         line.extent = line.baselineOffset + descent;
+        if (para.align === "justify" && paraLines[li + 1]?.automaticStart)
+          line.justifyWidth = availableW;
+        else if (para.align === "distribute") line.distributeWidth = availableW;
         cursorY += line.advance;
         lines.push(line);
       }
@@ -970,15 +1021,49 @@ export const layoutCore = (
   const columns = vert === "none" ? (input.columns ?? null) : null;
 
   const { placements, requiredH } =
-    columns && columns.count >= 2
-      ? placeColumns(
-          frame,
-          columns,
-          input.anchor,
-          buildLines,
-          !!input.includeOuterSpacing,
-        )
-      : placeSingle(frame, input.anchor, buildLines);
+    vert === "upright"
+      ? placeStacked(frame, input.anchor, buildLines, !!input.stackRightToLeft)
+      : columns && columns.count >= 2
+        ? placeColumns(
+            frame,
+            columns,
+            input.anchor,
+            buildLines,
+            !!input.includeOuterSpacing,
+          )
+        : placeSingle(frame, input.anchor, buildLines);
+
+  // Lines turned a quarter turn clockwise follow one another right to left;
+  // Mongolian's run left to right, so they are mirrored across the frame
+  // before it turns.
+  if (vert === "cw90" && input.linesLeftToRight)
+    for (const placement of placements) {
+      const top = placement.baselineY - placement.line.baselineOffset;
+      const mirrored = 2 * frame.y + frame.h - (top + placement.line.advance);
+      (placement as { baselineY: number }).baselineY =
+        mirrored + placement.line.baselineOffset;
+    }
+
+  if (input.anchorCenter && !(columns && columns.count >= 2)) {
+    // The text's own box: from its leftmost to its rightmost drawn line.
+    let left = Infinity,
+      right = -Infinity;
+    for (const { line, dx } of placements) {
+      const extent = lineExtent(line);
+      if (!extent) continue;
+      left = Math.min(
+        left,
+        extent.left + dx,
+        (line.bullet?.x ?? Infinity) + dx,
+      );
+      right = Math.max(right, extent.right + dx);
+    }
+    if (left < right) {
+      const shift = frame.x + frame.w / 2 - (left + right) / 2;
+      for (const placement of placements)
+        (placement as { dx: number }).dx += shift;
+    }
+  }
 
   let automaticWraps = 0;
   let unbreakableOverflowW = 0;
@@ -999,6 +1084,27 @@ export const layoutCore = (
     cx,
     cy,
   };
+};
+
+// Where a line's drawn text starts and ends, before any column shift.
+const lineExtent = (line: Line): { left: number; right: number } | null => {
+  let end = line.tokens.length;
+  while (
+    end > 0 &&
+    (line.tokens[end - 1]!.isSpace || line.tokens[end - 1]!.isBreak)
+  )
+    end--;
+  let width = 0;
+  for (let i = 0; i < end; i++)
+    if (!line.tokens[i]!.isBreak) width += line.tokens[i]!.width;
+  if (width <= 0) return null;
+  const left =
+    line.textAnchor === "middle"
+      ? line.anchorX - width / 2
+      : line.textAnchor === "end"
+        ? line.anchorX - width
+        : line.anchorX;
+  return { left, right: left + width };
 };
 
 export const layoutTextSvg = (
@@ -1052,6 +1158,49 @@ const placeSingle = (
       dx: 0,
     })),
     requiredH: blockH,
+  };
+};
+
+// Stacked text (`wordArtVert`): its letters stand one above another, each
+// paragraph in a column of its own, the columns side by side from the left
+// (or from the right). A paragraph taller than the box continues in the next
+// column. Columns are as wide as the tallest line's advance.
+const placeStacked = (
+  frame: Frame,
+  anchor: "top" | "center" | "bottom",
+  buildLines: LineBuilder,
+  rightToLeft: boolean,
+): { placements: Placement[]; requiredH: number } => {
+  const probe = buildLines(frame.x, frame.x + frame.w).lines;
+  if (probe.length === 0) return placeSingle(frame, anchor, buildLines);
+  const pitch = Math.max(1, ...probe.map((line) => line.advance));
+  const { lines } = buildLines(frame.x, frame.x + Math.min(frame.w, pitch));
+  let col = 0,
+    colTop = lines[0]!.topY,
+    tallest = 0;
+  const placed: { line: Line; localTopY: number; col: number }[] = [];
+  for (const line of lines) {
+    const previous = placed.at(-1);
+    if (
+      previous &&
+      (line.paraIndex !== previous.line.paraIndex ||
+        line.topY - colTop + line.extent > frame.h)
+    ) {
+      col++;
+      colTop = line.topY;
+    }
+    const localTopY = line.topY - colTop;
+    placed.push({ line, localTopY, col });
+    tallest = Math.max(tallest, localTopY + line.extent);
+  }
+  const offsetY = anchorOffsetY(frame.y, frame.h, tallest, anchor);
+  return {
+    placements: placed.map(({ line, localTopY, col: c }) => ({
+      line,
+      baselineY: offsetY + localTopY + line.baselineOffset,
+      dx: rightToLeft ? frame.w - (c + 1) * pitch : c * pitch,
+    })),
+    requiredH: tallest,
   };
 };
 
@@ -1164,12 +1313,65 @@ const emitLine = (line: Line, baselineY: number, dx: number): string => {
   const content = toks.filter((t) => !t.isBreak);
   if (content.length === 0) return "";
   const groups = groupTokens(content);
+  // A justified line widens its word spaces until it fills the line.
+  // `word-spacing` adds to each space the browser draws; the drawn
+  // decorations below take the same widths.
+  let wordSpacing = 0;
+  if (line.justifyWidth !== undefined) {
+    let used = 0,
+      spaces = 0;
+    for (const g of groups) {
+      used += g.width;
+      if (!/^\t+$/.test(g.text)) spaces += countWordSeparators(g.text);
+    }
+    const slack = line.justifyWidth - used;
+    if (spaces > 0 && slack > 0.01) {
+      wordSpacing = slack / spaces;
+      for (const g of groups)
+        if (!/^\t+$/.test(g.text))
+          g.width += wordSpacing * countWordSeparators(g.text);
+    }
+  }
+  // A distributed line spaces out every character, its last line too. The
+  // spacing after the final character falls past the line's end unseen.
+  if (line.distributeWidth !== undefined) {
+    let used = 0,
+      characters = 0;
+    const counts = groups.map((g) => {
+      used += g.width;
+      if (/^\t+$/.test(g.text)) return 0;
+      let n = 0;
+      for (const _ of graphemes(g.text)) n++;
+      characters += n;
+      return n;
+    });
+    const slack = line.distributeWidth - used;
+    if (characters > 1 && slack > 0.01) {
+      const extra = slack / (characters - 1);
+      groups.forEach((g, i) => {
+        if (!counts[i]) return;
+        g.extraLetterSpacing = extra;
+        g.width += extra * counts[i]!;
+      });
+      for (let i = groups.length - 1; i >= 0; i--)
+        if (counts[i]) {
+          groups[i]!.width -= extra;
+          break;
+        }
+    }
+  }
   let pendingDx = 0;
+  const upright = { dx: 0, dy: 0 };
   const tspans = groups
     .map((g) => {
       if (g.text === "\t" || /^\t+$/.test(g.text)) {
         pendingDx += g.width;
         return "";
+      }
+      if (line.uprightEastAsian) {
+        const out = uprightTspans(g, pendingDx, upright);
+        pendingDx = 0;
+        return out;
       }
       const out = tspan(g, pendingDx);
       pendingDx = 0;
@@ -1187,16 +1389,104 @@ const emitLine = (line: Line, baselineY: number, dx: number): string => {
       : line.textAnchor === "end"
         ? "start"
         : "middle";
-  const text = `<text x="${fmt(x0)}" y="${fmt(baselineY)}" text-anchor="${anchor}"${line.rtl ? ' direction="rtl"' : ""} xml:space="preserve">${tspans}</text>`;
+  const spacing = wordSpacing ? ` word-spacing="${fmt(wordSpacing)}"` : "";
+  const text = `<text x="${fmt(x0)}" y="${fmt(baselineY)}" text-anchor="${anchor}"${line.rtl ? ' direction="rtl"' : ""}${spacing} xml:space="preserve">${tspans}</text>`;
   return (
+    emitHighlights(groups, line, x0, baselineY) +
     text +
+    emitLinks(groups, line, x0, baselineY) +
     emitWavyUnderlines(groups, line.textAnchor, x0, baselineY) +
     emitDrawnDecorations(groups, line.textAnchor, x0, baselineY)
   );
 };
 
+// The characters CSS word-spacing widens (the common ones).
+const countWordSeparators = (text: string): number => {
+  let n = 0;
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+    if (c === 0x20 || c === 0xa0) n++;
+  }
+  return n;
+};
+
+// Highlighted runs sit on a band of their color as tall as the line's text,
+// drawn behind it. Right-to-left lines run their first run from the right.
+const emitHighlights = (
+  groups: readonly Group[],
+  line: Line,
+  x0: number,
+  baselineY: number,
+): string => {
+  if (!groups.some((g) => g.piece.highlightHex)) return "";
+  const total = groups.reduce((sum, g) => sum + g.width, 0);
+  const left =
+    line.textAnchor === "middle"
+      ? x0 - total / 2
+      : line.textAnchor === "end"
+        ? x0 - total
+        : x0;
+  const top = baselineY - line.ascent,
+    height = line.ascent + line.descent;
+  const parts: string[] = [];
+  let cursor = 0;
+  for (const g of groups) {
+    const color = g.piece.highlightHex;
+    if (color && g.width > 0) {
+      const x = line.rtl ? left + total - cursor - g.width : left + cursor;
+      parts.push(
+        `<rect x="${fmt(x)}" y="${fmt(top)}" width="${fmt(g.width)}" height="${fmt(height)}" fill="${color}"/>`,
+      );
+    }
+    cursor += g.width;
+  }
+  return parts.join("");
+};
+
+// Linked runs carry an unpainted box over their text, marked with the link,
+// so a viewer can find where on the slide each link sits. Neighbouring runs
+// with the same link share one box.
+const emitLinks = (
+  groups: readonly Group[],
+  line: Line,
+  x0: number,
+  baselineY: number,
+): string => {
+  if (!groups.some((g) => g.piece.href)) return "";
+  const total = groups.reduce((sum, g) => sum + g.width, 0);
+  const left =
+    line.textAnchor === "middle"
+      ? x0 - total / 2
+      : line.textAnchor === "end"
+        ? x0 - total
+        : x0;
+  const top = baselineY - line.ascent,
+    height = line.ascent + line.descent;
+  const boxes: { href: string; from: number; width: number }[] = [];
+  let cursor = 0;
+  for (const g of groups) {
+    const href = g.piece.href;
+    const last = boxes.at(-1);
+    if (href && last?.href === href && last.from + last.width === cursor)
+      last.width += g.width;
+    else if (href && g.width > 0)
+      boxes.push({ href, from: cursor, width: g.width });
+    cursor += g.width;
+  }
+  return boxes
+    .map(({ href, from, width }) => {
+      const x = line.rtl ? left + total - from - width : left + from;
+      return `<rect x="${fmt(x)}" y="${fmt(top)}" width="${fmt(width)}" height="${fmt(height)}" fill="none" stroke="none" data-pptx-link="${escapeXml(href)}"/>`;
+    })
+    .join("");
+};
+
 const explicitUnderline = (p: PieceInput): boolean =>
-  p.underline === "single" && (!!p.underlineHex || !!p.underlineDouble);
+  p.underline === "single" &&
+  (!!p.underlineHex ||
+    !!p.underlineDouble ||
+    !!p.underlineHeavy ||
+    !!p.underlineDashes);
 
 // Colored and double underlines and double strikethroughs have no SVG
 // decoration of their own; they are drawn as lines under or through the run.
@@ -1222,12 +1512,16 @@ const emitDrawnDecorations = (
       const size = renderedSizePxOf(p);
       const y0 = baselineY - baselineShiftPxOf(p);
       const width = Math.max(0.6, size * 0.055);
-      const line = (y: number, color: string) =>
-        `<path d="M${fmt(cursor)} ${fmt(y)}H${fmt(cursor + g.width)}" stroke="${color}" stroke-width="${fmt(width)}" fill="none"/>`;
+      const line = (y: number, color: string, w = width, dash = "") =>
+        `<path d="M${fmt(cursor)} ${fmt(y)}H${fmt(cursor + g.width)}" stroke="${color}" stroke-width="${fmt(w)}"${dash} fill="none"/>`;
       if (explicitUnderline(p)) {
         const color = p.underlineHex ?? p.fillHex;
         const y = y0 + size * 0.11;
-        parts.push(line(y, color));
+        const w = p.underlineHeavy ? width * 2 : width;
+        const dash = p.underlineDashes
+          ? ` stroke-dasharray="${p.underlineDashes.map((d) => fmt(d * w)).join(" ")}"`
+          : "";
+        parts.push(line(y, color, w, dash));
         if (p.underlineDouble) parts.push(line(y + width * 2.2, color));
       }
       if (p.strike && p.strikeDouble) {
@@ -1245,6 +1539,8 @@ interface Group {
   text: string;
   piece: PieceInput;
   width: number;
+  /** Spacing added after each character of a distributed line. */
+  extraLetterSpacing?: number;
 }
 
 const groupTokens = (toks: Token[]): Group[] => {
@@ -1320,6 +1616,16 @@ const emitWavyUnderlines = (
       // super/subscript run's wave tracks its raised/lowered glyphs.
       const y = baselineY - baselineShiftPxOf(g.piece);
       parts.push(wavyPath(cursor, cursor + g.width, y, g.piece));
+      // `wavyDbl`: a second wave below the first.
+      if (g.piece.underlineDouble)
+        parts.push(
+          wavyPath(
+            cursor,
+            cursor + g.width,
+            y + renderedSizePxOf(g.piece) * WAVY_AMPLITUDE_RATIO * 3,
+            g.piece,
+          ),
+        );
     }
     cursor += g.width;
   }
@@ -1360,15 +1666,17 @@ const wavyPath = (
     cx = midX;
     up = !up;
   }
-  const strokeWidth = Math.max(
-    WAVY_STROKE_WIDTH_MIN_PX,
-    size * WAVY_STROKE_WIDTH_RATIO,
-  );
-  return `<path d="${d}" stroke="${piece.fillHex}"${piece.fillOpacity !== undefined && piece.fillOpacity !== 1 ? ` stroke-opacity="${piece.fillOpacity}"` : ""} stroke-width="${fmt(strokeWidth)}" fill="none"/>`;
+  const strokeWidth =
+    Math.max(WAVY_STROKE_WIDTH_MIN_PX, size * WAVY_STROKE_WIDTH_RATIO) *
+    (piece.underlineHeavy ? 2 : 1);
+  // An underline colour of its own (`uFill`) replaces the text's.
+  const opacity = piece.underlineHex ? undefined : piece.fillOpacity;
+  return `<path d="${d}" stroke="${piece.underlineHex ?? piece.fillHex}"${opacity !== undefined && opacity !== 1 ? ` stroke-opacity="${opacity}"` : ""} stroke-width="${fmt(strokeWidth)}" fill="none"/>`;
 };
 
 const samePiece = (a: PieceInput, b: PieceInput): boolean =>
   a.family === b.family &&
+  a.effectKey === b.effectKey &&
   a.sizePx === b.sizePx &&
   a.bold === b.bold &&
   a.italic === b.italic &&
@@ -1380,24 +1688,67 @@ const samePiece = (a: PieceInput, b: PieceInput): boolean =>
   a.strike === b.strike &&
   a.underlineHex === b.underlineHex &&
   a.underlineDouble === b.underlineDouble &&
+  a.underlineHeavy === b.underlineHeavy &&
+  a.underlineDashes === b.underlineDashes &&
   a.strikeDouble === b.strikeDouble &&
   a.strokeHex === b.strokeHex &&
   a.strokeWidthPx === b.strokeWidthPx &&
   a.strokeOpacity === b.strokeOpacity &&
   a.superSub === b.superSub &&
+  a.highlightHex === b.highlightHex &&
   a.href === b.href;
 
-const tspan = (g: Group, dx = 0): string => {
+// Characters that stand upright in East Asian vertical text (UAX #50 U and
+// Tu): ideographs, kana, hangul and full-width letters and digits. Brackets,
+// the long vowel mark and Latin text lie along the column instead, as does
+// sentence punctuation, which this layout cannot move to its vertical place.
+const UPRIGHT_EAST_ASIAN =
+  /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}\u3005\u3006\uff10-\uff19\uff21-\uff3a\uff41-\uff5a]/u;
+
+// A turned line's upright characters are each turned back a quarter turn
+// within their own em square, which the glyph's ascent and descent share:
+// the glyph turns about its origin, moved by the ascent across and the
+// descent down, so it lands back in its square. `state` carries that move
+// from run to run of the line, since SVG keeps it for the glyphs after.
+const uprightTspans = (
+  g: Group,
+  dx: number,
+  state: { dx: number; dy: number },
+): string => {
+  const size = renderedSizePxOf(g.piece);
+  const runs = g.text.match(
+    new RegExp(
+      `(?:${UPRIGHT_EAST_ASIAN.source})+|(?:(?!${UPRIGHT_EAST_ASIAN.source})[\\s\\S])+`,
+      "gu",
+    ),
+  ) ?? [g.text];
+  return runs
+    .map((text, i) => {
+      const standing = UPRIGHT_EAST_ASIAN.test(text);
+      const target = standing ? { dx: size * 0.88, dy: size * 0.12 } : null;
+      const moveX = (target?.dx ?? 0) - state.dx + (i === 0 ? dx : 0);
+      const moveY = (target?.dy ?? 0) - state.dy;
+      state.dx = target?.dx ?? 0;
+      state.dy = target?.dy ?? 0;
+      return tspan({ ...g, text }, moveX, moveY, standing ? -90 : 0);
+    })
+    .join("");
+};
+
+const tspan = (g: Group, dx = 0, dy = 0, rotate = 0): string => {
   const p = g.piece;
   const sizePx = renderedSizePxOf(p);
   const attrs: string[] = [
     ...(dx ? [`dx="${fmt(dx)}"`] : []),
+    ...(dy ? [`dy="${fmt(dy)}"`] : []),
+    ...(rotate ? [`rotate="${rotate}"`] : []),
     `font-family="${escapeXml(p.family)}"`,
     `font-size="${fmt(sizePx)}"`,
     ...(p.kerning ? [`style="font-kerning:${p.kerning}"`] : []),
     `fill="${p.fillHex}"`,
   ];
   if (p.bold) attrs.push('font-weight="700"');
+  if (p.effectKey) attrs.push(`data-fx="${escapeXml(p.effectKey)}"`);
   if (p.fillOpacity !== undefined && p.fillOpacity !== 1)
     attrs.push(`fill-opacity="${p.fillOpacity}"`);
   if (p.italic) attrs.push('font-style="italic"');
@@ -1416,8 +1767,8 @@ const tspan = (g: Group, dx = 0): string => {
       attrs.push(`stroke-opacity="${p.strokeOpacity}"`);
   }
   if (deco.length) attrs.push(`text-decoration="${deco.join(" ")}"`);
-  if (p.letterSpacingPx !== 0)
-    attrs.push(`letter-spacing="${fmt(p.letterSpacingPx)}"`);
+  const letterSpacing = p.letterSpacingPx + (g.extraLetterSpacing ?? 0);
+  if (letterSpacing !== 0) attrs.push(`letter-spacing="${fmt(letterSpacing)}"`);
   if (p.superSub !== 0)
     attrs.push(`baseline-shift="${fmt(baselineShiftPxOf(p))}"`);
   return `<tspan ${attrs.join(" ")}>${escapeXml(g.text)}</tspan>`;

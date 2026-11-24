@@ -19,12 +19,13 @@ import { createCanvas } from '@napi-rs/canvas';
 import * as pdfjs from 'pdfjs-dist/legacy/build/pdf.mjs';
 import { JpegImage } from 'pdfjs-dist/image_decoders/pdf.image_decoders.mjs';
 import { PdfSession } from '../src/core/document.js';
-import { pageSource } from '../src/core/text-edit.js';
+import { pageSource, parseContent } from '../src/core/text-edit.js';
 import {
   REDACTION_PATTERNS,
   addRedactionMarks,
   applyRedactions,
   findRedactionMatches,
+  findAnnotationTextRects,
   findTextRects,
   listRedactionMarks,
   overlayTextUnsupported,
@@ -124,6 +125,22 @@ const GRAY_JPEG =
   'XUEAE7SB7j5R07cV7LYrG0YWQgo3OCfU5xxmqWqJbrHIgXjG3HQD365rwjxWFEcmGODyPbn0Hv05r5615pEdmHBBPCjO' +
   'Tz7/AOfxr//Z';
 
+/** A page drawn at 72 dpi on white, as RGBA. */
+async function renderPage(bytes) {
+  const pdf = await pdfPages(bytes);
+  const page = await pdf.getPage(1);
+  const viewport = page.getViewport({ scale: 1 });
+  const canvas = createCanvas(viewport.width, viewport.height);
+  const context = canvas.getContext('2d');
+  context.fillStyle = '#fff';
+  context.fillRect(0, 0, viewport.width, viewport.height);
+  await page.render({ canvasContext: context, viewport }).promise;
+  return context.getImageData(0, 0, viewport.width, viewport.height).data;
+}
+/** Content operators with their numeric operands. */
+const parseContentForTest = (source) =>
+  parseContent(source).map((c) => ({ op: c.op, args: c.args.map((t) => t.value) }));
+
 async function makePdf(pages, { setup } = {}) {
   const doc = await PDFDocument.create();
   const font = await doc.embedFont(StandardFonts.Helvetica);
@@ -203,6 +220,25 @@ describe('redaction marks', () => {
     expect(removeRedactionMark(saved, 0, id)).toBeUndefined();
     expect(listRedactionMarks(saved)).toHaveLength(1);
     expect(removeRedactionMark(saved, 0, 'nope')).toBe(false);
+  });
+
+  it('names marks written straight into /Annots by their place, as the page does', async () => {
+    const doc = await PDFDocument.load(await makePdf([{ content: '' }]));
+    const mark = (overlay) =>
+      doc.context.obj({
+        Type: 'Annot',
+        Subtype: 'Redact',
+        Rect: [10, 10, 60, 30],
+        OverlayText: PDFString.of(overlay),
+      });
+    doc.getPage(0).node.set(n('Annots'), doc.context.obj([mark('one'), mark('two')]));
+    const marks = listRedactionMarks(doc);
+    expect(marks.map((m) => [m.id, m.overlayText])).toEqual([
+      ['direct:0', 'one'],
+      ['direct:1', 'two'],
+    ]);
+    removeRedactionMark(doc, 0, 'direct:1');
+    expect(listRedactionMarks(doc).map((m) => m.overlayText)).toEqual(['one']);
   });
 
   it('rejects empty areas and resolves to false when nothing is marked', async () => {
@@ -950,7 +986,7 @@ describe('black-and-white scans', () => {
 });
 
 describe('vector graphics, annotations, and fields', () => {
-  it('removes paths entirely inside an area and keeps clips and partly covered paths', async () => {
+  it('removes paths entirely inside an area, keeps clips, and cuts partly covered paths', async () => {
     const content = [
       'q 10 10 380 380 re W n',
       '0 0 1 rg 100 100 20 20 re f',
@@ -960,12 +996,64 @@ describe('vector graphics, annotations, and fields', () => {
     ].join('\n');
     const bytes = await makePdf([{ content }]);
     const { bytes: out, report } = await redact(bytes, [[0, [[95, 95, 180, 125]], { fill: null }]]);
-    expect(report.paths).toBe(2);
+    expect(report.paths).toBe(3);
     const source = pageSource((await PDFDocument.load(out)).getPage(0));
     expect(source).toContain('10 10 380 380 re W n');
-    expect(source).toContain('90 110 m 300 110 l S');
     expect(source).not.toContain('100 100 20 20 re');
     expect(source).not.toContain('160 120 l');
+    // The line across the area keeps only its ends beyond it, half its width clear of it.
+    expect(source).not.toContain('90 110 m 300 110 l S');
+    expect(source).toContain('90 110 m 93 110 l\n182 110 m 300 110 l\nS');
+  });
+
+  // A path only partly under a mark (outlined lettering, a drawn signature, a chart) stayed
+  // whole under the black box, for anyone to read out of the file.
+  it('cuts the covered part out of outlined text and strokes and paints the rest as before', async () => {
+    const glyph = (x) =>
+      `${x} 200 m ${x + 30} 260 ${x + 60} 260 ${x + 80} 200 c ${x + 60} 200 l ${x + 50} 230 ${x + 30} 230 ${x + 20} 200 c h`;
+    const content = [
+      // Outlined lettering, one path for three letters, the middle one under the mark.
+      `0 0 0 rg ${glyph(40)} ${glyph(140)} ${glyph(240)} f`,
+      // A signature stroke of curves, dashed, through the mark and out of it.
+      '0 0 1 RG 3 w [6 3] 0 d 60 120 m 120 180 200 60 340 140 c S',
+      // Even-odd rings, filled and stroked, half under the mark.
+      '1 0 0 rg 0 0.5 0 RG 2 w 200 300 m 300 300 l 300 360 l 200 360 l h 220 315 m 280 315 l 280 345 l 220 345 l h B*',
+    ].join('\n');
+    const bytes = await makePdf([{ content }]);
+    const area = [135, 90, 230, 340];
+    const before = await renderPage(bytes);
+    const { bytes: out, report } = await redact(bytes, [[0, [area], { fill: null }]]);
+    expect(report.paths).toBe(3);
+    const after = await renderPage(out);
+    // Outside the area, a little beyond antialiasing, the page looks as it did: flattened curves
+    // stay within a twentieth of a point, so only the shading of an edge pixel changes.
+    let largest = 0;
+    for (let y = 0; y < 400; y++)
+      for (let x = 0; x < 400; x++) {
+        const py = 400 - y;
+        if (x > area[0] - 2 && x < area[2] + 2 && py > area[1] - 2 && py < area[3] + 2) continue;
+        const i = (y * 400 + x) * 4;
+        for (let c = 0; c < 3; c++)
+          largest = Math.max(largest, Math.abs(before[i + c] - after[i + c]));
+      }
+    expect(largest).toBeLessThan(96);
+    // Inside the area nothing is painted any more.
+    for (let y = 400 - area[3] + 4; y < 400 - area[1] - 4; y++)
+      for (let x = area[0] + 4; x < area[2] - 4; x++) {
+        const i = (y * 400 + x) * 4;
+        expect([after[i], after[i + 1], after[i + 2]]).toEqual([255, 255, 255]);
+      }
+    // And no point of the remaining paths lies inside it.
+    const doc = await PDFDocument.load(out);
+    const commands = parseContentForTest(pageSource(doc.getPage(0)));
+    for (const { op, args } of commands)
+      if (['m', 'l', 'c'].includes(op))
+        for (let i = 0; i + 1 < args.length; i += 2) {
+          const [x, y] = [args[i], args[i + 1]];
+          expect(
+            x > area[0] + 0.01 && x < area[2] - 0.01 && y > area[1] + 0.01 && y < area[3] - 0.01,
+          ).toBe(false);
+        }
   });
 
   it('removes links, comments, and form fields under the area, with their structure', async () => {
@@ -1218,6 +1306,116 @@ describe('find text & redact', () => {
     expect(await found('ssn')).toEqual(['078\u221205\u22121120']);
     expect(await found('creditCard')).toEqual(['4111\u20111111\u20111111\u20111111']);
     expect(await found('date')).toEqual(['2024\u201103\u201105', '05\u201303\u20132024']);
+  });
+
+  it('finds words broken at a line end, and Thai and Chinese phrases that wrap', async () => {
+    // Find matches these as a reader types them; Find text and redact left them unmarked.
+    const toUnicode = (map) =>
+      [
+        '/CIDInit /ProcSet findresource begin 12 dict begin begincmap',
+        '/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def',
+        '/CMapName /Test def 1 begincodespacerange <00> <FF> endcodespacerange',
+        `${map.length} beginbfchar`,
+        ...map.map(([code, unicode]) => `<${code}> <${unicode}>`),
+        'endbfchar endcmap CMapName currentdict /CMap defineresource pop end end',
+      ].join('\n');
+    const bytes = await makePdf([
+      {
+        content: [
+          'BT /F 12 Tf 30 350 Td (Call the John-) Tj 0 -14 Td (son office now) Tj ET',
+          'BT /F 12 Tf 30 300 Td (a forward-) Tj 0 -14 Td (thinking plan) Tj ET',
+          'BT /T 12 Tf 30 250 Td (AB) Tj 0 -14 Td (CD) Tj ET',
+          'BT /T 12 Tf 30 200 Td (EF) Tj 0 -14 Td (GH) Tj ET',
+        ].join('\n'),
+        resources: (doc) => ({
+          Font: {
+            F: doc.context.obj({ Type: 'Font', Subtype: 'Type1', BaseFont: 'Helvetica' }),
+            T: doc.context.obj({
+              Type: 'Font',
+              Subtype: 'Type1',
+              BaseFont: 'Helvetica',
+              ToUnicode: doc.context.register(
+                doc.context.stream(
+                  toUnicode([
+                    ['41', '0E01'],
+                    ['42', '0E02'],
+                    ['43', '0E04'],
+                    ['44', '0E07'],
+                    ['45', '4E2D'],
+                    ['46', '6587'],
+                    ['47', '5B57'],
+                    ['48', '7B26'],
+                  ]),
+                ),
+              ),
+            }),
+          },
+        }),
+      },
+    ]);
+    const doc = await PDFDocument.load(bytes);
+    const cache = new Map();
+    const found = async (query) => {
+      const matches = await findTextRects(doc, 0, query, { cache });
+      return matches.map((match) => match.rects.length);
+    };
+    // One rect on each line: the hyphen goes with the first half.
+    expect(await found('Johnson')).toEqual([2]);
+    expect(await found('forward-thinking')).toEqual([2]);
+    expect(await found('\u0e01\u0e02\u0e04\u0e07')).toEqual([2]);
+    expect(await found('\u0e01\u0e02 \u0e04\u0e07')).toEqual([2]);
+    expect(await found('\u4e2d\u6587\u5b57\u7b26')).toEqual([2]);
+    // A word broken at a line end is still found in part, and as written.
+    expect(await found('John')).toEqual([1]);
+    expect(await found('John- son')).toEqual([2]);
+    const [johnson] = await findTextRects(doc, 0, 'Johnson', { cache });
+    const [john] = await findTextRects(doc, 0, 'John-', { cache });
+    expect(johnson.rects[0][2]).toBeCloseTo(john.rects[0][2], 1);
+  });
+
+  it('finds whole phone numbers in international and trunk-prefixed formats', async () => {
+    // French numbers are five pairs, often after +33 and a one-digit area code; US numbers are
+    // often written with the leading 1; UK numbers put the trunk 0 in brackets. These were
+    // missed or found without their first digits, which then stayed readable beside the mark.
+    const phones = [
+      '+33 1 23 45 67 89',
+      '01 23 45 67 89',
+      '1-800-555-0199',
+      '+44 (0) 20 7946 0958',
+    ];
+    const bytes = await makePdf([
+      {
+        content: phones
+          .map(
+            (phone, i) =>
+              `BT /F 10 Tf 30 ${300 - i * 30} Td (Call ${phone.replace(/[()]/g, '\\$&')} now) Tj ET`,
+          )
+          .join('\n'),
+      },
+    ]);
+    const found = (
+      await findTextRects(await PDFDocument.load(bytes), 0, REDACTION_PATTERNS.phone)
+    ).map((m) => m.text);
+    expect(found).toEqual(phones);
+    // Numbers without separators, and runs too short or too long, are still not phone numbers.
+    const { regex, validate } = REDACTION_PATTERNS.phone;
+    const other = 'Order 5551234567, code 12 34 56 78, id 1234 5678 9012 3456 7890';
+    expect([...other.matchAll(regex)].map((m) => m[0]).filter(validate)).toEqual([]);
+  });
+
+  it('finds dates written year first with slashes or dots, and day-month-year with dashes', async () => {
+    // 2024/01/05 and 2024.01.05 are how much of East Asia and Europe write dates, and
+    // 05-Jan-2024 is common in forms and spreadsheets; none of them was found.
+    const { regex, validate } = REDACTION_PATTERNS.date;
+    const dates = (text) => [...text.matchAll(regex)].map((m) => m[0]).filter(validate);
+    expect(dates('Born 2024/01/05, seen 2024.12.31, due 05-Jan-2024 or 5-jan-24.')).toEqual([
+      '2024/01/05',
+      '2024.12.31',
+      '05-Jan-2024',
+      '5-jan-24',
+    ]);
+    // Version numbers, addresses, and impossible dates are not dates.
+    expect(dates('v1.2.3 and 10.0.0.1 and 2024/13/40 and 2024.1.2.3')).toEqual([]);
   });
 
   it('places exact rects on the matched glyphs from the page content itself', async () => {
@@ -1490,4 +1688,37 @@ it('finds slanted words without taking the letters of the words beside them', as
     ') here',
     's B',
   ]);
+});
+
+// A filled form or a comment holds what was typed in it outside the page's own text: Find text
+// and redact said "No matches found" for a social security number typed into a field.
+it('finds patterns typed into form fields and comments, and redacts the field or comment', async () => {
+  const doc = await PDFDocument.create();
+  const font = await doc.embedFont(StandardFonts.Helvetica);
+  const page = doc.addPage([400, 400]);
+  page.drawText('Applicant', { x: 40, y: 300, size: 12, font });
+  const field = doc.getForm().createTextField('ssn');
+  field.setText('123-45-6789');
+  field.addToPage(page, { x: 40, y: 200, width: 200, height: 24 });
+  const note = doc.context.register(
+    doc.context.obj({
+      Type: 'Annot',
+      Subtype: 'Text',
+      Rect: [300, 300, 320, 320],
+      Contents: PDFString.of('Her number is 234-56-7891'),
+    }),
+  );
+  page.node.lookup(n('Annots')).push(note);
+  const bytes = await doc.save();
+  const loaded = await PDFDocument.load(bytes);
+  const matches = findAnnotationTextRects(loaded, 0, REDACTION_PATTERNS.ssn);
+  expect(matches.map((m) => m.text)).toEqual(['123-45-6789', '234-56-7891']);
+  expect(matches[0].rects).toEqual([[39.5, 199.5, 240.5, 224.5]]);
+  expect(findAnnotationTextRects(loaded, 0, 'number IS')).toHaveLength(1);
+  expect(findAnnotationTextRects(loaded, 0, 'Applicant')).toEqual([]);
+  const { bytes: out } = await redact(bytes, [[0, matches.flatMap((m) => m.rects)]]);
+  const corpus = await recoverable(out);
+  expectGone(corpus, '123-45-6789');
+  expectGone(corpus, '234-56-7891');
+  expect((await PDFDocument.load(out)).getForm().getFields()).toHaveLength(0);
 });

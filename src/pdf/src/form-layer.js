@@ -1,13 +1,26 @@
 import { el } from './lib/ui.js';
 import { FormDraft, formWidgets, formWidgetLayout, tabOrderedWidgets } from './core/form-draft.js';
+import { formattedText, specialFormatOf } from './core/form-format.js';
 
+/** Buttons and signature fields hold no value to fill in. */
+const hasValue = (widget) => widget.type !== 'button' && widget.type !== 'signature';
+/**
+ * The keyboard a phone shows for a field: digits for a ZIP Code or Social Security number, the
+ * phone pad for a phone number (formats that take digits alone); the usual one otherwise.
+ */
+const inputMode = (widget) =>
+  ({ 0: 'numeric', 1: 'numeric', 2: 'tel', 3: 'numeric' })[
+    widget.format && specialFormatOf(widget.format)?.style
+  ] ?? null;
 const rgb = (value, fallback) => (value?.length === 3 ? `rgb(${[...value].join(' ')})` : fallback);
 
 /**
  * The page's fields as native controls. `onTabOut(direction)` is asked when Tab or Shift Tab
  * would leave the page's last or first field; it returns true when it takes the focus on.
+ * `onAction(action)` runs the form's own Print and Reset buttons (pushButtonAction), and
+ * signs or shows a signature field ({ kind: 'signature', name }).
  */
-export function createFormLayer({ onChange, onCommit, onTabOut }) {
+export function createFormLayer({ onChange, onCommit, onTabOut, onAction }) {
   const draft = new FormDraft();
   const root = el('div', { class: 'form-layer', role: 'group', 'aria-label': 'Page form fields' });
   const error = el('p', {
@@ -18,7 +31,18 @@ export function createFormLayer({ onChange, onCommit, onTabOut }) {
   });
   // Comb controls realign their boxes when their value changes.
   const combs = new WeakMap();
+  // A formatted field's value as its format shows it, while another field has the focus; or a
+  // calculated field's value as the fields filled in so far work it out.
+  const shownValues = new WeakMap();
+  let calculatedValues = new Map();
+  // Boxes typed in, which stay usable while the page is busy.
+  const typable = (control) =>
+    control.tagName === 'TEXTAREA' ||
+    (control.tagName === 'INPUT' && ['text', 'password'].includes(control.type));
+  let busyNow = false;
+  const lateEdits = new Map();
   let widgets = [],
+    radioGroups = new Set(),
     controls = new Map(),
     key,
     pendingFocus = null,
@@ -40,11 +64,19 @@ export function createFormLayer({ onChange, onCommit, onTabOut }) {
   function setEnabled(enabled) {
     root.hidden = !enabled;
   }
-  function setBusy(busy) {
+  /**
+   * While the page is busy (a value being saved, the page redrawn), boxes to type in stay as
+   * they are: what is typed then, and a Tab, still go to the fields, where a disabled box
+   * dropped them and the keys went on to the page's shortcuts. Typing goes on as a draft
+   * across the redraw (`lateEdits`). `locked` (no permission to fill) disables every field.
+   */
+  function setBusy(busy, { locked = false } = {}) {
     if (busy) rememberFocus();
+    busyNow = busy;
+    if (!busy) lateEdits.clear();
     for (const widget of widgets) {
       const control = controls.get(widget.id);
-      if (control) control.disabled = busy || widget.readOnly;
+      if (control) control.disabled = locked || widget.readOnly || (busy && !typable(control));
     }
     if (!busy && pendingFocus && !root.hidden) {
       const control = controls.get(pendingFocus.id);
@@ -69,7 +101,7 @@ export function createFormLayer({ onChange, onCommit, onTabOut }) {
   function sync(editingControl) {
     for (const widget of widgets) {
       const control = controls.get(widget.id);
-      if (!control) continue;
+      if (!control || !hasValue(widget)) continue;
       const value = draft.value(widget.name);
       if (widget.type === 'checkbox') control.checked = value.includes(widget.exportValue);
       else if (widget.type === 'radio') control.checked = value.includes(widget.buttonValue);
@@ -92,6 +124,24 @@ export function createFormLayer({ onChange, onCommit, onTabOut }) {
           combs.get(control)?.();
         }
       }
+      const shown = shownValues.get(control);
+      if (shown) {
+        const text = formattedText(value, widget.format ?? '');
+        shown.textContent = text === value ? '' : text;
+        shown.parentElement.classList.toggle('is-formatted', text !== value);
+        // A total the fields filled in so far change, until the form is saved and works it out.
+        const calculated =
+          calculatedValues.has(widget.name) && !draft.changes.has(widget.name)
+            ? calculatedValues.get(widget.name)
+            : null;
+        if (calculated !== null) {
+          shown.textContent = formattedText(calculated, widget.format ?? '');
+          // The field holds that total too, as it will once saved: a screen reader read the
+          // old one (often nothing) under the total on screen.
+          if (control !== editingControl) control.value = calculated;
+        }
+        shown.parentElement.classList.toggle('is-calculated', calculated !== null);
+      }
       control.closest('.form-widget').classList.toggle('has-draft', draft.changes.has(widget.name));
       control.setAttribute('aria-invalid', String(!error.hidden && isInvalid(widget)));
     }
@@ -100,6 +150,7 @@ export function createFormLayer({ onChange, onCommit, onTabOut }) {
     invalidField ? widget.name === invalidField : draft.changes.has(widget.name);
   function changed(widget, value, editingControl) {
     if (widget.readOnly || !draft.set(widget.name, value)) return;
+    if (busyNow) lateEdits.set(widget.name, value);
     clearError();
     sync(editingControl);
     onChange();
@@ -135,8 +186,27 @@ export function createFormLayer({ onChange, onCommit, onTabOut }) {
       disabled: widget.readOnly,
     };
     let control;
-    if (widget.type === 'checkbox' || widget.type === 'radio') {
-      control = el('input', { ...attrs, type: widget.type, name: `page-widget-${widget.id}` });
+    if (!hasValue(widget)) {
+      // The PDF draws the button or signature; this one takes its clicks and keys.
+      control = el('button', {
+        ...attrs,
+        type: 'button',
+        'aria-required': null,
+        ...(widget.type === 'signature' && {
+          'aria-label': `${label}: signature field (on page)`,
+          title: `${label}: signature field`,
+        }),
+      });
+      control.addEventListener('click', () => onAction?.(widget.action));
+    } else if (widget.type === 'checkbox' || widget.type === 'radio') {
+      // A radio group's buttons share a name, so Tab stops at the group once and screen
+      // readers count its buttons (2 of 3).
+      const group = radioGroups.has(widget.name) ? `page-group-${widget.name}` : null;
+      control = el('input', {
+        ...attrs,
+        type: widget.type,
+        name: group ?? `page-widget-${widget.id}`,
+      });
       control.addEventListener('change', () =>
         changed(
           widget,
@@ -190,6 +260,8 @@ export function createFormLayer({ onChange, onCommit, onTabOut }) {
         ...attrs,
         type: widget.multiline ? null : widget.password ? 'password' : 'text',
         maxlength: widget.maxLength,
+        placeholder: widget.placeholder,
+        inputmode: widget.type === 'text' ? inputMode(widget) : null,
         autocomplete: 'off',
         spellcheck: String(widget.spellcheck),
       });
@@ -234,8 +306,13 @@ export function createFormLayer({ onChange, onCommit, onTabOut }) {
       } else if (event.key === 'Tab' && !event.altKey && !event.ctrlKey && !event.metaKey) {
         const stops = [...root.querySelectorAll('.form-control')].filter((c) => !c.disabled);
         const direction = event.shiftKey ? -1 : 1;
-        if (control === (event.shiftKey ? stops[0] : stops.at(-1)) && onTabOut?.(direction))
-          event.preventDefault();
+        // The other buttons of a radio group are no stops of their own.
+        const here = stops.indexOf(control);
+        const beyond = (direction > 0 ? stops.slice(here + 1) : stops.slice(0, here)).filter(
+          (other) =>
+            !(control.type === 'radio' && other.type === 'radio' && other.name === control.name),
+        );
+        if (here >= 0 && !beyond.length && onTabOut?.(direction)) event.preventDefault();
       }
     });
     return control;
@@ -250,8 +327,12 @@ export function createFormLayer({ onChange, onCommit, onTabOut }) {
     radioChoices,
     listSelections,
     tabs,
+    structureOrder,
   ) {
     rememberFocus();
+    // Values typed while the page was saved or redrawn are drafts on the page drawn anew.
+    const carried = key !== pageKey ? new Map(lateEdits) : new Map();
+    lateEdits.clear();
     if (key !== pageKey) {
       draft.reset();
       key = pageKey;
@@ -262,8 +343,28 @@ export function createFormLayer({ onChange, onCommit, onTabOut }) {
       formWidgets(annotations, layers, buttonSelections, tooltips, radioChoices, listSelections),
       viewport.transform,
       tabs,
+      structureOrder,
     );
-    draft.register(widgets);
+    draft.register(widgets.filter(hasValue));
+    for (const [name, value] of carried) if (busyNow) lateEdits.set(name, value);
+    for (const [name, value] of carried) draft.set(name, value);
+    // Buttons sharing a name are on one at a time; groups whose buttons can be on together
+    // (in unison, or two buttons for one choice) keep a name per button.
+    const choices = new Map();
+    for (const widget of widgets.filter((w) => w.type === 'radio')) {
+      if (!choices.has(widget.name)) choices.set(widget.name, []);
+      choices.get(widget.name).push(widget);
+    }
+    radioGroups = new Set(
+      [...choices]
+        .filter(
+          ([, group]) =>
+            !group.some((w) => w.unison) &&
+            new Set(group.map((w) => w.buttonValue)).size === group.length,
+        )
+        .map(([name]) => name),
+    );
+    calculatedValues = new Map();
     controls = new Map();
     const fragment = document.createDocumentFragment();
     for (const widget of widgets) {
@@ -311,6 +412,18 @@ export function createFormLayer({ onChange, onCommit, onTabOut }) {
         control.addEventListener('input', align);
         combs.set(control, align);
       }
+      if (
+        (widget.format || widget.calculated) &&
+        !widget.comb &&
+        !widget.multiline &&
+        !widget.password
+      ) {
+        const shown = el('span', { class: 'form-shown', 'aria-hidden': 'true' });
+        shown.style.justifyContent =
+          { center: 'center', right: 'flex-end' }[widget.alignment] ?? '';
+        container.append(shown);
+        shownValues.set(control, shown);
+      }
       if (widget.type === 'choice' && widget.editableChoice) {
         const id = `form-options-${widget.id}`;
         control.setAttribute('list', id);
@@ -356,6 +469,15 @@ export function createFormLayer({ onChange, onCommit, onTabOut }) {
     undo,
     redo,
     owns: (element) => root.contains(element),
+    /** Whether the page has fields worked out from others, for showCalculated. */
+    get calculates() {
+      return widgets.some((widget) => widget.calculated);
+    },
+    /** Show calculated fields' values as the drafts work them out (field name to value). */
+    showCalculated(values) {
+      calculatedValues = values;
+      sync();
+    },
     /** Focus the page's first field (`last`: its last one); false when it has none to fill. */
     focusEdge(last = false) {
       const stops = [...root.querySelectorAll('.form-control')].filter((c) => !c.disabled);

@@ -99,6 +99,11 @@ export function createChartTools(h) {
   }
   const updateSelected = (fn, coalesce) =>
     update(selectedChart(), fn, coalesce);
+  // The chart's object on the canvas, while its slide is shown.
+  const objectHit = (part, id) =>
+    P.getSlidePartName(h.slide()) === part
+      ? document.querySelector(`.object-hit[data-shape-id="${id}"]`)
+      : null;
 
   /* ---------- Insert ---------- */
   async function insert() {
@@ -165,6 +170,7 @@ export function createChartTools(h) {
         const s = spec?.series[i];
         return s?.color || ctx().accents[i % 6];
       },
+      returnFocus: () => objectHit(part, id),
     });
     if (!opened) return;
     opened.key = `${part}#${id}`;
@@ -186,7 +192,8 @@ export function createChartTools(h) {
       accents: themeContext(theme).accents,
       aspect: aspectOf(obj),
     });
-    if (choice) update(obj, () => choice.spec);
+    if (!choice) return;
+    await update(obj, () => choice.spec);
   }
   function aspectOf(obj) {
     try {
@@ -338,6 +345,9 @@ export function createChartTools(h) {
     const readCategories = () => {
       if (xy) return;
       const lines = cats.value.split("\n");
+      // A line break after the last label adds no category.
+      const n = Math.max(0, ...spec.series.map((s) => s.values.length));
+      while (lines.length > n && !lines.at(-1).trim()) lines.pop();
       spec = cleanSpec({ ...spec, categories: lines });
     };
     const body = el(

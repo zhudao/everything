@@ -27,6 +27,25 @@ export const ANNOTATION_KINDS = new Set([
 const movable = (entry) =>
   !entry.locked && !entry.readOnly && annotationAccepts(entry.subtype, 'rect');
 
+/**
+ * Whether a comment's shape can be changed (resized, or its points moved): not one drawn with
+ * members of its group, such as a measurement with its label, whose value would no longer
+ * match; it moves as a whole instead.
+ */
+export const reshapable = (entry) => movable(entry) && entry.editable && !entry.group?.length;
+/**
+ * Whether a comment can be resized by its corners, and by which box: a callout's text box
+ * (its point stays where it points), or the whole comment. Lines and stamps keep their size.
+ */
+const RESIZABLE = new Set(['Square', 'Circle', 'FreeText', 'Ink', 'Polygon']);
+export const resizeBox = (entry) =>
+  reshapable(entry) && RESIZABLE.has(entry.subtype)
+    ? entry.subtype === 'FreeText' && entry.points?.length >= 2
+      ? entry.box && { key: 'box', box: entry.box }
+      : { key: 'rect', box: entry.rect }
+    : null;
+/** The smallest a comment is resized to, in screen pixels. */
+const MIN_SIZE = 8;
 const SVG = 'http://www.w3.org/2000/svg';
 /** Where a box of `size` may start within low..high, or at least no further out than `origin`. */
 const span = (start, size, origin, low, high) =>
@@ -34,12 +53,13 @@ const span = (start, size, origin, low, high) =>
 /** How long arrow keys rest before their nudges are saved as one move, in milliseconds. */
 const NUDGE_REST = 180;
 
-export function createAnnotationLayer({ onSelect, onMove, onDelete }) {
+export function createAnnotationLayer({ onSelect, onMove, onResize, onDelete }) {
   const root = el('div', { class: 'annotation-targets' });
   let viewport = null,
     entries = [],
     selected = null,
-    drag = null;
+    drag = null,
+    resize = null;
   // Arrow-key nudges not yet saved, as a PDF offset: shown at once, saved as one move once the
   // keys rest. `moving` is a saved move still being applied; nudges meanwhile wait for it.
   let nudge = null,
@@ -204,6 +224,197 @@ export function createAnnotationLayer({ onSelect, onMove, onDelete }) {
     }
     return svg;
   }
+  /**
+   * Corner handles on the chosen comment: dragging one resizes it, the opposite corner staying
+   * where it is. The box shown follows the pointer, and the change is saved on release.
+   */
+  function addHandles(node, entry, box) {
+    addPointHandles(node, entry, box);
+    const target = resizeBox(entry);
+    if (!target) return;
+    const frame = screenBox(target.box);
+    // Corners in screen pixels, local to the comment's target, clockwise from the top left.
+    const corners = [
+      [frame.left, frame.top],
+      [frame.left + frame.width, frame.top],
+      [frame.left + frame.width, frame.top + frame.height],
+      [frame.left, frame.top + frame.height],
+    ];
+    corners.forEach(([x, y], i) => {
+      const handle = el('span', {
+        class: 'annotation-handle',
+        'aria-hidden': 'true',
+        'data-corner': i,
+        onpointerdown: (e) => {
+          if (e.button !== 0) return;
+          e.preventDefault();
+          e.stopPropagation();
+          saveNudge();
+          const [ax, ay] = corners[(i + 2) % 4];
+          resize = { entry, node, handle, id: e.pointerId, key: target.key, anchor: [ax, ay] };
+          resize.from = [x, y];
+          resize.start = [e.clientX, e.clientY];
+          handle.setPointerCapture(e.pointerId);
+          node.focus({ preventScroll: true });
+        },
+        onpointermove: (e) => {
+          if (resize?.handle !== handle || resize.id !== e.pointerId) return;
+          // The dragged corner stays on the page, and the box keeps a size that can be seen.
+          const clamp = (value, low, high) => Math.min(Math.max(value, low), high);
+          const [ax, ay] = resize.anchor;
+          let cx = clamp(resize.from[0] + e.clientX - resize.start[0], 0, viewport.width);
+          let cy = clamp(resize.from[1] + e.clientY - resize.start[1], 0, viewport.height);
+          if (Math.abs(cx - ax) < MIN_SIZE) cx = ax + (cx < ax ? -MIN_SIZE : MIN_SIZE);
+          if (Math.abs(cy - ay) < MIN_SIZE) cy = ay + (cy < ay ? -MIN_SIZE : MIN_SIZE);
+          resize.corner = [cx, cy];
+          node.classList.add('is-resizing');
+          // Shown by moving the frame's edges: the target covers the comment's whole box,
+          // a callout's box only part of it.
+          const left = Math.min(ax, cx),
+            top = Math.min(ay, cy);
+          const shown = {
+            left: box.left + left - frame.left,
+            top: box.top + top - frame.top,
+            width: Math.abs(cx - ax) + box.width - frame.width,
+            height: Math.abs(cy - ay) + box.height - frame.height,
+          };
+          if (resize.key === 'rect') place(node, shown);
+          else {
+            resize.preview ??= node.appendChild(el('span', { class: 'annotation-resize-box' }));
+            place(resize.preview, {
+              left: left - box.left - 1,
+              top: top - box.top - 1,
+              width: Math.abs(cx - ax),
+              height: Math.abs(cy - ay),
+            });
+          }
+        },
+        onpointerup: (e) => {
+          if (resize?.handle !== handle || resize.id !== e.pointerId) return;
+          const done = resize;
+          resize = null;
+          if (!done.corner) return void cancelResize(done);
+          const [x1, y1] = viewport.convertToPdfPoint(...done.anchor);
+          const [x2, y2] = viewport.convertToPdfPoint(...done.corner);
+          const x = Math.min(x1, x2),
+            y = Math.min(y1, y2);
+          onResize(done.entry, done.key, {
+            x,
+            y,
+            width: Math.abs(x2 - x1),
+            height: Math.abs(y2 - y1),
+          });
+        },
+        onpointercancel: () => cancelResize(),
+      });
+      // Placed relative to the target's padding box, inside its 1px border.
+      handle.style.left = `${x - box.left - 1}px`;
+      handle.style.top = `${y - box.top - 1}px`;
+      handle.style.cursor = i % 2 ? 'nesw-resize' : 'nwse-resize';
+      node.append(handle);
+    });
+  }
+  /**
+   * Handles on the points a comment is drawn between: a line's or arrow's two ends, and the
+   * point a callout points at. Dragging one moves that point alone; a dashed line shows where
+   * the line will run.
+   */
+  function addPointHandles(node, entry, box) {
+    if (!reshapable(entry) || !(entry.points?.length >= 2)) return;
+    const callout = entry.subtype === 'FreeText';
+    if (!callout && entry.subtype !== 'Line') return;
+    const ends = callout ? [0] : [0, 1];
+    const local = ({ x, y }) => {
+      const [sx, sy] = viewport.convertToViewportPoint(x, y);
+      return [sx - box.left - 1, sy - box.top - 1];
+    };
+    for (const end of ends) {
+      const [x, y] = local(entry.points[end]);
+      // The line is drawn to the next point: the other end, or the callout's knee.
+      const [ox, oy] = local(entry.points[end === 0 ? 1 : 0]);
+      const handle = el('span', {
+        class: 'annotation-handle is-point',
+        'aria-hidden': 'true',
+        'data-point': end,
+        onpointerdown: (e) => {
+          if (e.button !== 0) return;
+          e.preventDefault();
+          e.stopPropagation();
+          saveNudge();
+          resize = { entry, node, handle, id: e.pointerId, start: [e.clientX, e.clientY] };
+          handle.setPointerCapture(e.pointerId);
+          node.focus({ preventScroll: true });
+        },
+        onpointermove: (e) => {
+          if (resize?.handle !== handle || resize.id !== e.pointerId) return;
+          // The point stays on the page.
+          const clamp = (value, low, high) => Math.min(Math.max(value, low), high);
+          const px = clamp(
+            x + e.clientX - resize.start[0],
+            -box.left - 1,
+            viewport.width - box.left - 1,
+          );
+          const py = clamp(
+            y + e.clientY - resize.start[1],
+            -box.top - 1,
+            viewport.height - box.top - 1,
+          );
+          resize.point = [px, py];
+          node.classList.add('is-resizing');
+          if (!resize.preview) {
+            resize.preview = document.createElementNS(SVG, 'svg');
+            resize.preview.setAttribute('class', 'annotation-resize-line');
+            resize.preview.append(document.createElementNS(SVG, 'line'));
+            node.append(resize.preview);
+          }
+          const line = resize.preview.firstChild;
+          line.setAttribute('x1', ox);
+          line.setAttribute('y1', oy);
+          line.setAttribute('x2', px);
+          line.setAttribute('y2', py);
+        },
+        onpointerup: (e) => {
+          if (resize?.handle !== handle || resize.id !== e.pointerId) return;
+          const done = resize;
+          resize = null;
+          if (!done.point || Math.hypot(done.point[0] - ox, done.point[1] - oy) < MIN_SIZE) {
+            cancelResize(done);
+            return;
+          }
+          const [px, py] = viewport.convertToPdfPoint(
+            done.point[0] + box.left + 1,
+            done.point[1] + box.top + 1,
+          );
+          const point = { x: px, y: py };
+          if (callout) onResize(entry, 'anchor', point);
+          else
+            onResize(
+              entry,
+              'points',
+              entry.points.map((p, i) => (i === end ? point : { x: p.x, y: p.y })),
+            );
+        },
+        onpointercancel: () => cancelResize(),
+      });
+      handle.style.left = `${x}px`;
+      handle.style.top = `${y}px`;
+      handle.style.cursor = 'crosshair';
+      node.append(handle);
+    }
+  }
+  /** Put a comment being resized back as it was. */
+  function cancelResize(ended = null) {
+    const current = ended ?? resize;
+    if (!current) return false;
+    const { node, handle, id, entry } = current;
+    resize = null;
+    if (handle.hasPointerCapture(id)) handle.releasePointerCapture(id);
+    place(node, screenBox(entry.rect));
+    node.classList.remove('is-resizing');
+    node.querySelector('.annotation-resize-box')?.remove();
+    node.querySelector('.annotation-resize-line')?.remove();
+    return true;
+  }
   const place = (node, box) =>
     Object.assign(node.style, {
       left: `${box.left}px`,
@@ -213,11 +424,17 @@ export function createAnnotationLayer({ onSelect, onMove, onDelete }) {
     });
 
   function select(entry, focus = false) {
+    cancelResize();
     selected = entry?.id ?? null;
+    root.querySelectorAll('.annotation-handle').forEach((handle) => handle.remove());
     root.querySelectorAll('.annotation-target').forEach((node) => {
       const on = node.dataset.id === selected;
       node.classList.toggle('is-selected', on);
       node.setAttribute('aria-pressed', String(on));
+      if (on) {
+        const chosen = entries.find((item) => item.id === selected);
+        if (chosen) addHandles(node, chosen, screenBox(chosen.rect));
+      }
       if (on && focus) node.focus({ preventScroll: true });
     });
     onSelect(entry || null);
@@ -227,9 +444,19 @@ export function createAnnotationLayer({ onSelect, onMove, onDelete }) {
     // A drag cannot go on across a redraw (a zoom, say): its target is replaced, and with it
     // the pointer capture. Left behind, it would move whichever comment the pointer passed.
     drag = null;
-    entries = next;
+    resize = null;
+    const previous = entries;
+    // One whose Rect cannot be read (left out, or the wrong length) has no place on the page.
+    entries = next.filter((entry) => entry.rect);
     viewport = nextViewport;
-    const kept = selected && entries.find((entry) => entry.id === selected);
+    let kept = selected && entries.find((entry) => entry.id === selected);
+    // A comment written into the page's Annots directly becomes an object of its own, with a
+    // new ID, when a reply first points at it; it keeps its place among the page's comments.
+    if (selected?.startsWith('direct:') && !kept && previous.length === entries.length) {
+      const at = previous.findIndex((entry) => entry.id === selected);
+      if (entries[at]?.subtype === previous[at]?.subtype) kept = entries[at];
+      if (kept) selected = kept.id;
+    }
     if (selected && !kept) select(null);
     // An edited comment is redrawn: its settings follow the new version.
     else if (kept) onSelect(kept, { refresh: true });
@@ -297,6 +524,7 @@ export function createAnnotationLayer({ onSelect, onMove, onDelete }) {
             } else if (e.key === 'Escape') {
               e.preventDefault();
               // Escape during a drag puts the comment back where it was and keeps it selected.
+              if (cancelResize()) return;
               if (drag) {
                 drag.node.style.transform = '';
                 if (drag.node.hasPointerCapture(drag.id)) drag.node.releasePointerCapture(drag.id);
@@ -349,7 +577,10 @@ export function createAnnotationLayer({ onSelect, onMove, onDelete }) {
         }
         // Only a comment that can move offers the move pointer.
         if (!movable(entry)) node.style.cursor = 'pointer';
-        if (entry.id === selected) node.classList.add('is-selected');
+        if (entry.id === selected) {
+          node.classList.add('is-selected');
+          addHandles(node, entry, box);
+        }
         return node;
       }),
     );
@@ -375,6 +606,23 @@ export function createAnnotationLayer({ onSelect, onMove, onDelete }) {
     clear() {
       saveNudge();
       if (selected) select(null);
+    },
+    /**
+     * Keep the nudges not yet saved from saving until the press on Undo or Redo is let go:
+     * saved mid-press, they turned Undo off before its click. The click's Undo saves them
+     * first (see `finish`); a press let go elsewhere saves them once the keys have rested.
+     */
+    hold() {
+      if (!nudge || moving) return;
+      clearTimeout(nudgeTimer);
+      window.addEventListener(
+        'pointerup',
+        () => {
+          clearTimeout(nudgeTimer);
+          if (nudge) nudgeTimer = setTimeout(saveNudge, NUDGE_REST);
+        },
+        { once: true, capture: true },
+      );
     },
     /** Save the nudges not yet saved, as a save or another edit must include them. */
     async finish() {

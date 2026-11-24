@@ -1,10 +1,11 @@
 import { paragraphText, paragraphFormat, locate } from './model.js';
 import { physicalAlignment } from './rtl-paragraph.js';
 import { runFormat } from './formatting.js';
-import { listKind } from './numbering.js';
+import { listKind, hasListLevel } from './numbering.js';
 import { HIGHLIGHTS } from './backgrounds.js';
 import { showLink } from './link-appearance.js';
 import { normalizeCrop, FULL_TURN, OBJECT, validateImage, nextDrawingId } from './images.js';
+import { commentAnchors, addCommentMarkers, removeCommentMarkers } from './comments.js';
 
 // Formatted copy and paste. A copy carries HTML for other applications, with
 // the editor's own fragment embedded for an exact paste back here. Pasting
@@ -15,6 +16,7 @@ import { normalizeCrop, FULL_TURN, OBJECT, validateImage, nextDrawingId } from '
 // pictures, notes) keep the plain-text path.
 
 export const FRAGMENT_ATTRIBUTE = 'data-documents-fragment';
+export const TABLE_ATTRIBUTE = 'data-documents-table';
 const RUN_KEYS = ['bold', 'italic', 'underlineStyle', 'strikethrough', 'color', 'highlight', 'fontSize', 'fontAscii', 'verticalAlign', 'capitalization'];
 const MAX_RUNS = 2000;
 
@@ -60,7 +62,7 @@ export function copyFragment(model, { hidden = () => false, objects = null } = {
   let carried = 0;
   // What the selection holds decides (each run is checked below); fields or notes elsewhere do not.
   if (start === end) return null;
-  const paragraphs = []; let at = 0, runCount = 0, cell = null;
+  const paragraphs = []; let at = 0, runCount = 0, cell = null, skipped = false;
   const last = model.paragraphs.at(-1);
   for (const p of model.paragraphs) {
     const length = paragraphText(p).length, from = at, to = at + length;
@@ -72,7 +74,7 @@ export function copyFragment(model, { hidden = () => false, objects = null } = {
     else if ((p.cellId || null) !== cell) return null;
     const runs = []; let offset = from;
     for (const run of p.runs) {
-      if (hidden(run)) { offset += run.text.length; continue; }
+      if (hidden(run)) { if (run.text && offset + run.text.length > start && offset < end) skipped = true; offset += run.text.length; continue; }
       const a = Math.max(start, offset), b = Math.min(end, offset + run.text.length);
       const overlaps = b > a || (!run.text && offset >= start && offset < end);
       // A picture, shape or equation in the text goes with it to a paste in this document (`objects`, below).
@@ -96,10 +98,17 @@ export function copyFragment(model, { hidden = () => false, objects = null } = {
     paragraphs.push({ text: runs.map(r => r.text).join(''), runs, mark,
       // Alignment is relative to the paragraph's direction (rtl-paragraph.js): the two travel together.
       styleId: p.styleId || null, styleName: style?.name || null, alignment: format.alignment, ...(format.bidi ? { bidi: true } : {}),
-      list: p.list ? { kind: listKind(model.numbering, p.list), level: p.list.level } : null });
+      list: p.list ? { kind: listKind(model.numbering, p.list), level: p.list.level, ...(objects?.token ? { numId: p.list.numId } : {}) } : null });
   }
   if (!paragraphs.length) return null;
-  return carried ? { paragraphs, objects: { token: objects.token, story: objects.story ?? null } } : { paragraphs };
+  const fragment = carried ? { paragraphs, objects: { token: objects.token, story: objects.story ?? null } } : { paragraphs };
+  // Which open document the copy is of: its list items go back into their own lists there (applyParagraph).
+  if (objects?.token) fragment.token = objects.token;
+  // The comments on stretches of the copied text, where they are in it: a cut pasted back in this document takes
+  // them along (movedComments). Text the copy leaves out would put them in the wrong place.
+  const anchors = objects?.token && model.comments?.length && !skipped && !cell ? commentAnchors(model.paragraphs).filter(a => a.start < a.end && a.start >= start && a.end <= end).map(a => ({ id: a.id, start: a.start - start, end: a.end - start })) : [];
+  if (anchors.length) fragment.comments = { token: objects.token, story: objects.story ?? null, anchors };
+  return fragment;
 }
 
 /**
@@ -148,20 +157,114 @@ function runHtml(run) {
 
 /** HTML for other applications, carrying the fragment for this editor. */
 export function fragmentHtml(fragment) {
-  let html = '', openList = null;
+  // The lists open around the paragraph, outermost first: a deeper level is a list inside the item before it, as
+  // other applications nest one, so its items keep their level and the outer list counts on after them.
+  let html = '';
+  const open = [];
+  const closeTo = depth => { while (open.length > depth) { const list = open.pop(); html += `${list.item ? '</li>' : ''}</${list.tag}>`; } };
   for (const p of fragment.paragraphs) {
     const kind = p.list?.kind === 'bullet' ? 'ul' : p.list ? 'ol' : null;
-    if (openList !== kind) { if (openList) html += `</${openList}>`; if (kind) html += `<${kind}>`; openList = kind; }
+    const depth = kind ? Math.max(0, Math.min(8, Number.isInteger(p.list.level) ? p.list.level : 0)) + 1 : 0;
+    closeTo(depth);
+    if (kind && open.length === depth && open[depth - 1].tag !== kind) closeTo(depth - 1);
+    // A list opened by a right-to-left item is right-to-left: its numbers stand in its indent at the right. Within
+    // it, a left-to-right item or list says so, or it would take the list's direction.
+    const rtl = p.bidi === true, dir = within => rtl ? ' dir="rtl"' : within ? ' dir="ltr"' : '';
+    while (open.length < depth) {
+      const within = !!open.at(-1)?.itemRtl;
+      open.push({ tag: open.length + 1 === depth ? kind : open.at(-1)?.tag || kind, item: false, rtl });
+      html += `<${open.at(-1).tag}${rtl !== within ? dir(within) : ''}>`;
+    }
+    if (kind && open[depth - 1].item) html += '</li>';
+    if (kind) Object.assign(open[depth - 1], { item: true, itemRtl: rtl });
     const heading = /^Heading([1-6])$/.exec(p.styleId || '')?.[1] || (p.styleId === 'Title' ? '1' : null);
     const tag = kind ? 'li' : heading ? `h${heading}` : 'p';
     // Tabs and runs of spaces are the text's own, which HTML collapses into one space unless told otherwise.
     // A right-to-left paragraph says so, and names the physical side where it is not its own start.
-    const rtl = p.bidi === true, side = physicalAlignment(p.alignment ?? 'left', rtl);
+    const side = physicalAlignment(p.alignment ?? 'left', rtl);
     const align = rtl && side === 'left' ? ';text-align:left' : rtl && side === 'right' ? '' : Object.hasOwn(HTML_ALIGNMENTS, side) ? `;text-align:${HTML_ALIGNMENTS[side]}` : '';
-    html += `<${tag}${rtl ? ' dir="rtl"' : ''} style="white-space:pre-wrap${align}">${p.runs.map(runHtml).join('') || '<br>'}</${tag}>`;
+    // A list item stays open for a deeper list after it.
+    html += `<${tag}${dir(kind && open[depth - 1].rtl)} style="white-space:pre-wrap${align}">${p.runs.map(runHtml).join('') || '<br>'}${kind ? '' : `</${tag}>`}`;
   }
-  if (openList) html += `</${openList}>`;
+  closeTo(0);
   return `<div ${FRAGMENT_ATTRIBUTE}="${escape(JSON.stringify(fragment))}">${html}</div>`;
+}
+
+/* ---------- A table ---------- */
+
+const CSS_BORDERS = { single: 'solid', thick: 'solid', double: 'double', dotted: 'dotted', dashed: 'dashed', dashSmallGap: 'dashed', dotDash: 'dashed', dotDotDash: 'dotted', triple: 'double' };
+function borderCss(border) {
+  if (!border || ['nil', 'none'].includes(border.style)) return 'none';
+  const color = hexColor(border.color) ? `#${border.color}` : '#000000', width = Math.max(0.25, (Number(border.size) || 4) / 8);
+  return `${width}pt ${CSS_BORDERS[border.style] || 'solid'} ${color}`;
+}
+/**
+ * Whole table rows copied here (copyTableRows) as an HTML table other applications paste as a table: column widths,
+ * merged cells (colspan, rowspan), borders, shading and the cells' formatted text. The rows themselves ride along
+ * in TABLE_ATTRIBUTE for a paste in this application, which makes the same table again.
+ */
+export function tableFragmentHtml(fragment) {
+  const { table, paragraphs } = fragment, grid = table.grid || [];
+  const byCell = new Map();
+  for (const p of paragraphs) { if (!byCell.has(p.cellId)) byCell.set(p.cellId, []); byCell.get(p.cellId).push(p); }
+  // The columns each row's cells start at, to count how many rows a vertical merge spans.
+  const starts = table.rows.map(row => { let column = row.gridBefore || 0; return row.cells.map(cell => { const at = column; column += cell.span ?? 1; return at; }); });
+  const rowSpan = (r, column) => { let n = 1; while (table.rows[r + n]?.cells.some((cell, i) => cell.vMerge === 'continue' && starts[r + n][i] === column)) n++; return n; };
+  const twipsPt = twips => Math.max(0, Math.round((Number(twips) || 0) / 2) / 10);
+  const cols = grid.some(w => w > 0) ? `<colgroup>${grid.map(w => `<col style="width:${twipsPt(w)}pt">`).join('')}</colgroup>` : '';
+  const rows = table.rows.map((row, r) => `<tr>${row.cells.map((cell, i) => {
+    if (cell.vMerge === 'continue') return '';
+    const span = cell.span ?? 1, down = cell.vMerge === 'restart' ? rowSpan(r, starts[r][i]) : 1, fill = hexColor(cell.shading) || hexColor(cell.fill?.replace?.(/^#/, ''));
+    const style = ['top', 'right', 'bottom', 'left'].map(side => `border-${side}:${borderCss(cell.borders?.[side])}`);
+    if (fill) style.push(`background-color:#${fill}`);
+    if (['center', 'bottom'].includes(cell.vertical)) style.push(`vertical-align:${cell.vertical === 'center' ? 'middle' : 'bottom'}`);
+    const width = grid.slice(starts[r][i], starts[r][i] + span).reduce((a, b) => a + (Number(b) || 0), 0);
+    if (width) style.push(`width:${twipsPt(width)}pt`);
+    const text = (byCell.get(cell.id) || []).map(p => {
+      const runs = p.runs.map(run => ({ text: run.text, format: Object.fromEntries(RUN_KEYS.map(key => [key, runFormat(run)[key]])) }));
+      const align = Object.hasOwn(HTML_ALIGNMENTS, p.format?.alignment) ? `;text-align:${HTML_ALIGNMENTS[p.format.alignment]}` : '';
+      return `<p style="margin:0;white-space:pre-wrap${align}">${runs.map(runHtml).join('') || '<br>'}</p>`;
+    }).join('');
+    return `<td${span > 1 ? ` colspan="${span}"` : ''}${down > 1 ? ` rowspan="${down}"` : ''} style="${style.join(';')}">${text}</td>`;
+  }).join('')}</tr>`).join('');
+  return `<table ${TABLE_ATTRIBUTE}="${escape(JSON.stringify(fragment))}" style="border-collapse:collapse">${cols}<tbody>${rows}</tbody></table>`;
+}
+/** The rows a copy here carried (tableFragmentHtml), or null for any other HTML. */
+export function htmlTableFragment(html) {
+  if (typeof DOMParser === 'undefined' || !html || !html.includes(TABLE_ATTRIBUTE)) return null;
+  const node = new DOMParser().parseFromString(html, 'text/html').querySelector(`[${TABLE_ATTRIBUTE}]`);
+  try {
+    const fragment = JSON.parse(node?.getAttribute(TABLE_ATTRIBUTE) || 'null');
+    return fragment?.table && Array.isArray(fragment.table.rows) && Array.isArray(fragment.paragraphs) && fragment.paragraphs.every(p => Array.isArray(p.runs) && p.runs.every(r => typeof r.text === 'string')) ? fragment : null;
+  } catch { return null; }
+}
+
+/**
+ * Another application's copy that is one table and nothing else (a spreadsheet's cells, a web page's or another word
+ * processor's table): its rows of cells, each { lines, colspan, rowspan, header, fill }, for a paste that makes it a
+ * table here. Null for anything else, which pastes as formatted paragraphs.
+ */
+export function foreignHtmlTable(html) {
+  if (typeof DOMParser === 'undefined' || !html || !/<table[\s>]/i.test(html) || html.includes(TABLE_ATTRIBUTE) || html.includes(FRAGMENT_ATTRIBUTE)) return null;
+  const body = new DOMParser().parseFromString(html, 'text/html').body;
+  const tables = body.querySelectorAll('table');
+  if (tables.length !== 1) return null;
+  const table = tables[0], outside = body.textContent.replace(table.textContent, '');
+  if (outside.trim() || table.querySelector('img, table table, svg, video')) return null;
+  const rows = [...table.querySelectorAll('tr')].filter(tr => tr.closest('table') === table).map(tr => [...tr.children].filter(td => /^(TD|TH)$/.test(td.tagName)).map(td => {
+    const lines = [];
+    const blocks = td.querySelectorAll('p, div, li, h1, h2, h3, h4, h5, h6');
+    // Whitespace in the markup is one space, as a browser shows it; a <br> or a paragraph of the cell is a new line.
+    for (const part of (blocks.length ? [...blocks].filter(b => !b.querySelector('p, div, li, h1, h2, h3, h4, h5, h6')) : [td])) {
+      const clone = part.cloneNode(true); clone.querySelectorAll('br').forEach(br => br.replaceWith('\u0001'));
+      lines.push(...String(clone.textContent ?? '').replace(/\s+/g, ' ').split('\u0001').map(line => line.trim()));
+    }
+    while (lines.length > 1 && !lines.at(-1)) lines.pop();
+    const color = cssColor(td.style?.backgroundColor || td.getAttribute('bgcolor') || ''), fill = color !== 'FFFFFF' && color;
+    const span = name => Math.max(1, Math.min(63, parseInt(td.getAttribute(name), 10) || 1));
+    return { lines: lines.length ? lines : [''], colspan: span('colspan'), rowspan: span('rowspan'), header: td.tagName === 'TH' || !!td.closest('thead'), ...(fill ? { fill } : {}) };
+  })).filter(cells => cells.length);
+  return rows.length ? rows : null;
 }
 
 /* ---------- A picture ---------- */
@@ -185,8 +288,11 @@ export function copiesPicture(model) {
   return !!image && !image.kind && asset?.bytes instanceof Uint8Array && PICTURE_MIME.test(asset.mime || '');
 }
 
-/** The HTML `copiesPicture` describes, or '' when the selection is not such a picture. */
-export function pictureHtml(model) {
+/**
+ * The HTML `copiesPicture` describes, or '' when the selection is not such a picture. `fragment` (a floating
+ * picture's copyFragment) goes with it for a paste in the same document, which keeps its wrapping and position.
+ */
+export function pictureHtml(model, { fragment = null } = {}) {
   if (!copiesPicture(model)) return '';
   const image = model.selectedImage, asset = model.assets[image.assetId];
   // A paste here keeps the frame, crop, flips and rotation. Other applications get the whole image: a cropped
@@ -195,7 +301,8 @@ export function pictureHtml(model) {
   const data = { alt: image.alt || '', width: image.width, height: image.height, ...(cropped ? { crop: image.crop } : {}),
     ...(image.flipH ? { flipH: true } : {}), ...(image.flipV ? { flipV: true } : {}), ...(image.rotation ? { rotation: image.rotation } : {}) };
   const size = cropped ? '' : ` width="${Math.round(image.width / EMU_PER_PX)}" height="${Math.round(image.height / EMU_PER_PX)}"`;
-  return `<img src="data:${asset.mime};base64,${base64(asset.bytes)}" alt="${escape(data.alt)}"${size} ${PICTURE_ATTRIBUTE}="${escape(JSON.stringify(data))}">`;
+  const whole = fragment?.objects ? ` ${FRAGMENT_ATTRIBUTE}="${escape(JSON.stringify(fragment))}"` : '';
+  return `<img src="data:${asset.mime};base64,${base64(asset.bytes)}" alt="${escape(data.alt)}"${size} ${PICTURE_ATTRIBUTE}="${escape(JSON.stringify(data))}"${whole}>`;
 }
 
 /** The picture a copy from this editor carries in its HTML, as a file with its size and alternative text, or null. */
@@ -416,6 +523,24 @@ export function htmlFragment(html, { copied = true } = {}) {
 
 /* ---------- Paste ---------- */
 
+/**
+ * Control characters other applications put in copied text (a terminal's escape codes, a bell, NUL, C1 controls)
+ * are no text a document holds, and pasted they showed as replacement marks (U+FFFD). They are left out of a
+ * paste. Tab, line feed and carriage return stay, and so do the breaks this editor's own copies carry: a line break
+ * (U+000B), a page break (U+000C) and a column break (U+000E).
+ */
+const PASTED_CONTROL = /[\u0000-\u0008\u000f-\u001f\u007f-\u009f]/, PASTED_CONTROLS = new RegExp(PASTED_CONTROL.source, 'g');
+export const withoutPastedControls = text => String(text ?? '').replace(PASTED_CONTROLS, '');
+/** A fragment for a paste with those control characters left out of its text (objects keep their stand-ins). */
+export function pastedFragment(fragment) {
+  if (!fragment?.paragraphs?.some(p => PASTED_CONTROL.test(p.text))) return fragment;
+  const paragraphs = fragment.paragraphs.map(p => {
+    const runs = p.runs.map(run => run.object ? run : { ...run, text: withoutPastedControls(run.text) }).filter(run => run.text);
+    return { ...p, runs, text: runs.map(run => run.text).join('') };
+  });
+  return { ...fragment, paragraphs };
+}
+
 function attempt(action) { try { action(); } catch { /* A property the destination cannot take keeps its own value. */ } }
 
 function styleFor(model, p) {
@@ -444,7 +569,7 @@ function continueList(model, p, lists) {
   lists.set(p.list.id, model.selectedParagraphs[0].list?.numId);
 }
 
-function applyParagraph(model, p, foreign, lists = new Map()) {
+function applyParagraph(model, p, foreign, lists = new Map(), own = false) {
   const style = styleFor(model, p);
   if (style) attempt(() => model.setParagraphStyle(style));
   else if (!foreign && p.styleId === null) attempt(() => model.setParagraphStyle(''));
@@ -466,6 +591,12 @@ function applyParagraph(model, p, foreign, lists = new Map()) {
       if (model.selectedParagraphs[0]?.list?.level === level) break;
     }
     continueList(model, p, lists);
+    // Copied in this document, an item stays in its own list, as in Word: pasted after a paragraph that ends the
+    // list, or above it, it numbers on with the list rather than starting a new one at 1.
+    const target = model.selectedParagraphs[0], kept = own && p.list.numId != null ? { numId: p.list.numId, level: target?.list?.level ?? p.list.level } : null;
+    if (kept && target?.list && target.list.numId !== kept.numId && hasListLevel(model.numbering, kept) && listKind(model.numbering, kept) === p.list.kind) {
+      target.list = { ...target.list, numId: kept.numId, level: kept.level, direct: true }; target.listChanged = true;
+    }
   } else if (current === 'bullet' || current === 'number') attempt(() => model.toggleList(current));
 }
 
@@ -515,10 +646,28 @@ export function pasteFragment(model, fragment, { token = null, story = null } = 
   model.checkpoint = () => {};
   // Formatting leaves the pasted text as it is: commands need not join or count through it each time.
   try {
-    model.withFixedText(() => applyFragment(model, fragment, start));
+    model.withFixedText(() => applyFragment(model, fragment, start, !fragment.foreign && !!token && fragment.token === token));
+    // Before objects take their places: a stand-in that cannot become its object again goes, and the comments with the rest.
+    if (fragment.comments?.token === token && token && (fragment.comments.story ?? null) === story) movedComments(model, fragment.comments.anchors, start, text.length);
     if (carried) placeObjects(model, fragment, start);
   } finally { delete model.checkpoint; }
   return true;
+}
+/**
+ * A cut takes the text a comment is on away, and the comment stays anchored to the point where the text was; pasted
+ * back in the same document, the text brings the comment with it, as in Word. A comment still on its text (the
+ * text was copied, not cut) stays there, and is not anchored twice.
+ */
+function movedComments(model, anchors, start, length) {
+  if (!Array.isArray(anchors) || !model.comments?.length) return;
+  const current = new Map(commentAnchors(model.paragraphs).map(a => [a.id, a]));
+  for (const anchor of anchors) {
+    const now = current.get(anchor?.id);
+    if (!now || now.start !== now.end || !model.comments.some(c => c.id === anchor.id)) continue;
+    if (!Number.isInteger(anchor.start) || !Number.isInteger(anchor.end) || anchor.start < 0 || anchor.end > length || anchor.start >= anchor.end) continue;
+    removeCommentMarkers(model.paragraphs, [anchor.id]);
+    addCommentMarkers(model.paragraphs, anchor.id, start + anchor.start, start + anchor.end);
+  }
 }
 function withoutObjects(fragment) {
   const paragraphs = fragment.paragraphs.map(p => { const runs = p.runs.filter(run => !run.object); return { ...p, runs, text: runs.map(run => run.text).join('') }; });
@@ -541,13 +690,34 @@ function placeObjects(model, fragment, start) {
         const image = { ...object.image, id: nextDrawingId(model.paragraphs) };
         // Identifiers that are unique in a document (paragraphs in a text box, a drawing's edit marks) are left off the copy.
         if (typeof image.shell === 'string') image.shell = image.shell.replace(/\s(?:w14:paraId|w14:textId|wp14:anchorId|wp14:editId)="[^"]*"/g, '');
-        if (image.anchor) image.anchor = { ...image.anchor, order: ++order };
+        if (image.anchor) image.anchor = { ...pastedPosition(model, at, image.anchor), order: ++order };
         placed = model.replace(OBJECT, { checkpoint: false, insertedImage: validateImage(image) });
       }
     } catch { placed = false; }
     if (!placed) { model.select(at, at + 1); if (model.text[at] === OBJECT_STAND_IN) model.replace('', { checkpoint: false }); }
   }
   model.select(Math.min(after, model.text.length));
+}
+
+/**
+ * Where a pasted floating object goes: where it was, unless that covers a drawing already there exactly (its copy
+ * pasted beside it, as a paste over a selected floating picture is): then a quarter inch down and to the right, and
+ * again past each copy pasted before, as copies of a drawing fan out. An axis aligned to its base (centred, say)
+ * stays aligned. A position from the paragraph or line compares with the drawings anchored in that paragraph.
+ */
+const PASTE_STEP = 228600, PASTE_STEPS = 40;
+function pastedPosition(model, at, anchor) {
+  const keys = ['horizontal', 'vertical', 'x', 'y', 'xAlign', 'yAlign', 'xPercentage', 'yPercentage'];
+  const fixed = axis => !!anchor[`${axis}Align`] || anchor[`${axis}Percentage`] !== undefined;
+  if (fixed('x') && fixed('y')) return anchor;
+  const local = ['paragraph', 'line'].includes(anchor.vertical) || anchor.horizontal === 'character';
+  const paragraphs = local ? [model.paragraphs[locate(model.paragraphs, at).index]] : model.paragraphs;
+  const others = paragraphs.flatMap(p => p.runs.map(r => r.image?.anchor).filter(Boolean));
+  let position = anchor;
+  for (let step = 0; step < PASTE_STEPS && others.some(other => keys.every(key => other[key] === position[key])); step++) {
+    position = { ...position, ...(fixed('x') ? {} : { x: (position.x || 0) + PASTE_STEP }), ...(fixed('y') ? {} : { y: (position.y || 0) + PASTE_STEP }) };
+  }
+  return position;
 }
 
 // Another application's run with only plain values (not bold, black) leaves the destination's formatting.
@@ -574,12 +744,12 @@ export function formattedPasteFits(fragment) {
  */
 const MAX_RUN_STEPS = 1000000;
 
-function applyFragment(model, fragment, start) {
+function applyFragment(model, fragment, start, own = false) {
   const after = start + fragment.paragraphs.reduce((n, p) => n + p.text.length + 1, -1);
   let at = start, steps = 0;
   const lists = new Map();
   for (const p of fragment.paragraphs) {
-    if (p.mark) { model.select(at); applyParagraph(model, p, !!fragment.foreign, lists); }
+    if (p.mark) { model.select(at); applyParagraph(model, p, !!fragment.foreign, lists, own); }
     let offset = at;
     let applied = appliedRuns(fragment, p);
     const cost = applied.length * p.runs.length;

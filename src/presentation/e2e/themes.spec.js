@@ -233,11 +233,16 @@ test("background styles, the Format Background pane and Apply to All", async ({
     expect(P.getSlideXmlString(s)).toContain('showMasterSp="0"');
   }
   expect(P.getSlideBackgroundPictureFill(slides[3]).tile.scaleX).toBe(0.5);
-  // Reset Background puts the slide back on the master's background: the
-  // gradient background style chosen first.
+  // The masters take it too, so a slide added later shows it.
+  for (const m of P.getSlideMasters(p))
+    expect(P.getSlideBackground(P.getTemplateSlide(p, m.partName)).kind).toBe(
+      "image",
+    );
+  // Reset Background puts the slide back on the master's background, which
+  // Apply to All made the texture.
   await pane.getByRole("button", { name: "Reset Background" }).click();
   await expect(
-    pane.getByRole("radio", { name: "Gradient fill" }),
+    pane.getByRole("radio", { name: "Picture or texture fill" }),
   ).toBeChecked();
   ({ p } = await download(page));
   expect(P.getSlideBackground(P.getSlides(p)[0]).kind).toBe("inherit");
@@ -392,4 +397,69 @@ test("the current theme's thumbnail and variants are shown inline, and the tab f
   await expect(
     page.getByRole("menuitem", { name: "Customize Fonts…" }),
   ).toBeVisible();
+});
+
+// An equation is drawn in the slide's text color; it stayed black when a
+// dark theme turned the slide dark.
+test("an equation in the text color follows a theme change, undone in one step", async ({
+  page,
+}) => {
+  await start(page);
+  await expect(page.locator("#slide-canvas .slide-image")).toBeVisible();
+  await tab(page, "insert");
+  await command(page, "equation");
+  const dialog = page.getByRole("dialog", { name: "Equation" });
+  await dialog.getByLabel("Equation (TeX-style)").fill("x^2");
+  await dialog.getByRole("button", { name: "Insert", exact: true }).click();
+  await expect(
+    page.locator('.object-hit[aria-label^="Image: Equation"]'),
+  ).toHaveCount(1);
+  await page.keyboard.press("Escape");
+  const equation = (p) =>
+    P.getShapeObjectData(
+      P.getSlideShapes(P.getSlides(p)[0]).find(
+        (s) => P.getShapeObjectData(s)?.type === "equation",
+      ),
+    );
+  const before = equation((await download(page)).p).color;
+  await tab(page, "design");
+  await (await themeOption(page, "Midnight")).click();
+  await expect(page.locator("#save-status")).toContainText("Saved");
+  let { p } = await download(page);
+  const body = P.resolveDeckBodyTextColor(P.getSlides(p)[0]);
+  expect(body.toLowerCase()).not.toBe(before.toLowerCase());
+  expect(equation(p).color.toLowerCase()).toBe(body.toLowerCase());
+  await page.keyboard.press(`${mod}+z`);
+  await expect
+    .poll(async () => equation((await download(page)).p).color)
+    .toBe(before);
+});
+
+// A picture background replaced by a color stayed in the saved file, on
+// every slide Apply to All had given it.
+test("a picture background replaced on every slide leaves the file", async ({
+  page,
+}) => {
+  await storyDeck(page);
+  await tab(page, "design");
+  await command(page, "format-background");
+  const pane = page.locator("#format-background");
+  await pane.getByRole("radio", { name: "Picture or texture fill" }).check();
+  await pane.getByRole("button", { name: "Linen texture" }).click();
+  await pane.getByRole("button", { name: "Apply to All" }).click();
+  await expect(page.locator("#save-status")).toContainText("Saved");
+  const media = (files) =>
+    Object.keys(files).filter((n) => n.startsWith("ppt/media/"));
+  expect(media((await download(page)).files)).toHaveLength(1);
+  await pane.getByRole("radio", { name: "Solid fill" }).check();
+  await expect(pane.getByRole("radio", { name: "Solid fill" })).toBeChecked();
+  await pane.getByRole("button", { name: "Apply to All" }).click();
+  await expect
+    .poll(async () => media((await download(page)).files))
+    .toEqual([]);
+  // Undo brings the picture back.
+  await page.keyboard.press(`${mod}+z`);
+  await expect
+    .poll(async () => media((await download(page)).files))
+    .toHaveLength(1);
 });

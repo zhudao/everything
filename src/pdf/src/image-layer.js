@@ -10,7 +10,54 @@ import {
   MAX_IMAGE_SIZE,
 } from './core/image-edit.js';
 
+/** Screen pixels left free for a press between an object's corner handles. */
+const MOVE_STRIP = 12;
+/** A stored measure as a property field shows it: to two decimals, or to two significant
+ * digits for a width under 1 pt, so a thin line never reads as zero. */
+const fieldNumber = (n) => Number(Math.abs(n) >= 1 ? n.toFixed(2) : n.toPrecision(2));
+/** An angle as the Angle field shows it: to hundredths of a degree, so a picture another program
+ * turned by 30 degrees (stored as a matrix rounded to a few digits) reads 30, not 30.0007. */
+const shownAngle = (degrees) => Number(degrees.toFixed(2)) % 360;
 const same = (a, b) => a.every((n, i) => Math.abs(n - b[i]) < 1e-7);
+/** The object each target button stands for, replaced when a redraw keeps the button. */
+const targetEntry = new WeakMap();
+/** What each target button was drawn from: an entry can change in place after it is drawn. */
+const targetDrawn = new WeakMap();
+const drawnFrom = (entry) => ({
+  ordinal: entry.ordinal,
+  kind: entry.kind,
+  labelIndex: entry.labelIndex,
+  invisible: entry.invisible,
+  svg: entry.svg,
+  filled: entry.filled,
+  stroked: entry.stroked,
+  fillRule: entry.fillRule,
+  transform: entry.transform?.slice(),
+  ctm: entry.ctm?.slice(),
+  cap: entry.state?.cap,
+  join: entry.state?.join,
+  miter: entry.state?.miter,
+  width: entry.state?.width,
+});
+const sameList = (a, b) =>
+  a === b || (!!a && !!b && a.length === b.length && a.every((n, i) => n === b[i]));
+/** Whether a target drawn as `drawn` reads and hits exactly as one drawn for `entry` would. */
+const drawnAs = (drawn, entry) =>
+  !!drawn &&
+  drawn.ordinal === entry.ordinal &&
+  drawn.kind === entry.kind &&
+  drawn.labelIndex === entry.labelIndex &&
+  drawn.invisible === entry.invisible &&
+  drawn.svg === entry.svg &&
+  drawn.filled === entry.filled &&
+  drawn.stroked === entry.stroked &&
+  drawn.fillRule === entry.fillRule &&
+  sameList(drawn.transform, entry.transform) &&
+  sameList(drawn.ctm, entry.ctm) &&
+  drawn.cap === entry.state?.cap &&
+  drawn.join === entry.state?.join &&
+  drawn.miter === entry.state?.miter &&
+  drawn.width === entry.state?.width;
 const minimumPathTarget = (node) => {
   node.setAttribute('stroke-width', '8');
   node.setAttribute('vector-effect', 'non-scaling-stroke');
@@ -25,6 +72,7 @@ export function createImageLayer({
   onChange,
   preparePreview,
   onProperties = () => {},
+  onSelected = () => {},
 }) {
   const targets = el('div', { class: 'image-targets' });
   const controls = el('div', { class: 'image-controls', hidden: true });
@@ -52,10 +100,22 @@ export function createImageLayer({
     background,
     previewKey;
   const heldArrows = new Set();
+  // Arrow keys pressed while a nudge was being saved, to apply once it is.
+  const queuedArrows = [];
+  // Delete or Backspace pressed while a nudge was being saved, to remove the object once it is;
+  // Escape, to let go of it.
+  let queuedDelete = false,
+    queuedClose = false;
   // The object target a finger last went down on, to tell its tap from a keyboard click.
   let touched = null;
+  // The busy state last given to every object target, as `${blocked}:${settlingFocus}`.
+  let targetState = null;
   let renderKey, pageKey;
   let keepRatio = true;
+  // The corner handles' width in pixels, read once a selection's controls are shown.
+  let handleSize = 0;
+  // The selected object whose handles stand outside it, by page and ordinal.
+  let smallObject = null;
   const dirty = () => !!(selected && draft && !same(selected.transform, draft));
   const pendingInputs = () =>
     [...properties.querySelectorAll('input[type="number"]')].filter(
@@ -65,8 +125,13 @@ export function createImageLayer({
     );
   const current = () => draft || selected.transform;
   const rotation = () => {
-    const m = matrix(viewport.transform, current());
-    return ((Math.atan2(m[1], m[0]) * 180) / Math.PI + 360) % 360;
+    const t = current(),
+      m = matrix(viewport.transform, t);
+    // A mirrored picture is flipped left to right and then turned: its angle is where its left
+    // edge, now on the right, points. Read from its own right edge, an upright mirror image
+    // would show 180. A shape's mirrored coordinates (common in top-down PDFs) show nothing.
+    const flip = kind() === 'image' && t[0] * t[3] - t[1] * t[2] < 0 ? -1 : 1;
+    return ((Math.atan2(flip * m[1], flip * m[0]) * 180) / Math.PI + 360) % 360;
   };
   const kind = (entry = selected) => entry?.kind || 'image';
   const title = () => kind()[0].toUpperCase() + kind().slice(1);
@@ -80,16 +145,30 @@ export function createImageLayer({
   const pdfPoint = (p) => viewport.convertToPdfPoint(...p);
   function setBusy(value) {
     busy = value;
+    // The object targets, one per picture or shape, all take the same state, and the app sets
+    // it far more often than it changes: they are gone through only when it does, or when a
+    // redraw added new ones (render clears targetState). Thousands of them took most of the time.
+    const blocked = busy || !!committing;
+    const state = `${blocked}:${settlingFocus}`;
+    if (state !== targetState) {
+      targetState = state;
+      for (const target of targets.querySelectorAll('button')) {
+        target.disabled = blocked && !settlingFocus;
+        if (blocked && settlingFocus) target.setAttribute('aria-disabled', 'true');
+        else target.removeAttribute('aria-disabled');
+      }
+    }
     for (const control of [
-      ...targets.querySelectorAll('button'),
       ...controls.querySelectorAll('button'),
       ...properties.querySelectorAll('button, input'),
     ]) {
-      const blocked = busy || !!committing;
       // During a native blur/focus sequence, semantic disablement blocks
       // actions without removing the destination from the browser's tab order.
-      control.disabled = blocked && !settlingFocus;
-      if (blocked && settlingFocus) control.setAttribute('aria-disabled', 'true');
+      // The selected object's own frame and handles are never disabled: the focus stays on
+      // them while a nudge is saved, and their actions check for that themselves.
+      const held = settlingFocus || controls.contains(control);
+      control.disabled = blocked && !held;
+      if (blocked && held) control.setAttribute('aria-disabled', 'true');
       else control.removeAttribute('aria-disabled');
     }
   }
@@ -103,6 +182,11 @@ export function createImageLayer({
   }
   function cancel(preserveSelection = false, preservePreview = false, preserveControls = false) {
     heldArrows.clear();
+    // A save redraws the page and so closes the selection; arrows held for after it stay.
+    if (!committing) {
+      queuedArrows.length = 0;
+      queuedDelete = queuedClose = false;
+    }
     if (!preserveSelection) {
       selectionGeneration++;
       choosing = null;
@@ -136,7 +220,8 @@ export function createImageLayer({
       properties.replaceChildren();
       onProperties(null);
     }
-    targets.querySelectorAll('button').forEach((b) => b.setAttribute('aria-pressed', 'false'));
+    for (const b of targets.querySelectorAll('[aria-pressed="true"]'))
+      b.setAttribute('aria-pressed', 'false');
   }
   function selectOrdinal(ordinal, focus = false) {
     const entry = entries.find((entry) => entry.ordinal === ordinal && entry.editable);
@@ -144,11 +229,11 @@ export function createImageLayer({
     selected = entry;
     draft = null;
     buildControls();
-    targets
-      .querySelectorAll('button')
-      .forEach((b) =>
-        b.setAttribute('aria-pressed', String(Number(b.dataset.ordinal) === ordinal)),
-      );
+    // Only the buttons whose state changes are touched: each change restyles its button.
+    for (const b of targets.querySelectorAll('button')) {
+      const pressed = String(Number(b.dataset.ordinal) === ordinal);
+      if (b.getAttribute('aria-pressed') !== pressed) b.setAttribute('aria-pressed', pressed);
+    }
     if (focus) controls.querySelector('.image-move')?.focus({ preventScroll: true });
   }
   async function choose(entry, focus = false) {
@@ -266,7 +351,9 @@ export function createImageLayer({
     // Keep the final transform available to a preview that finishes during the commit.
     // Reload preserves that preview until the replacement page has been painted.
     keepCommitProperties = !remove;
-    let focus, focusedLabel;
+    let focus,
+      focusedLabel,
+      failed = false;
     settlingFocus = true;
     const focusSettled = new Promise((resolve) => {
       // Observe the destination after the native change/blur/focus event has
@@ -294,6 +381,7 @@ export function createImageLayer({
           selectOrdinal(entry.ordinal);
         }
       } catch (error) {
+        failed = true;
         await focusSettled;
         stopPreview();
         selectOrdinal(entry.ordinal);
@@ -309,14 +397,35 @@ export function createImageLayer({
           !remove &&
           (document.activeElement === document.body || ownsFocus(document.activeElement))
         ) {
-          const input = [...properties.querySelectorAll('input, button')].find(
-            (input) => input.getAttribute('aria-label') === focusedLabel,
-          );
+          const input = [
+            ...properties.querySelectorAll('input, button'),
+            ...controls.querySelectorAll('.image-resize'),
+          ].find((input) => input.getAttribute('aria-label') === focusedLabel);
           (input || controls.querySelector('.image-move'))?.focus({ preventScroll: true });
         } else if (document.activeElement === document.body && priorFocus?.isConnected) {
           // A delayed keyboard commit can temporarily disable the toolbar control the
           // user moved to. Restore it only if focus has not moved somewhere else.
           priorFocus.focus({ preventScroll: true });
+        }
+        const queued = queuedArrows.splice(0),
+          removal = queuedDelete,
+          letGo = queuedClose;
+        queuedDelete = queuedClose = false;
+        if (removal && !failed && !remove && selected && enabled && !busy)
+          setTimeout(safe(() => finish(true)));
+        else if (letGo && !remove && selected) {
+          const ordinal = selected.ordinal,
+            frameFocused = controls.contains(document.activeElement);
+          close();
+          if (frameFocused || document.activeElement === document.body)
+            targets.querySelector(`[data-ordinal="${ordinal}"]`)?.focus({ preventScroll: true });
+        } else if (queued.length && !failed && !remove && selected && enabled && !busy) {
+          for (const { key, shift, corner } of queued) nudge(key, shift, corner);
+          clearTimeout(keyboardTimer);
+          keyboardTimer = setTimeout(
+            safe(() => finish()),
+            180,
+          );
         }
         onChange();
       }
@@ -369,10 +478,26 @@ export function createImageLayer({
     pageKey = nextPageKey;
     close(preserveSelection, { preserveControls });
     entries = images;
+    const sameView = !!viewport && sameList(viewport.transform, nextViewport.transform);
     viewport = nextViewport;
-    targets.replaceChildren();
+    // A page of thousands of shapes is redrawn after every nudge, and one target each is a lot
+    // for the browser to restyle and lay out again: a target whose object and view are as they
+    // were stays in place. The focused one is made anew, as all of them were before.
+    const reusable = new Map();
+    for (const target of targets.children)
+      if (sameView && target !== document.activeElement)
+        reusable.set(target.dataset.ordinal, target);
+    const wanted = [];
+    targetState = null;
     for (const entry of entries) {
       if (!entry.editable) continue;
+      const kept = reusable.get(String(entry.ordinal));
+      if (kept && drawnAs(targetDrawn.get(kept), entry)) {
+        reusable.delete(String(entry.ordinal));
+        targetEntry.set(kept, entry);
+        wanted.push(kept);
+        continue;
+      }
       const target = el('button', {
         type: 'button',
         class: kind(entry) === 'image' ? 'image-target' : 'path-target',
@@ -386,9 +511,14 @@ export function createImageLayer({
         onclick: (e) => {
           const tap = touched === target;
           touched = null;
-          if ((!e.detail || tap) && !busy && !committing) safe(choose)(entry, true);
+          if ((!e.detail || tap) && !busy && !committing)
+            safe(async () => {
+              if (await choose(targetEntry.get(target), true)) onSelected();
+            })();
         },
       });
+      targetEntry.set(target, entry);
+      targetDrawn.set(target, drawnFrom(entry));
       const corners = setPolygon(target, entry.transform);
       if (entry.svg) {
         target.style.pointerEvents = 'none';
@@ -450,10 +580,17 @@ export function createImageLayer({
           touched = e.isPrimary ? target : null;
           return;
         }
-        begin(e, entry);
+        begin(e, targetEntry.get(target));
       });
-      targets.append(target);
+      wanted.push(target);
     }
+    const keep = new Set(wanted);
+    for (const target of [...targets.children]) if (!keep.has(target)) target.remove();
+    // The kept targets are already in order; only the new ones go in between them.
+    let next = targets.firstChild;
+    for (const target of wanted)
+      if (target === next) next = next.nextSibling;
+      else targets.insertBefore(target, next);
     targets.hidden = !enabled;
     if (restore != null) selectOrdinal(restore);
     if (preserveSelection) controls.hidden = false;
@@ -477,6 +614,11 @@ export function createImageLayer({
     return corners;
   }
   function buildControls() {
+    handleSize = 0;
+    // A redraw while a nudge is saved rebuilds the frame and handles; the focus stays on them.
+    const focused = controls.contains(document.activeElement)
+      ? document.activeElement.getAttribute('aria-label')
+      : null;
     controls.replaceChildren();
     properties.replaceChildren();
     controls.hidden = !enabled || !selected;
@@ -502,7 +644,7 @@ export function createImageLayer({
         class: 'image-resize busy-enabled',
         'data-corner': i,
         'aria-label': `Resize ${kind()}, corner ${i + 1}`,
-        title: 'Drag to resize',
+        title: 'Drag to resize. Arrow keys move this corner 1 pt; Shift moves 10 pt.',
       });
       handle.addEventListener('pointerdown', (e) => begin(e, selected, i));
       controls.append(handle);
@@ -581,6 +723,13 @@ export function createImageLayer({
     if (selected.kind && selected.kind !== 'image') {
       const panel = properties.querySelector('.image-edit-panel'),
         styles = el('div', { class: 'path-style-controls' });
+      // A stamp's lettering and frame are filled and outlined in one color, which thickens them;
+      // while both still match, a new color or opacity for either is given to both, or the
+      // letters would keep a rim of the old color.
+      const stamp = selected.kind === 'stamp' && selected.filled && selected.stroked,
+        sameColor =
+          stamp && pathColorHex(selected.state.fill) === pathColorHex(selected.state.stroke),
+        sameOpacity = stamp && Math.abs(selected.state.alpha - selected.state.strokeAlpha) < 1e-6;
       for (const [key, painted] of [
         ['fill', selected.filled],
         ['stroke', selected.stroked],
@@ -604,7 +753,12 @@ export function createImageLayer({
             value: pathColorHex(selected.state[key]),
             'aria-label': `${title()} ${key} color`,
           });
-          input.onchange = safe(() => finish(false, { [key]: input.value }));
+          input.onchange = safe(() =>
+            finish(
+              false,
+              sameColor ? { fill: input.value, stroke: input.value } : { [key]: input.value },
+            ),
+          );
           const alpha = selected.state[key === 'fill' ? 'alpha' : 'strokeAlpha'];
           const opacity = el('input', {
             type: 'number',
@@ -617,11 +771,16 @@ export function createImageLayer({
             'aria-label': `${title()} ${key} opacity in percent`,
             title: `${key === 'fill' ? 'Fill' : 'Stroke'} opacity`,
           });
-          opacity.onchange = safe(() =>
-            opacity.value.trim() && opacity.reportValidity()
-              ? finish(false, { [`${key}Opacity`]: Number(opacity.value) / 100 })
-              : undefined,
-          );
+          opacity.onchange = safe(() => {
+            if (!opacity.value.trim() || !opacity.reportValidity()) return;
+            const value = Number(opacity.value) / 100;
+            return finish(
+              false,
+              sameOpacity
+                ? { fillOpacity: value, strokeOpacity: value }
+                : { [`${key}Opacity`]: value },
+            );
+          });
           row.append(input, el('label', {}, opacity, '%'));
         }
         styles.append(row);
@@ -636,7 +795,7 @@ export function createImageLayer({
           min: 0,
           max: 10000,
           step: 'any',
-          value: Number((selected.state.width * scale).toFixed(4)),
+          value: fieldNumber(selected.state.width * scale),
           required: true,
           'aria-label': `${title()} stroke width in points`,
           title:
@@ -675,7 +834,12 @@ export function createImageLayer({
       if (!angle.value.trim() || !angle.reportValidity()) return;
       const value = Number(angle.value),
         previous = rotation();
-      if (value === Number(previous.toFixed(4)) % 360) return;
+      // An angle the object already has, such as 360 for an upright one, turns nothing; the
+      // field shows the angle again rather than keep a value no edit will clear.
+      if (shownAngle(((value % 360) + 360) % 360) === shownAngle(previous)) {
+        angle.value = angle.defaultValue;
+        return;
+      }
       return rotate(value - previous);
     };
     const rotations = el(
@@ -692,6 +856,10 @@ export function createImageLayer({
     onProperties(properties, title());
     layout();
     setBusy(busy);
+    if (focused && document.activeElement === document.body)
+      [...controls.querySelectorAll('button')]
+        .find((control) => control.getAttribute('aria-label') === focused)
+        ?.focus({ preventScroll: true });
   }
   function layout(syncInputs = false) {
     if (!selected || !viewport || !controls.querySelector('.image-move')) return;
@@ -702,6 +870,21 @@ export function createImageLayer({
     outline
       .querySelector('polygon')
       .setAttribute('points', corners.map((p) => p.join(',')).join(' '));
+    // On an object hardly wider than a handle, the handles centered on its corners would cover
+    // all of it, and a press meant to move it would resize it instead; they stand outside its
+    // corners then. A drag keeps the choice it started with, so a handle stays under the pointer,
+    // and an object keeps them outside while it stays selected, so they do not jump once it grows.
+    handleSize ||= controls.querySelector('.image-resize').offsetWidth;
+    const key = `${pageKey}:${selected.ordinal}`;
+    let small =
+      Math.min(
+        Math.hypot(corners[1][0] - corners[0][0], corners[1][1] - corners[0][1]),
+        Math.hypot(corners[2][0] - corners[1][0], corners[2][1] - corners[1][1]),
+      ) <
+      (handleSize || 16) + MOVE_STRIP;
+    if (gesture) small = gesture.small ??= small;
+    if (small) smallObject = key;
+    else small = smallObject === key;
     controls.querySelectorAll('.image-resize').forEach((handle, i) => {
       handle.style.left = `${corners[i][0]}px`;
       handle.style.top = `${corners[i][1]}px`;
@@ -709,6 +892,10 @@ export function createImageLayer({
       const angle = Math.atan2(corners[i][1] - opposite[1], corners[i][0] - opposite[0]);
       const direction = ((Math.round(angle / (Math.PI / 4)) % 4) + 4) % 4;
       handle.style.cursor = ['ew-resize', 'nwse-resize', 'ns-resize', 'nesw-resize'][direction];
+      const outward = (n) => -50 + 50 * Math.max(-1, Math.min(1, n * Math.SQRT2));
+      handle.style.transform = small
+        ? `translate(${outward(Math.cos(angle))}%, ${outward(Math.sin(angle))}%)`
+        : '';
     });
     const panel = properties.querySelector('.image-edit-panel');
     for (const [i, label] of ['width', 'height'].entries()) {
@@ -720,7 +907,7 @@ export function createImageLayer({
     }
     const angle = panel.querySelector(`[aria-label="${title()} rotation in degrees"]`);
     if (angle && (syncInputs || document.activeElement !== angle))
-      angle.value = angle.defaultValue = String(Number(rotation().toFixed(4)) % 360);
+      angle.value = angle.defaultValue = String(shownAngle(rotation()));
     preview.hidden = !dirty() || !bitmap;
     if (bitmap && background) {
       background.style.width = `${viewport.width}px`;
@@ -816,48 +1003,88 @@ export function createImageLayer({
       const a = pdfPoint(g.start),
         b = pdfPoint([g.start[0] + dx, g.start[1] + dy]);
       setDraft([...m.slice(0, 4), m[4] + b[0] - a[0], m[5] + b[1] - a[1]]);
-    } else {
-      const local = [
-          [0, 1],
-          [1, 1],
-          [1, 0],
-          [0, 0],
-        ],
-        anchor = local[(g.corner + 2) % 4];
-      const knob = local[g.corner];
-      // Move the corner by the pointer's displacement, preserving where the handle
-      // was grabbed. Using the absolute pointer position snaps the corner to the
-      // pointer on the first sample, particularly with larger touch hit targets.
-      const start = pdfPoint(g.start),
-        current = pdfPoint(position),
-        original = point(m, ...knob),
-        p = original.map((value, i) => value + current[i] - start[i]);
-      const [x, y] = point(inverse(m), ...p);
-      let sx = (x - anchor[0]) / (knob[0] - anchor[0]),
-        sy = (y - anchor[1]) / (knob[1] - anchor[1]);
-      if (keepRatio) {
-        const a = point(m, ...anchor),
-          k = original;
-        const dx = k[0] - a[0],
-          dy = k[1] - a[1];
-        sx = sy = ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / (dx * dx + dy * dy);
-      }
-      const minX = 1 / (Math.hypot(m[0], m[1]) * viewport.userUnit),
-        minY = 1 / (Math.hypot(m[2], m[3]) * viewport.userUnit);
-      if (keepRatio) sx = sy = Math.max(minX, minY, Math.min(100, sx));
-      else {
-        sx = Math.max(minX, Math.min(100, sx));
-        sy = Math.max(minY, Math.min(100, sy));
-      }
-      setDraft([
-        m[0] * sx,
-        m[1] * sx,
-        m[2] * sy,
-        m[3] * sy,
-        m[4] + m[0] * anchor[0] * (1 - sx) + m[2] * anchor[1] * (1 - sy),
-        m[5] + m[1] * anchor[0] * (1 - sx) + m[3] * anchor[1] * (1 - sy),
-      ]);
+    } else setDraft(resizedFrom(m, g.corner, g.start, position));
+  }
+  /** The transform with `corner` (0 to 3) moved by the screen displacement `from` to `to`, its
+   * opposite corner fixed, kept in proportion when that is chosen. A pointer's drag is followed
+   * along the diagonal; an arrow key (`along`) sizes the object by the side it moves, so the
+   * height of a long, low banner grows by the step as well as its width. */
+  function resizedFrom(m, corner, from, to, along = false) {
+    const local = [
+        [0, 1],
+        [1, 1],
+        [1, 0],
+        [0, 0],
+      ],
+      anchor = local[(corner + 2) % 4];
+    const knob = local[corner];
+    // Move the corner by the pointer's displacement, preserving where the handle
+    // was grabbed. Using the absolute pointer position snaps the corner to the
+    // pointer on the first sample, particularly with larger touch hit targets.
+    const start = pdfPoint(from),
+      current = pdfPoint(to),
+      original = point(m, ...knob),
+      p = original.map((value, i) => value + current[i] - start[i]);
+    const [x, y] = point(inverse(m), ...p);
+    let sx = (x - anchor[0]) / (knob[0] - anchor[0]),
+      sy = (y - anchor[1]) / (knob[1] - anchor[1]);
+    if (keepRatio && along) sx = sy = Math.abs(sx - 1) >= Math.abs(sy - 1) ? sx : sy;
+    else if (keepRatio) {
+      const a = point(m, ...anchor),
+        k = original;
+      const dx = k[0] - a[0],
+        dy = k[1] - a[1];
+      sx = sy = ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / (dx * dx + dy * dy);
     }
+    const minX = 1 / (Math.hypot(m[0], m[1]) * viewport.userUnit),
+      minY = 1 / (Math.hypot(m[2], m[3]) * viewport.userUnit);
+    if (keepRatio) sx = sy = Math.max(minX, minY, Math.min(100, sx));
+    else {
+      sx = Math.max(minX, Math.min(100, sx));
+      sy = Math.max(minY, Math.min(100, sy));
+    }
+    return [
+      m[0] * sx,
+      m[1] * sx,
+      m[2] * sy,
+      m[3] * sy,
+      m[4] + m[0] * anchor[0] * (1 - sx) + m[2] * anchor[1] * (1 - sy),
+      m[5] + m[1] * anchor[0] * (1 - sx) + m[3] * anchor[1] * (1 - sy),
+    ];
+  }
+  // A drag held at an edge of the page view scrolls it, so an object can be taken to a part of
+  // a zoomed page that is out of view. The pointer sends nothing while it holds still, so a frame
+  // loop scrolls until it leaves the edge, the view can scroll no further, or the drag ends. A
+  // drag that starts at an edge (a handle there, say) scrolls only once it has left it and come
+  // back.
+  let edgeScroll = [0, 0],
+    edgeFrame = 0;
+  const pageView = () => targets.closest('.workspace');
+  function followEdge(e) {
+    const view = pageView();
+    if (!view || !draft) return;
+    const box = view.getBoundingClientRect(),
+      edge = 16;
+    const toward = (at, low, high) => (at < low + edge ? -1 : at > high - edge ? 1 : 0);
+    const at = ({ clientX, clientY }) => [
+      toward(clientX, box.left, box.right),
+      toward(clientY, box.top, box.bottom),
+    ];
+    const ready = (gesture.awayFromEdge ||= at(gesture.startEvent).map((direction) => !direction));
+    edgeScroll = at(e).map((direction, axis) => ((ready[axis] ||= !direction) ? direction : 0));
+    if ((edgeScroll[0] || edgeScroll[1]) && !edgeFrame)
+      edgeFrame = requestAnimationFrame(scrollAtEdge);
+  }
+  function scrollAtEdge() {
+    edgeFrame = 0;
+    const view = pageView();
+    if (!gesture || !view || !(edgeScroll[0] || edgeScroll[1])) return;
+    const { scrollLeft, scrollTop } = view;
+    view.scrollLeft += edgeScroll[0] * 10;
+    view.scrollTop += edgeScroll[1] * 10;
+    if (view.scrollLeft === scrollLeft && view.scrollTop === scrollTop) return;
+    updateGesture(pointAt(gesture.event));
+    edgeFrame = requestAnimationFrame(scrollAtEdge);
   }
   controls.addEventListener('pointermove', (e) => {
     if (selecting?.pointerId === e.pointerId) {
@@ -866,6 +1093,7 @@ export function createImageLayer({
     if (gesture?.pointerId === e.pointerId) {
       gesture.event = e;
       updateGesture(pointAt(e));
+      followEdge(e);
     }
   });
   controls.addEventListener(
@@ -906,8 +1134,54 @@ export function createImageLayer({
   properties.addEventListener('input', (e) => {
     if (e.target.matches('input[type="number"]')) onChange();
   });
+  const arrows = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] };
+  const cornerOf = (node) => node.closest?.('.image-resize')?.dataset.corner ?? null;
+  /** One arrow key's move of the object, 1 pt or 10 pt; on a corner handle, of that corner. */
+  function nudge(key, shift, corner) {
+    const vector = arrows[key],
+      step = (shift ? 10 : 1) * viewport.scale,
+      m = current();
+    // On a corner handle the arrows move that corner, resizing the object as a drag of it does.
+    if (corner != null) {
+      setDraft(resizedFrom(m, Number(corner), [0, 0], [vector[0] * step, vector[1] * step], true));
+      return;
+    }
+    // Keyboard moves stop where a drag would, so a held arrow cannot push the object out of
+    // sight off the page.
+    const { dx, dy } = visibleShift(m, vector[0] * step, vector[1] * step, true),
+      a = pdfPoint([0, 0]),
+      b = pdfPoint([dx, dy]);
+    setDraft([...m.slice(0, 4), m[4] + b[0] - a[0], m[5] + b[1] - a[1]]);
+  }
   const onKey = (e) => {
-    if (!selected || busy || committing) return;
+    if (!selected || busy || committing) {
+      // An arrow pressed while the last nudge is saved moves the object once that is done,
+      // rather than scrolling the page. The save redraws the page, which lets go of the
+      // selection for a moment while its frame keeps the focus.
+      if (arrows[e.key] && e.target.tagName !== 'INPUT' && !e.ctrlKey && !e.metaKey && !e.altKey) {
+        e.preventDefault();
+        if (committing && !gesture && !selecting)
+          queuedArrows.push({ key: e.key, shift: e.shiftKey, corner: cornerOf(e.target) });
+      }
+      // So is Delete: it removes the object once the move is saved, rather than going unheard.
+      if (
+        (e.key === 'Delete' || e.key === 'Backspace') &&
+        e.target.tagName !== 'INPUT' &&
+        committing &&
+        keepCommitProperties &&
+        !gesture &&
+        !selecting
+      ) {
+        e.preventDefault();
+        queuedDelete = true;
+      }
+      if (e.key === 'Escape' && committing && keepCommitProperties && !gesture && !selecting) {
+        e.preventDefault();
+        e.stopPropagation();
+        queuedClose = true;
+      }
+      return;
+    }
     if (e.key === 'Escape') {
       e.preventDefault();
       e.stopPropagation();
@@ -926,22 +1200,12 @@ export function createImageLayer({
       safe(() => finish(true))();
       return;
     }
-    const vector = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] }[
-      e.key
-    ];
-    if (!vector || e.ctrlKey || e.metaKey || e.altKey) return;
+    if (!arrows[e.key] || e.ctrlKey || e.metaKey || e.altKey) return;
     e.preventDefault();
     // The pointer owns its preview until release or cancellation. A keyboard
     // nudge would shift that preview and its release timer would end the drag.
     if (gesture || selecting) return;
-    const step = (e.shiftKey ? 10 : 1) * viewport.scale,
-      m = current(),
-      // Keyboard moves stop where a drag would, so a held arrow cannot push the object out
-      // of sight off the page.
-      { dx, dy } = visibleShift(m, vector[0] * step, vector[1] * step, true),
-      a = pdfPoint([0, 0]),
-      b = pdfPoint([dx, dy]);
-    setDraft([...m.slice(0, 4), m[4] + b[0] - a[0], m[5] + b[1] - a[1]]);
+    nudge(e.key, e.shiftKey, cornerOf(e.target));
     heldArrows.add(e.key);
     clearTimeout(keyboardTimer);
   };
@@ -957,9 +1221,17 @@ export function createImageLayer({
       180,
     );
   };
+  // A second finger, wherever it lands, makes a finger's move of the object a pinch of the page:
+  // the move is taken back rather than saved when the fingers lift.
+  const secondFinger = (e) => {
+    const held = gesture || selecting;
+    if (e.pointerType === 'touch' && !e.isPrimary && held && held.pointerId !== e.pointerId)
+      cancel();
+  };
   // Release can arrive after focus leaves a handle; leaving the window ends the hold too.
   window.addEventListener('keyup', endKeyboardMove, true);
   window.addEventListener('blur', endKeyboardMove);
+  window.addEventListener('pointerdown', secondFinger, true);
   controls.addEventListener('keydown', onKey);
   properties.addEventListener('keydown', onKey);
   return {
@@ -992,6 +1264,7 @@ export function createImageLayer({
     destroy() {
       window.removeEventListener('keyup', endKeyboardMove, true);
       window.removeEventListener('blur', endKeyboardMove);
+      window.removeEventListener('pointerdown', secondFinger, true);
       close();
     },
   };

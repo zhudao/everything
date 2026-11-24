@@ -12,24 +12,27 @@ import {
   confirmAction,
   promptText,
   toast,
+  dismissToast,
+  dismissErrorToast,
+  fieldEditingKey,
   download,
   applyTheme,
   themeValue,
   syncThemeColor,
   formatBytes,
+  formatShortcut,
 } from './lib/ui.js';
 import * as P from './lib/puter.js';
 import { waitFor } from './lib/abort.js';
 import { appsButton, closeAppsPanel, refreshAppsButtons, setAppsAccount } from './apps-panel.js';
 import { configureUserMenu, hasUserMenu, refreshUserMenus, userMenuSlot } from './user-menu.js';
-import {
-  PdfSession,
-  safeName,
-  preparePdfForEditing,
-  blankPdf,
-  samplePdf,
-  MAX_FILE_SIZE,
-} from './core/document.js';
+import { safeName, MAX_FILE_SIZE, MAX_IMAGE_SIZE } from './core/file-limits.js';
+
+// pdf-lib's half of the app (about 600 KB) loads with the first PDF, not with the library.
+const loadDocument = () => import('./core/document.js');
+// The editor, the largest chunk, starts loading as a PDF starts opening rather than after it is
+// read and checked, so the two downloads overlap.
+const loadEditor = () => import('./editor.js');
 
 const root = document.querySelector('#app');
 /** The library's URL. Opening the app lands in the editor instead. */
@@ -52,7 +55,9 @@ let user = null,
   openGeneration = 0,
   cloudOpenGeneration = 0,
   openController = null,
-  homeGeneration = 0;
+  homeGeneration = 0,
+  // The library on screen lists again once Puter says who is signed in.
+  refreshLibrary = null;
 const run =
   (fn) =>
   async (...args) => {
@@ -325,36 +330,43 @@ function settings() {
   });
 }
 function shortcuts() {
+  // Written as each platform writes them, as the menus show them: ⌘S on a Mac, Ctrl+S elsewhere.
+  const keys = (...specs) => specs.map(formatShortcut).join(' / ');
+  const apple = formatShortcut('Mod') === '⌘';
   const dialog = modal(
     'Keyboard shortcuts',
     el(
       'div',
       { class: 'shortcut-list' },
       ...[
-        [P.launchedByPuter() ? 'Open from Puter' : 'Open a PDF', 'Ctrl / ⌘ O'],
-        ['Save to Puter', 'Ctrl / ⌘ S'],
-        [
-          P.launchedByPuter() ? 'Save to another Puter folder' : 'Download',
-          'Ctrl / ⌘ Shift S',
-        ],
-        ['Undo', 'Ctrl / ⌘ Z'],
-        ['Redo', 'Ctrl / ⌘ Shift Z or Ctrl Y'],
-        ['Find in PDF', 'Ctrl / ⌘ F'],
-        ['Find next / previous', 'Ctrl / ⌘ G, with Shift; F3'],
-        ['Print', 'Ctrl / ⌘ P'],
-        ['Zoom in / out', 'Ctrl / ⌘ + / −'],
-        ['Fit page', 'Ctrl / ⌘ 0'],
-        ['Actual size', 'Ctrl / ⌘ 1'],
-        ['Fit width', 'Ctrl / ⌘ 2'],
-        ['Previous / next page', 'Alt ← / →'],
+        [P.launchedByPuter() ? 'Open from Puter' : 'Open a PDF', keys('Mod+O')],
+        ['Save to Puter', keys('Mod+S')],
+        [P.launchedByPuter() ? 'Save to another Puter folder' : 'Download', keys('Mod+Shift+S')],
+        ['Undo', keys('Mod+Z')],
+        // Ctrl Y is the Windows and Linux redo; a Mac has ⇧⌘Z alone.
+        ['Redo', apple ? keys('Mod+Shift+Z') : `${keys('Mod+Shift+Z')} or ${keys('Ctrl+Y')}`],
+        ['Select all the text on the page', keys('Mod+A')],
+        ['Bold, italic, underline while editing text', `${keys('Mod+B')}, I, U`],
+        ['Edit the selected text', 'Enter / F2'],
+        ['Delete the selected text, comment or object', 'Delete'],
+        ['Save the text, note or reply being written', keys('Mod+Enter')],
+        ['Cancel the text being edited', 'Esc'],
+        ['Find in PDF', keys('Mod+F')],
+        ['Find next / previous', `${keys('Mod+G')}, with Shift; F3`],
+        ['Print', keys('Mod+P')],
+        ['Zoom in / out', keys('Mod+Plus', 'Mod+Minus')],
+        ['Fit page', keys('Mod+0')],
+        ['Actual size', keys('Mod+1')],
+        ['Fit width', keys('Mod+2')],
+        ['Previous / next page', keys('Alt+←', 'Alt+→')],
         ['First / last page', 'Home / End'],
-        ['Go to page', 'Ctrl / ⌘ Alt G'],
-        ['Rotate the page clockwise', 'Ctrl / ⌘ Shift R'],
-        ['Delete the page', 'Ctrl / ⌘ Shift D'],
-        ['Document properties', 'Ctrl / ⌘ D'],
-        ['Full screen', 'Ctrl / ⌘ L'],
+        ['Go to page', keys('Mod+Alt+G')],
+        ['Rotate the page clockwise', keys('Mod+Shift+R')],
+        ['Delete the page', keys('Mod+Shift+D')],
+        ['Document properties', keys('Mod+D')],
+        ['Full screen', keys('Mod+L')],
         ['Show or hide the side panel', 'F4'],
-        ['Show or hide the tools pane', 'Shift F4'],
+        ['Show or hide the tools pane', keys('Shift+F4')],
         ['Select tool / Hand tool', 'V / H'],
         ['Move the pages while held', 'Space'],
       ].map(([label, key]) => el('div', {}, el('span', {}, label), el('kbd', {}, key))),
@@ -495,8 +507,12 @@ async function canLeave(signal) {
   if (choice !== 'sign-in') return choice === 'leave';
   try {
     await ensureSignedIn();
-  } catch {
-    return false; // The sign-in was dismissed; the PDF stays open.
+  } catch (error) {
+    // The PDF stays open. A dismissed sign-in needs no word; one that could not start (Puter
+    // unreachable, its window blocked) says why, or the button would seem to do nothing.
+    if (!P.isSignInCancelled(error) && isCurrent())
+      toast(error?.message || 'Puter could not sign you in. Please try again.', { error: true });
+    return false;
   }
   if (!isCurrent()) return false;
   await leavingEditor.save();
@@ -533,27 +549,59 @@ async function openFiles(files) {
   if (!pictures.length) throw new Error('Choose a PDF, or PNG and JPEG pictures.');
   const name = pictures[0].name.replace(/\.[^.]+$/, '') || 'Pictures';
   // The new PDF exists nowhere else yet, as a combined one does, so it starts out unsaved.
-  await openDocument(
+  const opened = await openDocument(
     async (signal) => {
       const [{ imagesToPdf, defaultPaper }, { normalizeImageFiles }] = await Promise.all([
         import('./core/image-pages.js'),
         import('./image-codec.js'),
       ]);
       signal.throwIfAborted();
-      const images = await normalizeImageFiles(pictures, { lazy: true, signal });
+      // A picture too large among several is named; the size check below would not say which.
+      const large = pictures.length > 1 && pictures.find((file) => file.size > MAX_IMAGE_SIZE);
+      if (large)
+        throw new Error(
+          `${large.name} is larger than 20 MB. Leave it out, or make it smaller, and try again.`,
+        );
+      const readers = await normalizeImageFiles(pictures, { lazy: true, signal });
       // An obsolete batch must not decode and embed pictures after its file reads finish.
       signal.throwIfAborted();
-      return imagesToPdf(images, { paper: defaultPaper(), signal });
+      // Among several pictures, one that cannot be read is named: "Choose a valid PNG or JPEG
+      // image" alone left the reader to guess which of them it was.
+      let current = 0;
+      const images = readers.map((read, i) => () => {
+        current = i;
+        return read();
+      });
+      try {
+        return await imagesToPdf(images, { paper: defaultPaper(), signal });
+      } catch (error) {
+        if (error?.code !== 'invalid-image' || pictures.length < 2) throw error;
+        throw new Error(
+          `${pictures[current].name} is not a PNG or JPEG picture that can be read. Leave it out and try again.`,
+        );
+      }
     },
     `${name}.pdf`,
     null,
     { unsaved: true },
   );
+  // Files that are neither (a GIF, a document) were left out; the reader learns which.
+  const skipped = files.filter((file) => !isPictureFile(file));
+  if (opened && skipped.length)
+    toast(
+      `${skipped.length === 1 ? `${skipped[0].name} was` : `${skipped.length} files were`} left out. Only PNG and JPEG pictures become pages.`,
+    );
 }
 /** A new PDF is a sheet of the paper the region prints on, as pictures turned into pages are. */
 async function newBlankPdf() {
-  const { PAPER_SIZES, defaultPaper } = await import('./core/image-pages.js');
+  const [{ PAPER_SIZES, defaultPaper }, { blankPdf }] = await Promise.all([
+    import('./core/image-pages.js'),
+    loadDocument(),
+  ]);
   return blankPdf(PAPER_SIZES[defaultPaper()]);
+}
+async function samplePdf() {
+  return (await loadDocument()).samplePdf();
 }
 async function openDevice(file) {
   if (file.size > MAX_FILE_SIZE) throw new Error('Choose a PDF smaller than 100 MB.');
@@ -655,9 +703,31 @@ async function openDocument(
     }
   };
   sourceSignal?.addEventListener('abort', abortSource, { once: true });
+  // A read that takes a while (a large file, a cloud file on a slow connection) says the PDF is
+  // on its way; the choice otherwise seemed to do nothing until the PDF appeared. Not as the
+  // app starts, which has nothing on screen to keep waiting over.
+  let notice = 0;
+  const slow =
+    root.childElementCount &&
+    setTimeout(() => {
+      if (token === openGeneration) notice = toast(`Opening ${safeName(name)}…`, { persist: true });
+    }, 600);
+  const opened = () => {
+    clearTimeout(slow);
+    if (notice) dismissToast(notice);
+    notice = 0;
+  };
   let nextEditor;
+  const documentModule = loadDocument();
+  const editorModule = loadEditor();
+  // An open that fails or is replaced first leaves them unused; a failure to load is reported
+  // only where they are awaited.
+  documentModule.catch(() => {});
+  editorModule.catch(() => {});
   try {
     let bytes = await readBytes(controller.signal);
+    if (token !== openGeneration) return;
+    const { PdfSession, preparePdfForEditing } = await documentModule;
     if (token !== openGeneration) return;
     let protection = null,
       encryptedOriginal = null;
@@ -666,6 +736,7 @@ async function openDocument(
     } catch (error) {
       if (token !== openGeneration) return;
       if (error.code !== 'encrypted') throw error;
+      opened();
       // A protected file opens once its password is known; the working copy is then plain.
       const { promptUnlock } = await import('./unlock-dialog.js');
       if (token !== openGeneration) return;
@@ -685,13 +756,15 @@ async function openDocument(
       protection = unlocked.protection;
       bytes = await preparePdfForEditing(bytes);
     }
+    // The PDF is read; what follows asks (Leave this PDF?) or shows it.
+    opened();
     if (
       token !== openGeneration ||
       !(await waitForAppDialogsToClose({ signal: controller.signal }))
     )
       return;
     if (token !== openGeneration || !(await canLeave(controller.signal))) return;
-    const { createEditor } = await import('./editor.js');
+    const { createEditor } = await editorModule;
     if (token !== openGeneration) return;
     const hadFocus = viewHasFocus();
     editor?.destroy();
@@ -725,6 +798,7 @@ async function openDocument(
       ),
     });
     editor = nextEditor;
+    dismissErrorToast();
     if (hadFocus) refocusView('.workspace');
     if (location.hash === LIBRARY_HASH)
       history.replaceState(null, '', location.pathname + location.search);
@@ -736,6 +810,7 @@ async function openDocument(
     if (nextEditor && editor === nextEditor) showHome();
     throw error;
   } finally {
+    opened();
     sourceSignal?.removeEventListener('abort', abortSource);
     if (token === openGeneration) loading = false;
     if (openController === controller) openController = null;
@@ -754,6 +829,17 @@ function refocusView(selector) {
   if (document.activeElement === document.body || !document.activeElement?.isConnected)
     root.querySelector(selector)?.focus({ preventScroll: true });
 }
+/**
+ * Text as the library search compares it: without case or the accents of Latin, Greek and
+ * Cyrillic letters. Other marks stay (Japanese voicing marks tell different syllables apart),
+ * and the text is composed again so a Korean syllable is not matched by its first sounds.
+ */
+const fold = (text) =>
+  text
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .normalize('NFC')
+    .toLowerCase();
 /** The app's name, and the library view's own heading. */
 function brand() {
   return el('h1', { class: 'brand' }, appIcon(), el('span', {}, 'PDF Editor'));
@@ -774,6 +860,8 @@ function showHome({ accountRefresh = false } = {}) {
   if (location.hash !== LIBRARY_HASH) history.replaceState(null, '', LIBRARY_HASH);
   const generation = ++homeGeneration;
   const list = el('div', { class: 'file-list' });
+  // What a search found, for screen readers, which otherwise hear nothing as the rows change.
+  const searchStatus = el('p', { class: 'sr-only', role: 'status' });
   let files = [],
     loadGeneration = 0,
     filter = '',
@@ -786,7 +874,7 @@ function showHome({ accountRefresh = false } = {}) {
     'aria-label': 'Search PDFs',
     oninput: (e) => {
       // Spaces around the words (a pasted name, a stray space) do not hide every file.
-      filter = e.target.value.trim().toLowerCase();
+      filter = fold(e.target.value.trim());
       renderFiles();
     },
   });
@@ -812,6 +900,7 @@ function showHome({ accountRefresh = false } = {}) {
   };
   const drawFiles = () => {
     list.replaceChildren();
+    searchStatus.textContent = '';
     if (libraryState === 'loading') {
       list.append(el('div', { class: 'empty-library' }, 'Loading your PDFs…'));
       return;
@@ -828,12 +917,16 @@ function showHome({ accountRefresh = false } = {}) {
       return;
     }
     const shown = files
-      .filter((f) => f.name.toLowerCase().includes(filter))
+      .filter((f) => foldedName(f).includes(filter))
       .sort((a, b) =>
         sort === 'name'
-          ? a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' })
+          ? byName.compare(a.name, b.name)
           : (b[sort] || 0) - (a[sort] || 0),
       );
+    if (filter)
+      searchStatus.textContent = !shown.length
+        ? 'No matching PDFs'
+        : `${shown.length} matching ${shown.length === 1 ? 'PDF' : 'PDFs'}`;
     if (!shown.length) {
       list.append(
         el(
@@ -873,36 +966,66 @@ function showHome({ accountRefresh = false } = {}) {
         el('span'),
       ),
     );
-    shown.forEach((file) => {
-      const timestamp = file.modified;
-      const date = timestamp
-        ? new Date(timestamp).toLocaleDateString(undefined, {
-            month: 'short',
-            day: 'numeric',
-            year: 'numeric',
-          })
-        : 'Unknown';
-      list.append(
-        el(
-          'div',
-          { class: 'file-row' },
-          button(
-            file.name,
-            'FileText',
-            run(() => openCloudItem(file)),
-            'file-open',
-          ),
-          el('span', { class: 'file-date muted' }, date),
-          el('span', { class: 'file-size muted' }, formatBytes(file.size || 0)),
-          iconButton(`Options for ${file.name}`, 'MoreHorizontal', (e) => {
-            // Safari does not focus clicked buttons; give the dialog a real return target.
-            e.currentTarget.focus({ preventScroll: true });
-            fileOptions(file);
-          }),
-        ),
-      );
-    });
+    list.append(...shown.map(fileRow));
   };
+  // Each listing builds a file's row once. Typing in Search PDFs then only chooses and orders
+  // rows, rather than rebuilding (and re-formatting the date of) every one on each keystroke,
+  // which took about 100 ms per key in a library of 2,000 PDFs.
+  const rows = new WeakMap();
+  // Accents and case are left out of the comparison, as the Name order already does, so
+  // "resume" finds Résumé.pdf. Each name is folded once per listing.
+  const folded = new WeakMap();
+  const foldedName = (file) => {
+    let name = folded.get(file);
+    if (name === undefined) folded.set(file, (name = fold(file.name)));
+    return name;
+  };
+  // One collator for every comparison: localeCompare with options sets one up each time, which
+  // made a name-sorted search of 2,000 PDFs spend 5 to 10 ms a key on sorting alone.
+  const byName = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
+  const dateFormat = new Intl.DateTimeFormat(undefined, {
+    month: 'short',
+    day: 'numeric',
+    year: 'numeric',
+  });
+  const fileRow = (file) => {
+    let row = rows.get(file);
+    if (row) return row;
+    const timestamp = file.modified;
+    const date = timestamp ? dateFormat.format(new Date(timestamp)) : 'Unknown';
+    row = el(
+      'div',
+      { class: 'file-row' },
+      button(
+        file.name,
+        'FileText',
+        run(async () => {
+          try {
+            await openCloudItem(file);
+          } catch (error) {
+            throw gone(file, error);
+          }
+        }),
+        'file-open',
+      ),
+      el('span', { class: 'file-date muted' }, date),
+      el('span', { class: 'file-size muted' }, formatBytes(file.size || 0)),
+      iconButton(`Options for ${file.name}`, 'MoreHorizontal', (e) => {
+        // Safari does not focus clicked buttons; give the dialog a real return target.
+        e.currentTarget.focus({ preventScroll: true });
+        fileOptions(file);
+      }),
+    );
+    rows.set(file, row);
+    return row;
+  };
+  // A PDF deleted elsewhere (another tab, another device) since the listing: the reader learns
+  // so in plain words, and the list catches up rather than offering the row again.
+  function gone(file, error) {
+    if (!P.isNotFound(error)) return error;
+    refreshAfterAction();
+    return new Error(`${file.name} is no longer in your Puter cloud.`);
+  }
   function refreshAfterAction() {
     load();
     // Replacing the rows can remove the focused action button. Recover focus in that
@@ -926,7 +1049,7 @@ function showHome({ accountRefresh = false } = {}) {
           await fn();
         } catch (error) {
           // A previous account's cloud failure must not appear in a newer workflow.
-          if (!signal.aborted) throw error;
+          if (!signal.aborted) throw gone(file, error);
         } finally {
           working = false;
           buttons.forEach((b) => (b.disabled = false));
@@ -953,6 +1076,8 @@ function showHome({ accountRefresh = false } = {}) {
             await settleAccount(signal);
             download(bytes, file.name);
             d.close();
+            // As the editor's Download says, and as the other actions below say what they did.
+            toast('PDF downloaded.');
           }),
         ),
         button(
@@ -960,17 +1085,38 @@ function showHome({ accountRefresh = false } = {}) {
           'Pencil',
           action(async () => {
             d.close();
-            const name = await promptText(
-              'Rename PDF',
-              'File name',
-              file.name.replace(/\.pdf$/i, ''),
-              { signal },
-            );
-            await settleAccount(signal);
-            // An unchanged name is no rename: Puter would refuse it as a name already taken.
-            if (name && safeName(name) !== file.name && !signal.aborted) {
-              await P.renameFile(file.path, name);
-              if (!signal.aborted) refreshAfterAction();
+            // A name Puter refuses (one already taken, say) brings the question back with what
+            // was typed and the reason, rather than ending on a message and an empty start.
+            let value = file.name.replace(/\.pdf$/i, ''),
+              refusal = null;
+            for (;;) {
+              const asked = promptText('Rename PDF', 'File name', value, { signal });
+              if (refusal) toast(refusal, { error: true });
+              const name = await asked;
+              await settleAccount(signal);
+              // An unchanged name is no rename: Puter would refuse it as a name already taken.
+              if (!name || safeName(name) === file.name || signal.aborted) return;
+              let renamed;
+              try {
+                renamed = P.fileInfo(await P.renameFile(file.path, name));
+              } catch (error) {
+                // Someone who has moved on to another dialog meanwhile gets the message alone,
+                // rather than the question taking over the dialog they are in.
+                if (
+                  signal.aborted ||
+                  P.isNotFound(error) ||
+                  P.isConnectionFailure(error) ||
+                  document.querySelector('dialog[open]')
+                )
+                  throw error;
+                value = name;
+                refusal = error?.message || error?.error?.message || 'This name could not be used.';
+                continue;
+              }
+              if (signal.aborted) return;
+              refreshAfterAction();
+              toast(`Renamed to ${renamed?.name || safeName(name)}.`);
+              return;
             }
           }),
         ),
@@ -989,9 +1135,13 @@ function showHome({ accountRefresh = false } = {}) {
               if (signal.aborted) return;
               throw error;
             }
-            await P.saveFile(file.name.replace(/\.pdf$/i, ' copy'), bytes);
+            const name = file.name.replace(/\.pdf$/i, ' copy');
+            const copy = P.fileInfo(await P.saveFile(name, bytes));
             d.close();
-            if (!signal.aborted) refreshAfterAction();
+            if (signal.aborted) return;
+            refreshAfterAction();
+            // Puter numbers a name already taken, so the copy is named as it was saved.
+            toast(`Saved a copy as ${copy?.name || safeName(name)}.`);
           }),
         ),
         button(
@@ -1010,7 +1160,9 @@ function showHome({ accountRefresh = false } = {}) {
               await settleAccount(signal);
               if (signal.aborted) return;
               await P.deleteFile(file.path);
-              if (!signal.aborted) refreshAfterAction();
+              if (signal.aborted) return;
+              refreshAfterAction();
+              toast(`${file.name} deleted.`);
             }
           }),
           'btn danger',
@@ -1026,7 +1178,9 @@ function showHome({ accountRefresh = false } = {}) {
     // A refresh after renaming, duplicating, or deleting keeps the rows on screen until the new
     // listing arrives, so a long library is not cut to one line and the reader keeps their place.
     if (!user || libraryState !== 'ready' || !files.length) {
-      libraryState = user ? 'loading' : 'ready';
+      // Until Puter has said whether anyone is signed in, the library waits for it rather than
+      // inviting someone who is signed in to sign in.
+      libraryState = user || sessionState === 'unknown' ? 'loading' : 'ready';
       renderFiles();
     }
     if (!user) return;
@@ -1118,6 +1272,7 @@ function showHome({ accountRefresh = false } = {}) {
               el('div', { class: 'search-wrap' }, icon('Search', 16), search),
             ),
           ),
+          searchStatus,
           list,
         ),
         el(
@@ -1140,6 +1295,9 @@ function showHome({ accountRefresh = false } = {}) {
     ),
   );
   if (hadFocus) refocusView('#main');
+  refreshLibrary = () => {
+    if (generation === homeGeneration) load();
+  };
   load();
 }
 window.addEventListener('beforeunload', (e) => {
@@ -1149,7 +1307,7 @@ window.addEventListener('beforeunload', (e) => {
   }
 });
 window.addEventListener('keydown', (e) => {
-  if (document.querySelector('dialog[open]')) return;
+  if (document.querySelector('dialog[open]') || fieldEditingKey(e)) return;
   // Also by the key's place, for layouts whose letters are not Latin (Ctrl+O arrives as "щ").
   const o =
     e.key.toLowerCase() === 'o' || (e.code === 'KeyO' && !e.altKey && !/[\x00-\x7f]/.test(e.key));
@@ -1186,15 +1344,25 @@ window.addEventListener('dragleave', () => {
   }
 });
 window.addEventListener('drop', (e) => {
-  const files = [...(e.dataTransfer?.files || [])];
+  // A folder arrives as a file without a type that cannot be read; it is named for what it is.
+  const folders = new Set(
+    [...(e.dataTransfer?.items || [])]
+      .map((item) => item.kind === 'file' && item.webkitGetAsEntry?.())
+      .filter((entry) => entry?.isDirectory)
+      .map((entry) => entry.name),
+  );
+  const dropped = [...(e.dataTransfer?.files || [])];
+  const files = dropped.filter((file) => !(folders.has(file.name) && !file.type));
   // Only file drops belong to the app. Text dragged into a field keeps its native insertion,
   // which cancelling the event here would silently discard.
-  if (!files.length && !document.body.classList.contains('dropping')) return;
+  if (!dropped.length && !document.body.classList.contains('dropping')) return;
   // The drop is always cancelled, even when it is ignored: the browser would otherwise leave
   // the app and show the file itself.
   e.preventDefault();
   dragDepth = 0;
   document.body.classList.remove('dropping');
+  if (!files.length && dropped.length)
+    return toast('Folders cannot be opened. Open a PDF from the folder.', { error: true });
   if (!files.length) return;
   // The message lands in the open dialog, which is where the reader is looking.
   if (dialogOpen()) return toast('Close this dialog to open a dropped file.', { error: true });
@@ -1289,6 +1457,7 @@ const initPuter = async () => {
     accountToken = token;
     sessionState = 'out';
     editor?.updateAccount();
+    refreshLibrary?.();
   }
 };
 if (globalThis.puter) initPuter();

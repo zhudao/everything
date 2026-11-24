@@ -238,6 +238,30 @@ test("a presentation launched from the desktop opens directly, titled after the 
     .toBe("Presentation");
 });
 
+test("an empty presentation file opens as a new presentation saved to it", async ({
+  page,
+}) => {
+  // As a desktop's New > Presentation makes it.
+  await mockDrive(page, {
+    seed: { "~/Desktop/Plan.pptx": "" },
+    launch: [{ name: "Plan.pptx", path: "~/Desktop/Plan.pptx" }],
+  });
+  await expect(title(page)).toHaveText("Plan");
+  await expect(page.locator("#slide-position")).toHaveText("Slide 1 of 1");
+  expect(await writes(page)).toEqual([]);
+  await addText(page);
+  await expect(status(page)).toHaveText("Saved to Puter");
+  expect((await writes(page)).at(-1)).toMatchObject({
+    path: "/test/Desktop/Plan.pptx",
+    options: { overwrite: true },
+  });
+  const saved = await page.evaluate(async () => {
+    const blob = await window.puter.fs.read("~/Desktop/Plan.pptx");
+    return [...new Uint8Array(await blob.arrayBuffer()).subarray(0, 2)];
+  });
+  expect(saved).toEqual([0x50, 0x4b]);
+});
+
 test("a launch that is not a presentation explains itself and opens a new one", async ({
   page,
 }) => {
@@ -547,6 +571,95 @@ test("a failing autosave says so in the status, and leaving asks first", async (
   ).toBeVisible();
 });
 
+test("a Puter file too large to open is refused before it is downloaded", async ({
+  page,
+}) => {
+  const story = await base64(createDeck("story"));
+  await mockDrive(page, {
+    seed: { "Presentations/Huge.pptx": story },
+    path: "/#/home",
+  });
+  await page.evaluate(() => {
+    // The drive reports the file's size; its bytes stay small.
+    const stat = puter.fs.stat;
+    puter.fs.stat = async (arg) => ({
+      ...(await stat(arg)),
+      size: 300 * 1024 * 1024,
+    });
+    const read = puter.fs.read;
+    window.__reads = 0;
+    puter.fs.read = (path) => {
+      window.__reads++;
+      return read(path);
+    };
+  });
+  await page
+    .getByRole("button", { name: "Huge PowerPoint presentation" })
+    .click();
+  await expect(page.locator("#toast")).toHaveText(
+    "Please choose a PPTX file smaller than 200 MB.",
+  );
+  expect(await page.evaluate(() => window.__reads)).toBe(0);
+});
+test("a rename onto a name already taken keeps the dialog open to correct it", async ({
+  page,
+}) => {
+  const story = await base64(createDeck("story"));
+  await mockDrive(page, {
+    env: "web",
+    seed: {
+      "Presentations/Mine.pptx": story,
+      "Presentations/Taken.pptx": story,
+    },
+    path: "/#/home",
+  });
+  const tryName = async (name) => {
+    const dialog = page.getByRole("dialog", { name: "Rename presentation" });
+    const field = dialog.getByRole("textbox", { name: "Presentation name" });
+    await field.fill(name);
+    await field.press("Enter");
+    return { dialog, field };
+  };
+  const expectTaken = async ({ dialog, field }) => {
+    await expect(field).toHaveAttribute("aria-invalid", "true");
+    await expect(field).toHaveAccessibleDescription(
+      "A file named “Taken.pptx” is already in that folder. Choose another name.",
+    );
+    await expect(field).toBeFocused();
+    expect(
+      await field.evaluate((i) => [i.selectionStart, i.selectionEnd]),
+    ).toEqual([0, 5]);
+    await expect(dialog).toBeVisible();
+  };
+  // In the library.
+  await page
+    .getByRole("button", { name: "Options for Mine", exact: true })
+    .click();
+  await page.getByRole("menuitem", { name: "Rename", exact: true }).click();
+  await expectTaken(await tryName("Taken"));
+  const { dialog, field } = await tryName("Fresh");
+  await expect(dialog).toHaveCount(0);
+  await expect(
+    page.getByRole("button", { name: "Fresh PowerPoint presentation" }),
+  ).toBeVisible();
+  expect(await page.evaluate(() => window.__fs.paths())).toContain(
+    `${APP_FOLDER}/Fresh.pptx`,
+  );
+  // In the editor.
+  await page
+    .getByRole("button", { name: "Fresh PowerPoint presentation" })
+    .click();
+  await expect(title(page)).toHaveText("Fresh");
+  await title(page).click();
+  await expectTaken(await tryName("Taken"));
+  await field.fill("");
+  await page.keyboard.type("Newer");
+  await expect(field).not.toHaveAttribute("aria-invalid");
+  await field.press("Enter");
+  await expect(dialog).toHaveCount(0);
+  await expect(title(page)).toHaveText("Newer");
+});
+
 test("opening a Puter file offers its unsaved recovery draft", async ({
   page,
 }) => {
@@ -609,6 +722,53 @@ test("a recovery draft open in one tab does not open in another", async ({
   await expect(draft(page)).toBeVisible();
   await draft(other).click();
   await expect(other.locator(".object-hit")).toHaveCount(1);
+});
+
+test("a recovery draft open in one tab can't be deleted from another", async ({
+  page,
+  context,
+}) => {
+  await mockDrive(page);
+  await expect(title(page)).toHaveText("Untitled presentation");
+  await addText(page);
+  const other = await context.newPage();
+  await mockDrive(other, { path: "/#/home" });
+  await other
+    .getByRole("button", {
+      name: "Options for Untitled presentation",
+      exact: true,
+    })
+    .click();
+  await other
+    .getByRole("menuitem", { name: "Delete draft", exact: true })
+    .click();
+  await expect(other.locator("#toast")).toHaveText(
+    "This draft is open in another tab. Close it there to delete it.",
+  );
+  await expect(other.getByRole("dialog")).toHaveCount(0);
+  // The edits are still on this device for the tab that has them open.
+  await page.getByRole("button", { name: "Back to presentations" }).click();
+  await expect(
+    page.getByRole("button", { name: "Untitled presentation Recovery draft" }),
+  ).toBeVisible();
+  // Once no tab has it open, it can be deleted.
+  await other.reload();
+  await other
+    .getByRole("button", {
+      name: "Options for Untitled presentation",
+      exact: true,
+    })
+    .click();
+  await other
+    .getByRole("menuitem", { name: "Delete draft", exact: true })
+    .click();
+  await other
+    .getByRole("dialog")
+    .getByRole("button", { name: "Delete", exact: true })
+    .click();
+  await expect(
+    other.getByRole("button", { name: "Untitled presentation Recovery draft" }),
+  ).toHaveCount(0);
 });
 
 test("closing the Puter window asks about a presentation never saved", async ({
@@ -860,6 +1020,28 @@ test("inside Puter, exports download to this device and copies go through Puter'
   ).toHaveCount(0);
 });
 
+test("Open recent lists the presentations in Puter from the first screen", async ({
+  page,
+}) => {
+  const story = await base64(createDeck("story"));
+  await mockDrive(page, {
+    env: "web",
+    seed: {
+      "Presentations/Alpha.pptx": story,
+      "Presentations/Beta.pptx": story,
+    },
+  });
+  await expect(title(page)).toHaveText("Untitled presentation");
+  await fileMenu(page);
+  await page.getByRole("menuitem", { name: "Open recent" }).click();
+  const items = page
+    .getByRole("menu", { name: "Open recent" })
+    .getByRole("menuitem");
+  await expect(items).toHaveText([/^Beta/, /^Alpha/]);
+  await items.filter({ hasText: "Alpha" }).click();
+  await expect(title(page)).toHaveText("Alpha");
+});
+
 test("a cancelled Open dialog leaves things as they were", async ({ page }) => {
   const story = await base64(createDeck("story"));
   await mockDrive(page, { seed: { "~/Desktop/Pick.pptx": story } });
@@ -870,4 +1052,88 @@ test("a cancelled Open dialog leaves things as they were", async ({ page }) => {
   await page.evaluate(() => (window.__ui.pick = "/test/Desktop/Pick.pptx"));
   await page.keyboard.press("Control+o");
   await expect(title(page)).toHaveText("Pick");
+});
+
+test("a slide show or template in Puter opens as a new presentation that saves as .pptx", async ({
+  page,
+}) => {
+  const show = createDeck("story");
+  P.setPresentationKind(show, "slideshow");
+  const template = createDeck("story");
+  P.setPresentationKind(template, "template");
+  await mockDrive(page, {
+    env: "web",
+    seed: {
+      "~/Desktop/Keynote.ppsx": await base64(show),
+      "~/Desktop/Brand.potx": await base64(template),
+    },
+    launch: [{ name: "Keynote.ppsx", path: "~/Desktop/Keynote.ppsx" }],
+  });
+  // Launched from the desktop: it keeps its name, but not its file, which a
+  // presentation (.pptx) cannot be saved into.
+  await expect(title(page)).toHaveText("Keynote");
+  await expect(page.locator("#slide-position")).toHaveText("Slide 1 of 5");
+  await expect(status(page)).not.toHaveAttribute("title", /Keynote\.ppsx/);
+  await addText(page);
+  await page.keyboard.press("Control+s");
+  await expect(status(page)).toHaveText("Saved to Puter");
+  expect((await writes(page)).map((w) => w.path)).toEqual([
+    `${APP_FOLDER}/Keynote.pptx`,
+  ]);
+  const kept = await page.evaluate(async () => {
+    const { P } = await import("/src/model.js");
+    const read = async (path) =>
+      P.getPresentationKind(
+        await P.loadPresentation(
+          new Uint8Array(await (await puter.fs.read(path)).arrayBuffer()),
+        ),
+      );
+    return [
+      await read("~/Desktop/Keynote.ppsx"),
+      await read("Presentations/Keynote.pptx"),
+    ];
+  });
+  expect(kept).toEqual(["slideshow", "presentation"]);
+  // Puter's Open dialog offers them, and a template starts an untitled one.
+  await page.evaluate(() => (window.__ui.pick = "/test/Desktop/Brand.potx"));
+  await page.keyboard.press("Control+o");
+  await expect(title(page)).toHaveText("Untitled presentation");
+  await expect(page.locator("#slide-position")).toHaveText("Slide 1 of 5");
+});
+
+test("Open recent leaves out a file found deleted, and follows one renamed", async ({
+  page,
+}) => {
+  const story = await base64(createDeck("story"));
+  await mockDrive(page, {
+    env: "web",
+    seed: {
+      "Presentations/Alpha.pptx": story,
+      "Presentations/Beta.pptx": story,
+    },
+  });
+  await expect(title(page)).toHaveText("Untitled presentation");
+  const recentItems = async () => {
+    await fileMenu(page);
+    await page.getByRole("menuitem", { name: "Open recent" }).click();
+    return page
+      .getByRole("menu", { name: "Open recent" })
+      .getByRole("menuitem");
+  };
+  await expect(await recentItems()).toHaveText([/^Beta/, /^Alpha/]);
+  await page.keyboard.press("Escape");
+  await page.keyboard.press("Escape");
+  // Elsewhere, Beta is renamed and Alpha deleted.
+  await page.evaluate((folder) => {
+    window.__fs.move(`${folder}/Beta.pptx`, `${folder}/Beta 2.pptx`);
+    window.__fs.remove(`${folder}/Alpha.pptx`);
+  }, APP_FOLDER);
+  await (await recentItems()).filter({ hasText: "Alpha" }).click();
+  await expect(page.locator("#toast")).toHaveText(
+    "“Alpha” is no longer there. It may have been moved or deleted.",
+  );
+  await (await recentItems()).filter({ hasText: "Beta" }).click();
+  await expect(title(page)).toHaveText("Beta 2");
+  // Neither is offered again under its old name.
+  await expect(await recentItems()).toHaveText(["No recent presentations"]);
 });

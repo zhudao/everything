@@ -3,11 +3,12 @@
 // a level, Backspace at the start of an item joins it to the one before, and
 // the graphic follows as you type.
 import { el, icon } from "../ui.js";
-import { fitToViewport } from "../charts/chart-sheet.js";
+import { fitToViewport, isUndoKey } from "../charts/chart-sheet.js";
 import {
   indentLine,
   joinWithPrevious,
   normalize,
+  pasteLines,
   splitItem,
 } from "./outline.js";
 
@@ -17,8 +18,16 @@ import {
 const SAMPLE = "[Text]";
 
 // `read()` gives the graphic's items now (null once it is gone), `write(items)`
-// applies new ones; `onCurrent(index)` hears the item being edited.
-export function openTextPane({ title, about, read, write, onCurrent }) {
+// applies new ones; `onCurrent(index)` hears the item being edited;
+// `returnFocus()` gives the element the keyboard goes back to on closing.
+export function openTextPane({
+  title,
+  about,
+  read,
+  write,
+  onCurrent,
+  returnFocus = null,
+}) {
   let items = read();
   if (!items) return null;
   if (!items.length) items = [{ text: "", level: 0 }];
@@ -40,6 +49,8 @@ export function openTextPane({ title, about, read, write, onCurrent }) {
       "aria-modal": "false",
       "aria-labelledby": "smartart-pane-title",
       tabindex: -1,
+      // Ctrl/⌘+Z and Y undo and redo the graphic, as the toolbar does.
+      "data-applies-edits": "",
     },
     el(
       "div",
@@ -74,6 +85,8 @@ export function openTextPane({ title, about, read, write, onCurrent }) {
       e.stopPropagation();
       close();
     }
+    // The editor's undo takes the typing back once it is on the graphic.
+    if (isUndoKey(e) && timer) commitNow();
   });
   dragBy(panel.querySelector(".chart-sheet-head"), panel);
 
@@ -98,20 +111,36 @@ export function openTextPane({ title, about, read, write, onCurrent }) {
               current = i;
               onCurrent?.(i);
             },
-            // A click places the caret after the focus arrives.
-            onclick: (e) => {
+            // A click on the sample text chooses all of it, even in the
+            // item that already has the keyboard, where the browser would
+            // otherwise put the caret after it once the click is over.
+            onmousedown: (e) => {
               const input = e.currentTarget;
-              if (
-                input.value === SAMPLE &&
-                input.selectionStart === input.selectionEnd
-              )
-                input.select();
+              if (e.button !== 0 || input.value !== SAMPLE) return;
+              e.preventDefault();
+              input.focus();
+              input.select();
             },
             oninput: (e) => {
               items[i] = { ...items[i], text: e.target.value };
               schedule();
             },
             onkeydown: (e) => key(e, i),
+            // Lines pasted from a list become items of their own: the
+            // field alone would run them together on one line.
+            onpaste: (e) => {
+              const input = e.currentTarget;
+              const result = pasteLines(
+                items,
+                i,
+                input.selectionStart ?? input.value.length,
+                input.selectionEnd ?? input.value.length,
+                e.clipboardData?.getData("text/plain"),
+              );
+              if (!result) return;
+              e.preventDefault();
+              change(result);
+            },
           }),
         ),
       ),
@@ -154,6 +183,24 @@ export function openTextPane({ title, about, read, write, onCurrent }) {
     ) {
       e.preventDefault();
       change(joinWithPrevious(items, i));
+    } else if (
+      e.key === "Backspace" &&
+      i === 0 &&
+      !input.value &&
+      items.length > 1
+    ) {
+      // An empty first item goes, as any other empty item does.
+      e.preventDefault();
+      change({ items: items.slice(1), index: 0, caret: 0 });
+    } else if (
+      e.key === "Delete" &&
+      caret === input.value.length &&
+      input.selectionEnd === caret &&
+      i < items.length - 1
+    ) {
+      // Delete at the end of an item brings the next one up to join it.
+      e.preventDefault();
+      change(joinWithPrevious(items, i + 1));
     } else if (e.key === "ArrowUp" && i > 0) {
       e.preventDefault();
       focusItem(i - 1);
@@ -191,7 +238,9 @@ export function openTextPane({ title, about, read, write, onCurrent }) {
     if (disposed) return;
     if (timer) commitNow();
     disposed = true;
+    const hadFocus = panel.contains(document.activeElement);
     panel.remove();
+    if (hadFocus) returnFocus?.()?.focus({ preventScroll: true });
     onClose?.();
   }
   draw();

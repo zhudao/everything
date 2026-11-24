@@ -189,6 +189,66 @@ test("Chart Design changes elements, type, layout and data orientation", async (
   expect(new Set(spec.series.map((s) => s.color)).size).toBe(4);
 });
 
+test("a chart changed to a pie and back gets its other series again", async ({
+  page,
+}) => {
+  await start(page);
+  await insertChart(page, "Column", "Clustered Column");
+  await page.getByRole("button", { name: "Close data sheet" }).click();
+  const change = async (family, type) => {
+    await ribbonCommand(page, "Chart Design", "chart-change-type");
+    const dialog = page.getByRole("dialog", { name: "Change Chart Type" });
+    await dialog.getByRole("tab", { name: family }).click();
+    await dialog.getByRole("radio", { name: type, exact: true }).click();
+    await dialog.getByRole("button", { name: "OK", exact: true }).click();
+    await expect(dialog).toBeHidden();
+  };
+  await change("Pie", "Pie");
+  await expect.poll(async () => (await download(page)).spec.kind).toBe("pie");
+  // The saved pie keeps them, so they come back after a reopen too.
+  expect((await download(page)).spec.series).toHaveLength(3);
+  await change("Column", "Clustered Column");
+  await expect
+    .poll(async () => (await download(page)).spec.kind)
+    .toBe("column");
+  const { spec } = await download(page);
+  expect(spec.series.map((s) => s.name)).toEqual([
+    "Series 1",
+    "Series 2",
+    "Series 3",
+  ]);
+  expect(spec.series[2].values).toEqual([1.8, 2.1, 3.2, 4.8]);
+});
+
+test("Ctrl+Z and Ctrl+Y in the data sheet undo and redo the chart's data", async ({
+  page,
+}) => {
+  await start(page);
+  await insertChart(page, "Column", "Clustered Column");
+  const cell = (r, c) =>
+    page.locator(`.chart-sheet input[data-row="${r}"][data-col="${c}"]`);
+  await expect(cell(1, 1)).toBeFocused();
+  await page.keyboard.type("10");
+  await page.keyboard.press("Enter");
+  await expect
+    .poll(async () => (await download(page)).spec.series[0].values[0])
+    .toBe(10);
+  await cell(2, 1).click();
+  await page.keyboard.press("ControlOrMeta+z");
+  await expect(cell(1, 1)).toHaveValue("4.1");
+  await expect(page.locator(".chart-sheet input:focus")).toHaveCount(1);
+  expect((await download(page)).spec.series[0].values[0]).toBe(4.1);
+  await cell(2, 1).click();
+  await page.keyboard.press("ControlOrMeta+y");
+  await expect(cell(1, 1)).toHaveValue("10");
+  // Typing not yet on the chart goes on it first, then comes off with Undo.
+  await cell(3, 2).click();
+  await page.keyboard.type("77");
+  await page.keyboard.press("ControlOrMeta+z");
+  await expect(cell(3, 2)).toHaveValue("1.9");
+  await expect(cell(1, 1)).toHaveValue("10");
+});
+
 test("the Format pane formats the chart element chosen on the Format tab", async ({
   page,
 }) => {
@@ -242,4 +302,70 @@ test("Select Data renames a series by clicking its name and typing", async ({
     "Revenue",
     "Series 3",
   ]);
+});
+
+// Closing the data sheet from the keyboard dropped the focus to the page,
+// so the next Tab started again from the top of the window.
+// A line break typed after the last category label saved an empty category.
+test("Select Data takes no empty category from a line break at the end", async ({
+  page,
+}) => {
+  await start(page);
+  await insertChart(page, "Column", "Clustered Column");
+  await page.getByRole("button", { name: "Close data sheet" }).click();
+  await ribbonCommand(page, "Chart Design", "chart-select-data");
+  const dialog = page.getByRole("dialog", { name: "Select Data" });
+  const labels = dialog.getByRole("textbox", { name: /Category labels/ });
+  await labels.fill("North\nSouth\nEast\nWest\n\n");
+  await dialog.getByRole("button", { name: "OK", exact: true }).click();
+  await expect
+    .poll(async () => (await download(page)).spec.categories)
+    .toEqual(["North", "South", "East", "West"]);
+});
+
+test("closing the data sheet with Escape puts the keyboard back on the chart", async ({
+  page,
+}) => {
+  await start(page);
+  await insertChart(page, "Column", "Clustered Column");
+  const cell = page.locator('.chart-sheet input[data-row="1"][data-col="1"]');
+  await expect(cell).toBeFocused();
+  await page.keyboard.type("9");
+  await page.keyboard.press("Escape");
+  await expect(page.locator(".chart-sheet")).toHaveCount(0);
+  const chart = page.locator("#slide-canvas .object-hit.selected");
+  await expect(chart).toBeFocused();
+  await page.waitForTimeout(500);
+  await expect(chart).toBeFocused();
+  const { spec } = await download(page);
+  expect(spec.series[0].values[0]).toBe(9);
+});
+
+// Clicking a cell placed the caret in its value, so clicking 4.3 and
+// typing 7 made it 4.37; Tab and Enter already chose the whole cell.
+test("a click on a data sheet cell chooses it, and typing replaces its value", async ({
+  page,
+}) => {
+  await start(page);
+  await insertChart(page, "Column", "Clustered Column");
+  const sheet = page.locator(".chart-sheet");
+  const cell = sheet.locator('input[data-row="2"][data-col="2"]');
+  await expect(cell).toHaveValue("4.3");
+  await cell.click();
+  await page.keyboard.type("7");
+  await expect(cell).toHaveValue("7");
+  // A click in the cell being typed in places the caret.
+  await cell.click({ position: { x: 4, y: 8 } });
+  await page.keyboard.type("1");
+  await expect(cell).toHaveValue(/^(17|71)$/);
+  // The cell already chosen when the sheet opens is replaced too.
+  const first = sheet.locator('input[data-row="1"][data-col="1"]');
+  await first.click();
+  await page.keyboard.type("5");
+  await page.keyboard.press("Enter");
+  await expect(first).toHaveValue("5");
+  await page.waitForTimeout(500);
+  const { spec } = await download(page);
+  expect(spec.series[0].values[0]).toBe(5);
+  expect([17, 71]).toContain(spec.series[1].values[1]);
 });

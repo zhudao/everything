@@ -3,7 +3,7 @@ import { pageBackingSize } from './canvas-backing.js';
 import { StorySession } from './story-session.js';
 import { decodeShape } from './canvas-shapes.js';
 import { wordPosition, optionWordPosition } from './word-navigation.js';
-import { carriesFormatting, copyFragment, fragmentHtml, htmlFragment, pasteFragment, formattedPasteFits, copiesPicture, pictureHtml, htmlPicture } from './clipboard-fragment.js';
+import { carriesFormatting, copyFragment, fragmentHtml, htmlFragment, pasteFragment, formattedPasteFits, copiesPicture, pictureHtml, htmlPicture, pastedFragment, withoutPastedControls, FRAGMENT_ATTRIBUTE, tableFragmentHtml, htmlTableFragment, foreignHtmlTable } from './clipboard-fragment.js';
 import { copiesDrawing, drawingHtml, htmlDrawing, pasteDrawing, equationHtml, htmlEquation, pastedEquation, uncopiedHtml, copiedUncopied, UNCOPIED_MESSAGE, UNCUT_MESSAGE } from './drawing-clipboard.js';
 import { xmlAttributeText } from './text-limits.js';
 import { textEdit, followEdit } from './text-edit.js';
@@ -31,6 +31,7 @@ import { text3dSurface } from './text-3d.js';
 import { enterCellText, leaveCellText } from './canvas-cell-text.js';
 import { tableBorderWidth } from './table-border-layout.js';
 import { layoutPageStories } from './page-story-layout.js';
+import { pageStoryLabel } from './page-stories.js';
 import { layoutSerializer } from './page-story-measure.js';
 import { drawingPageContexts, drawingPageContext } from './shape-page-fields.js';
 import { paintParagraphBorder } from './canvas-paragraph-borders.js';
@@ -48,8 +49,8 @@ import { hasRunBackground, runBackground, foregroundBackground, runBackgroundRec
 import { paintColor } from './colors.js';
 import { TextDocument, boundaries, locate, paragraphFormat, paragraphText } from './model.js';
 import { cellContext, rowGrid, verticalMerges } from './tables.js';
-import { cellBlockRects, cellBlockPlacements, wholeRows, blockBetween } from './table-selection.js';
-import { clearCells, splitTable, insertTablePageBreak } from './table-editing.js';
+import { cellBlockRects, cellBlockPlacements, wholeRows, wholeColumns, blockBetween } from './table-selection.js';
+import { clearCells, deleteColumns, deleteRows, deleteTable, splitTable, insertTablePageBreak, joinTables, copyTableRows, pasteTableRows, foreignTableRows } from './table-editing.js';
 import { paragraphEdges } from './paragraph-geometry.js';
 import { pageGeometry } from './page-settings.js';
 import { pageBorderStrokes } from './page-borders.js';
@@ -58,10 +59,13 @@ import { paintPagePictureBackground } from './canvas-page-background.js';
 import { setDarkPage } from './canvas-dark-page.js';
 import { viewGeometry, viewPageStories, fitContinuousPages, isContinuousView, usesScreenGeometry } from './document-views.js';
 import { pageLookup } from './page-lookup.js';
+import { headingNumbers, numberedHeading } from './outline.js';
 import { font, layoutDocument, caretRect, lineAtPosition, verticalLine, hitTestStop, nearestStop, imageAtPoint, selectionRects, selectionRectFinder } from './layout.js';
 import { refreshPageReferences } from './page-reference-refresh.js';
 import { positionedImageBounds, drawingOwnRotation } from './positioned-images.js';
 import { createImageInteraction } from './image-interaction.js';
+import { diagramDescriptionAfterTextEdit } from './diagram-builder.js';
+import { xmlEscape } from './inserted-drawings.js';
 import { paintDecodedImage, imageInfo, decodeImage, decodeImages, validateImageAssets, imageCropRect, inlineImagePaintFrame, normalizedRotation, ANGLE_PER_DEGREE, EMU_PER_PX, isPositionedImage } from './images.js';
 import { sectionColumnIntervals } from './section-columns.js';
 let nextAsset = 0;
@@ -72,6 +76,12 @@ let nextAsset = 0;
 const EAGER_PAGES = 8;
 // Pages off screen are painted once changes have paused this long (schedulePaint).
 const QUIET_PAINT_MS = 600;
+// A page canvas holds its pixels for as long as it exists: about 14 MB a page on a 2x display, so
+// every page of a 160-page document held over 2 GB. In a document longer than RETAINED_PAGES only
+// the pages within RETAIN_SCREENS screens of the view keep theirs; the others give them up
+// (releasePages) and are painted again when they come near, as a page changed while away is.
+const RETAINED_PAGES = 16;
+const RETAIN_SCREENS = 3;
 // How long a finger rests on the text before it opens the context menu.
 const LONG_PRESS_MS = 500;
 
@@ -263,6 +273,8 @@ export class CanvasEditor {
     watchResolution();
     // Pages left unpainted by the last paint are painted before they are shown.
     this.stalePages = new Set();
+    // Pages far from the view whose canvases gave up their pixels (releasePages); each is also stale.
+    this.releasedPages = new Set();
     document.addEventListener('scroll', () => this.paintShownPages(), { capture: true, passive: true, signal: this.abort.signal });
     window.addEventListener('resize', () => this.paintShownPages(), { signal: this.abort.signal });
     // The view also grows without the window: a pane closes, the ribbon folds, Focus starts.
@@ -539,6 +551,11 @@ export class CanvasEditor {
   transact(action) { return this.session.transact(action); }
   /** The section index of a body page. */
   sectionOfPage(page = this.caretPageIndex) { return this.layout?.pageSections?.[page] ?? 0; }
+  /** The names of the header and footer a page shows, as its header/footer editing cues label them. */
+  storyChromeLabels(page) {
+    const shown = this.storyLayout?.pageVariants?.[page], sections = this.pageStories?.sections?.length || 1;
+    return shown ? { header: pageStoryLabel('header', shown, sections), footer: pageStoryLabel('footer', shown, sections) } : {};
+  }
   updatePageReferences() {
     if (this.session.path !== null) { this.onError(new Error('Update page references from the document body.')); return false; }
     let result;
@@ -574,8 +591,11 @@ export class CanvasEditor {
       if (this.destroyed || signal?.aborted) { preview.close(); return false; }
       if (revision !== this.session.revision || this.model !== model || model.selectedImage !== image) throw new Error('The document changed while the drawing text was being prepared.');
       model.assets[id] = prepared.asset; this.images.set(id, preview);
+      // A diagram keeps its outline as its description (wp:docPr descr): it follows the text typed into its shapes.
+      const alt = diagramDescriptionAfterTextEdit(image.alt, prepared.shell);
+      const shell = alt ? prepared.shell.replace(/(<wp:docPr\b[^>]*?)\sdescr="[^"]*"/, '$1').replace(/<wp:docPr\b/, `$& descr="${xmlEscape(alt)}"`) : prepared.shell;
       let failure;
-      if (!this.execute(() => model.replaceDrawingText(image, id, prepared.shell), error => { failure = error; })) throw failure || new Error('The drawing text could not be applied.');
+      if (!this.execute(() => model.replaceDrawingText(image, id, shell, alt), error => { failure = error; })) throw failure || new Error('The drawing text could not be applied.');
       return true;
     } catch (error) {
       this.images.delete(id); delete model.assets[id]; preview.close(); throw error;
@@ -654,7 +674,11 @@ export class CanvasEditor {
   createCharacterStyle(name, basedOn) { return this.execute(() => this.model.createCharacterStyle(name, basedOn)); }
   setParagraphStyle(id) { this.execute(() => this.model.setParagraphStyle(id)); this.focus(); }
   setOutlineLevel(value) { this.execute(() => this.model.setOutlineLevel(value)); this.focus(); }
-  get outline() { return this.model.outline.map(entry => ({ ...entry, page: lineAtPosition(this.selectionLayout, entry.start, 'forward').page + 1 })); }
+  get outline() {
+    // Numbered headings show their numbers ("2.1 Methods"), counted once for the whole list.
+    const numbers = headingNumbers(this.model.paragraphs, this.model.numbering);
+    return this.model.outline.map(entry => ({ ...entry, text: numberedHeading(entry, numbers), page: lineAtPosition(this.selectionLayout, entry.start, 'forward').page + 1 }));
+  }
   goToParagraph(id) {
     this.finishComposition();
     const index = this.model.paragraphs.findIndex(p => p.id === id); if (index < 0) return false;
@@ -667,6 +691,8 @@ export class CanvasEditor {
   toggleBold() { this.execute(() => this.model.toggleBold()); this.focus(); }
   setRunFormat(patch) { this.execute(() => this.model.setRunFormat(patch)); this.focus(); }
   setFontSize(size) { this.execute(() => this.model.setFontSize(size)); this.focus(); }
+  /** Increase or Decrease Font Size: each size in the selection takes `next(size)` (model.stepFontSize). */
+  stepFontSize(next) { this.execute(() => this.model.stepFontSize(next)); this.focus(); }
   toggleItalic() { this.execute(() => this.model.toggleItalic()); this.focus(); }
   toggleUnderline() { this.execute(() => this.model.toggleUnderline()); this.focus(); }
   clearDirectTextFormatting() { this.finishComposition(); const ok = this.execute(() => this.model.clearDirectTextFormatting()); this.focus(); return ok; }
@@ -816,6 +842,7 @@ export class CanvasEditor {
       this.pages.append(canvas);
     }
     this.canvases = [...this.pages.children];
+    for (const index of this.releasedPages) if (index >= this.canvases.length) this.releasedPages.delete(index);
     this.resizeCanvases();
     // Font and style edits can introduce an effect face absent at import time.
     // Prepare outlines without delaying input; repaint only the latest layout.
@@ -841,21 +868,27 @@ export class CanvasEditor {
     this.approximateScriptFonts = scriptFonts;
     if (scriptNoticeChanged) this.onSelection();
   }
+  /** Page `index`'s size on screen in CSS pixels, and its canvas's backing store size. */
+  backingSize(index) {
+    const geometry = this.layout.pages[index] || this.layout.page;
+    // Shown at exactly its backing store's size: the browser draws a canvas at a whole number of
+    // CSS pixels, so a fractional page size (A4, fit-width and slider zooms, or any odd number of
+    // device pixels on a 2x display) would otherwise be resampled, which blurs every page.
+    const cssWidth = Math.max(1, Math.round(geometry.width * this.zoom)), cssHeight = Math.max(1, Math.round(geometry.height * this.zoom));
+    // A page too large for the browser's canvas limit gets fewer device pixels (canvas-backing.js).
+    return { cssWidth, cssHeight, ...pageBackingSize(cssWidth, cssHeight, window.devicePixelRatio || 1) };
+  }
   resizeCanvases() {
     this.canvases.forEach((canvas, index) => {
-      const geometry = this.layout.pages[index] || this.layout.page;
       canvas.dataset.page = index;
-      const ratio = window.devicePixelRatio || 1;
-      // Shown at exactly its backing store's size: the browser draws a canvas at a whole number of
-      // CSS pixels, so a fractional page size (A4, fit-width and slider zooms, or any odd number of
-      // device pixels on a 2x display) would otherwise be resampled, which blurs every page.
-      const cssWidth = Math.max(1, Math.round(geometry.width * this.zoom)), cssHeight = Math.max(1, Math.round(geometry.height * this.zoom));
-      // A page too large for the browser's canvas limit gets fewer device pixels (canvas-backing.js).
-      const { width, height } = pageBackingSize(cssWidth, cssHeight, ratio);
+      const { cssWidth, cssHeight, width, height } = this.backingSize(index);
       // Assigning a dimension clears and reallocates the canvas even when unchanged, and pages
       // off screen are repainted only later: keep the backing store of pages that kept their size.
-      if (canvas.width !== width) canvas.width = width;
-      if (canvas.height !== height) canvas.height = height;
+      // A released page gets its backing store when it is painted next.
+      if (!this.releasedPages.has(index)) {
+        if (canvas.width !== width) canvas.width = width;
+        if (canvas.height !== height) canvas.height = height;
+      }
       canvas.style.width = `${cssWidth}px`;
       canvas.style.height = `${cssHeight}px`;
     });
@@ -924,6 +957,8 @@ export class CanvasEditor {
   }
   paintSheets(pages = null) {
     this.printedLayout = { layout: this.layout, storyLayout: this.storyLayout };
+    // Text drawn inside drawings on each printed page (see paint), read by PDF export's text layer.
+    this.printTextRuns = new Map();
     const count = this.layout.pages.length, sheets = new Array(count);
     const chosen = pages ? [...new Set(pages)].filter(index => Number.isInteger(index) && index >= 0 && index < count).sort((a, b) => a - b) : [...sheets.keys()];
     for (const index of chosen) {
@@ -938,21 +973,47 @@ export class CanvasEditor {
   }
   /** Indices of the page canvases on screen, with a screenful of margin; every page in a short document. */
   shownPages() {
-    const all = this.canvases.map((_, index) => index);
-    if (all.length <= EAGER_PAGES) return all;
+    if (this.canvases.length <= EAGER_PAGES) return this.canvases.map((_, index) => index);
+    return this.pagesWithin(1) ?? [];
+  }
+  /** Indices of the page canvases within `screens` screens of the view, or null while the view has no size. */
+  pagesWithin(screens) {
     const host = this.host.getBoundingClientRect();
     const top = Math.max(host.top, 0), bottom = Math.min(host.bottom, window.innerHeight);
     const left = Math.max(host.left, 0), right = Math.min(host.right, window.innerWidth);
     const height = Math.max(0, bottom - top), width = Math.max(0, right - left);
-    return all.filter(index => {
-      const r = this.canvases[index].getBoundingClientRect();
-      return r.bottom > top - height && r.top < bottom + height && r.right > left - width && r.left < right + width;
+    if (!height || !width) return null;
+    const result = [];
+    this.canvases.forEach((canvas, index) => {
+      const r = canvas.getBoundingClientRect();
+      if (r.bottom > top - height * screens && r.top < bottom + height * screens && r.right > left - width * screens && r.left < right + width * screens) result.push(index);
+    });
+    return result;
+  }
+  /**
+   * The pages that keep their pixels (RETAINED_PAGES), or null for every page. The host's `keepsEveryPage()` says
+   * when something draws every page (page thumbnails), which then keep theirs, painted while the browser is idle.
+   */
+  retainedPages() {
+    if (this.canvases.length <= RETAINED_PAGES || this.keepsEveryPage?.()) return null;
+    const near = this.pagesWithin(RETAIN_SCREENS);
+    // The host's `pagesShownElsewhere()` names pages another view shows (the split view's second pane).
+    return near && new Set([...near, ...(this.pagesShownElsewhere?.() || [])]);
+  }
+  /** Far pages give up their canvases' pixels, and are painted again before they are shown or read. */
+  releasePages(retained = this.retainedPages()) {
+    if (!retained) return;
+    this.canvases.forEach((canvas, index) => {
+      if (retained.has(index) || this.releasedPages.has(index)) return;
+      canvas.width = 0; canvas.height = 0;
+      this.releasedPages.add(index); this.stalePages.add(index);
     });
   }
   paintShownPages() {
     if (this.destroyed || !this.stalePages.size) return;
     const pages = this.shownPages().filter(index => this.stalePages.has(index));
-    if (pages.length) this.paint({ pages });
+    // Pages left far behind are released while the browser is idle (schedulePaint), not during the scroll.
+    if (pages.length) this.paint({ pages }); else this.schedulePaint();
   }
   /** Paint every page left for later, for callers that read the page canvases' pixels. */
   flushPaint() {
@@ -974,10 +1035,14 @@ export class CanvasEditor {
       if (this.destroyed || !this.stalePages.size) return;
       // A change since this was scheduled starts the wait again.
       if ((this.changedAt ?? -Infinity) + QUIET_PAINT_MS > performance.now()) { this.schedulePaint(); return; }
+      // Pages far from the view are released rather than painted (RETAINED_PAGES).
+      const retained = this.retainedPages();
+      this.releasePages(retained);
       // Nearest pages first, a couple at a time while the browser has idle time, so typing and
       // scrolling stay responsive.
       const shown = this.shownPages(), anchor = shown.length ? shown[0] : 0;
-      const order = [...this.stalePages].sort((a, b) => Math.abs(a - anchor) - Math.abs(b - anchor));
+      const order = [...this.stalePages].filter(index => !retained || retained.has(index)).sort((a, b) => Math.abs(a - anchor) - Math.abs(b - anchor));
+      if (!order.length) return;
       do this.paint({ pages: order.splice(0, 2) });
       while (order.length && deadline && !deadline.didTimeout && deadline.timeRemaining() > 4);
       this.schedulePaint();
@@ -1017,6 +1082,8 @@ export class CanvasEditor {
     const composing = printing ? null : this.compositionRange();
     const composedRects = composing ? selectionRects(this.selectionLayout, ...composing) : [];
     for (const index of indices || canvases.keys()) {
+      // A released page gets its backing store back (releasePages).
+      if (canvases === this.canvases && this.releasedPages.delete(index)) { const { width, height } = this.backingSize(index); canvases[index].width = width; canvases[index].height = height; }
       const canvas = canvases[index], ctx = canvas.getContext('2d'), geometry = this.layout.pages[index] || this.layout.page;
       // A canvas keeps its pixels and drawing state between paints (resizeCanvases keeps unchanged sizes).
       ctx.reset?.();
@@ -1025,6 +1092,9 @@ export class CanvasEditor {
       setCanvasFontAlternatives(ctx, this.model.styles.fontAlternatives);
       const scale = canvas.width / geometry.width;
       ctx.setTransform(scale, 0, 0, scale, 0, 0);
+      // Printed sheets collect the text drawn inside drawings (text boxes, shapes) in page pixels, for a PDF's text layer.
+      const printText = printing && this.printTextRuns ? [] : null, textSink = printText ? run => printText.push({ ...run, matrix: run.matrix.map(v => v / scale) }) : undefined;
+      if (printText) this.printTextRuns.set(index, printText);
       ctx.fillStyle = geometry.background || '#FFFFFF'; ctx.fillRect(0, 0, geometry.width, geometry.height);
       paintPagePictureBackground(ctx, geometry, this.images, { bestEffort: this.readOnly });
       ctx.fillStyle = '#000000';
@@ -1075,10 +1145,10 @@ export class CanvasEditor {
                   const [x, y, w, h] = rect.destination;
                   const [sx, sy, sw, sh] = rect.source, scaleX = w * f.width / sw, scaleY = h * f.height / sh;
                   ctx.beginPath(); ctx.rect(x * f.width, y * f.height, w * f.width, h * f.height); ctx.clip();
-                  paintDecodedImage(ctx, bitmap, x * f.width - sx * scaleX, y * f.height - sy * scaleY, bitmap.width * scaleX, bitmap.height * scaleY, { ...drawingPageContext(this.drawingPageContexts, index, f.pageStory ? undefined : f.region), pageStory: !!f.pageStory, printing });
+                  paintDecodedImage(ctx, bitmap, x * f.width - sx * scaleX, y * f.height - sy * scaleY, bitmap.width * scaleX, bitmap.height * scaleY, { ...drawingPageContext(this.drawingPageContexts, index, f.pageStory ? undefined : f.region), pageStory: !!f.pageStory, printing, textSink });
                 }
                 ctx.restore();
-              } else paintDecodedImage(ctx, bitmap, f.x, f.y, f.width, f.height, { ...drawingPageContext(this.drawingPageContexts, index, f.pageStory ? undefined : f.region), pageStory: !!f.pageStory, printing, bitmapDisplayScale: printing ? undefined : scale });
+              } else paintDecodedImage(ctx, bitmap, f.x, f.y, f.width, f.height, { ...drawingPageContext(this.drawingPageContexts, index, f.pageStory ? undefined : f.region), pageStory: !!f.pageStory, printing, bitmapDisplayScale: printing ? undefined : scale, textSink });
               if (f.image.opacity !== undefined) ctx.restore();
             }
             // A selected shape shows its frame handles only; pictures and objects within a text selection are tinted.
@@ -1192,7 +1262,7 @@ export class CanvasEditor {
                     ctx.scale(flipH ? -1 : 1, flipV ? -1 : 1);
                   }
                   const left = transformed ? -width / 2 : x0, upper = transformed ? -height / 2 : y0;
-                  if (bitmap.previewPlaceholder || !fragment.image.crop || !Object.values(fragment.image.crop).some(Boolean)) paintDecodedImage(ctx, bitmap, left, upper, width, height, { ...drawingPageContext(this.drawingPageContexts, index, line.pageStory ? undefined : line.region), pageStory: !!line.pageStory, printing, bitmapDisplayScale: printing ? undefined : scale });
+                  if (bitmap.previewPlaceholder || !fragment.image.crop || !Object.values(fragment.image.crop).some(Boolean)) paintDecodedImage(ctx, bitmap, left, upper, width, height, { ...drawingPageContext(this.drawingPageContexts, index, line.pageStory ? undefined : line.region), pageStory: !!line.pageStory, printing, bitmapDisplayScale: printing ? undefined : scale, textSink });
                   else {
                     const rect = imageCropRect(fragment.image.crop, bitmap.width, bitmap.height);
                     if (rect) { const [x, y, w, h] = rect.destination; paintImage(ctx, bitmap, ...rect.source, left + x * width, upper + y * height, w * width, h * height); }
@@ -1239,8 +1309,9 @@ export class CanvasEditor {
         paintText(ctx, { ...label.style, text: label.text, x: label.x, width: label.width }, label.baseline); ctx.restore();
       }
       if (geometry.pageBorders?.zOrder !== 'back') for (const border of pageBorders) paintParagraphBorder(ctx, border);
-      if (storyChrome && storyChrome.active !== 'body') paintStoryChrome(ctx, geometry, storyChrome.bounds, storyChrome.active);
+      if (storyChrome && storyChrome.active !== 'body') paintStoryChrome(ctx, geometry, storyChrome.bounds, storyChrome.active, this.storyChromeLabels(index));
       if (!printing) for (const overlay of this.overlays) if (!overlay.spelling) overlay(ctx, index, geometry);
+      if (!printing && this.textDrag?.at != null) this.paintDropCaret(ctx, index);
       if (!printing && controlRects) paintControlCarets(ctx, controlRects, index, scale);
       if (composedRects.length) paintCompositionUnderline(ctx, composedRects, this.selectionLayout.lines, index, scale);
       if (!printing && start === end && caret.page === index && document.activeElement === this.input && !this.accessible) {
@@ -1408,7 +1479,7 @@ export class CanvasEditor {
     document.addEventListener('pointerdown', end, { capture: true, signal });
   }
   /** Forget the press in progress (the browser took it for a scroll, or a second finger made it a pinch). */
-  cancelPointer() { this.touch = null; this.linkPress = null; this.dragging = false; this.dragControl = null; this.stopAutoScroll(); this.imageInteraction.cancel(); }
+  cancelPointer() { if (this.textDrag) { this.textDrag = null; this.stopAutoScroll(); this.paint(); } this.touch = null; this.linkPress = null; this.dragging = false; this.dragControl = null; this.stopAutoScroll(); this.imageInteraction.cancel(); }
   pointerDown(e, tapped = false) {
     // Control+click is a Mac's secondary click: the context menu follows, and the selection it acts on stays.
     if (e.button !== 0 || MAC && e.ctrlKey) return;
@@ -1425,6 +1496,7 @@ export class CanvasEditor {
     const presses = last && e.timeStamp - last.time < 500 && Math.hypot(e.clientX - last.x, e.clientY - last.y) < 5
       && left === last.left && top === last.top ? last.presses % 3 + 1 : 1;
     this.lastPress = { time: e.timeStamp, x: e.clientX, y: e.clientY, left, top, presses };
+    const previousUnit = this.unit;
     this.unit = null;
     e.preventDefault();
     // Crop mode and Shift+click drawing selection take the press first (image-interaction.js).
@@ -1440,6 +1512,25 @@ export class CanvasEditor {
       if (story && isNoteStoryKind(this.pageStories?.stories[story.pageStory]?.kind) && this.pageStories.stories[story.pageStory].editable) this.editStory(story.pageStory, story.page);
     }
     let position = this.point(e), restoredPromptSelection, restoredOutsideCaret, sameOffsetCaret;
+    const margin = !this.pointImage && !e.altKey && this.marginLine(e);
+    if (margin) {
+      this.selectInMargin(e, margin, presses);
+      this.dragging = true; this.dragControl = null;
+      try { this.pages.setPointerCapture(e.pointerId); } catch { /* released */ }
+      this.preferredX = null; this.focus(); this.onSelection();
+      return;
+    }
+    // A press inside the selected text may start dragging it elsewhere (textDrag); a click there places the caret
+    // as it lifts.
+    const [selectedStart, selectedEnd] = this.model.range;
+    if (presses === 1 && !e.shiftKey && !e.metaKey && !e.ctrlKey && e.pointerType !== 'touch' && !this.readOnly && !this.viewOnly && !this.pointImage
+      && selectedStart < selectedEnd && position > selectedStart && position < selectedEnd && !this.model.activeCellBlock && !this.model.selectedImage
+      && carriesFormatting(this.model)) {
+      this.textDrag = { from: [selectedStart, selectedEnd], x: e.clientX, y: e.clientY, pointerId: e.pointerId, model: this.model, revision: this.session.revision, started: false, at: null };
+      try { this.pages.setPointerCapture(e.pointerId); } catch { /* released */ }
+      this.focus();
+      return;
+    }
     if ((e.ctrlKey || e.metaKey) && this.pointLink) { this.openHyperlink(this.pointLink.link); return; }
     // A plain press on a link is settled when it lifts: a click there is a click on the link, a drag selects.
     if (this.pointLink && presses === 1 && !e.shiftKey && !e.altKey) this.linkPress = { range: this.pointLink, x: e.clientX, y: e.clientY, pointerId: e.pointerId };
@@ -1488,6 +1579,13 @@ export class CanvasEditor {
       // whole words or paragraphs, as native selection does.
       const unit = !e.shiftKey && presses > 1 && !this.model.selection.controlCaret && this.textUnit(e, position, presses);
       if (unit) { this.model.select(unit.start, unit.end); this.unit = { ...unit, presses, model: this.model, path: this.session.path }; }
+      // Shift+click after a double or triple click (the words or paragraph it chose left as they were) extends by
+      // whole words or paragraphs, as a drag from it does.
+      const chosen = e.shiftKey && previousUnit?.model === this.model && previousUnit.path === this.session.path ? previousUnit.chosen : null;
+      if (chosen && chosen.anchor === selection.anchor && chosen.focus === selection.focus && chosen.revision === this.session.revision) {
+        this.unit = { ...previousUnit, chosen: null };
+        this.selectThroughUnit(e, this.unit, position);
+      }
     }
     const dragSelection = this.model.selection;
     const dragRange = !this.readOnly && !e.shiftKey && dragSelection.anchor === dragSelection.focus &&
@@ -1507,20 +1605,56 @@ export class CanvasEditor {
       if (dx < 10 || dx <= dy) return;
       this.pointerDown(this.touch.down, true);
     }
+    if (this.textDrag?.pointerId === e.pointerId) { this.moveTextDrag(e); return; }
     if (this.imageInteraction.move(e)) return;
     if (!this.dragging) {
       this.point(e, false);
       const openable = this.pointLink && openableHyperlink(this.pointLink.link);
       this.pages.title = this.pointLink ? `${this.pointLink.link.tooltip || hyperlinkLabel(this.pointLink.link)}${openable ? this.readOnly || this.viewOnly ? ' (Click to open)' : ` (${MAC ? 'Cmd' : 'Ctrl'}+click to open)` : ''}` : '';
-      this.pages.style.cursor = openable && (this.readOnly || this.viewOnly || e.metaKey || e.ctrlKey && !MAC) ? 'pointer' : '';
+      this.pages.style.cursor = openable && (this.readOnly || this.viewOnly || e.metaKey || e.ctrlKey && !MAC) ? 'pointer' : !this.pointImage && this.marginLine(e) ? 'default' : '';
       return;
     }
     this.dragTo(e);
     this.dragPoint = { clientX: e.clientX, clientY: e.clientY, altKey: e.altKey };
     this.autoScroll();
   }
+  /**
+   * The body line beside a press in the left margin of a page, the selection bar of desktop word processors, or null.
+   * Lines in tables (whose gutter selects rows, table-pointer.js), frames and text boxes have none.
+   */
+  marginLine(e) {
+    if (this.session.path !== null || this.accessible) return null;
+    // The page under the pointer is the event's own target, unless the pointer is captured (a drag).
+    const over = c => { const r = c.getBoundingClientRect(); return e.clientX >= r.left && e.clientX <= r.right && e.clientY >= r.top && e.clientY <= r.bottom; };
+    const canvas = this.canvases.includes(e.target) ? e.target : this.canvases.find(over);
+    if (!canvas || !over(canvas)) return null;
+    const rect = canvas.getBoundingClientRect(), page = Number(canvas.dataset.page), layout = this.selectionLayout;
+    const x = (e.clientX - rect.left) / this.zoom, y = (e.clientY - rect.top) / this.zoom, geometry = layout.pages?.[page] || layout.page;
+    if (!(geometry?.left > 8) || x >= geometry.left - 4) return null;
+    const line = layout.lines.find(l => l.page === page && y >= l.y && y < l.y + l.height && !l.cellId && !l.frameId && !l.cellText);
+    return line && line.stops?.length && x < line.stops[0].x - 4 && x < line.stops.at(-1).x ? line : null;
+  }
+  /**
+   * A press in the selection bar (marginLine): one selects the line, two its paragraph, three (or Cmd/Ctrl) the whole
+   * document; Shift extends the selection to the line, and a drag goes on by lines (or paragraphs).
+   */
+  selectInMargin(e, line, presses) {
+    const kind = e.metaKey || e.ctrlKey || presses === 3 ? 'all' : presses === 2 ? null : 'line';
+    const unit = this.textUnit(e, line.start, kind === null ? 3 : 1, kind);
+    if (e.shiftKey && kind === 'line') {
+      const anchor = this.model.selection.anchor;
+      this.model.select(anchor, unit.start < anchor ? unit.start : unit.end);
+    } else this.model.select(unit.start, unit.end);
+    this.caretPage = line.page;
+    this.unit = { ...unit, presses: kind === 'line' ? 1 : 3, margin: kind || 'paragraph', model: this.model, path: this.session.path };
+  }
   /** The word (two presses) or paragraph (three) at a pointer position. */
-  textUnit(e, position, presses) {
+  textUnit(e, position, presses, kind = null) {
+    if (kind === 'all') return { start: 0, end: this.model.text.length };
+    if (kind === 'line') {
+      const line = lineAtPosition(this.selectionLayout, position, 'forward', this.caretPage);
+      return { start: line.start, end: line.end };
+    }
     if (presses === 3) {
       const { index, offset } = locate(this.model.paragraphs, position), start = position - offset;
       return { start, end: start + paragraphText(this.model.paragraphs[index]).length };
@@ -1532,13 +1666,17 @@ export class CanvasEditor {
     const word = new Intl.Segmenter(undefined, { granularity: 'word' }).segment(this.model.text).containing(this.pointCharacter(e, position));
     return word && !/[\n\v\f\u000e]/.test(word.segment) ? { start: word.index, end: word.index + word.segment.length } : null;
   }
+  /** Select from the word or paragraph `unit` to the whole word or paragraph at `position`. */
+  selectThroughUnit(e, unit, position) {
+    const other = this.textUnit(e, position, unit.presses, unit.margin) || { start: position, end: position };
+    if (other.start < unit.start) this.model.select(unit.end, Math.min(other.start, position));
+    else this.model.select(unit.start, Math.max(other.end, position, unit.end));
+  }
   /** Extend a pointer selection to a point. */
   dragTo(e) {
     const unit = this.unit?.model === this.model && this.unit;
     if (unit) {
-      const position = this.point(e), other = this.textUnit(e, position, unit.presses) || { start: position, end: position };
-      if (other.start < unit.start) this.model.select(unit.end, Math.min(other.start, position));
-      else this.model.select(unit.start, Math.max(other.end, position, unit.end));
+      this.selectThroughUnit(e, unit, this.point(e));
       this.syncInput(); this.paint(); this.onSelection();
       return;
     }
@@ -1561,10 +1699,12 @@ export class CanvasEditor {
       const speed = beyond => beyond > 0 ? Math.min(80, 8 + Math.round(beyond / 2)) : 0;
       const dy = point ? speed(point.clientY - (bounds.bottom - edge)) - speed(bounds.top + edge - point.clientY) : 0;
       const dx = point ? speed(point.clientX - (bounds.right - edge)) - speed(bounds.left + edge - point.clientX) : 0;
-      if (!this.dragging || this.destroyed || !dx && !dy) { this.stopAutoScroll(); return; }
+      const textDrag = this.textDrag?.started ? this.textDrag : null;
+      if (!this.dragging && !textDrag || this.destroyed || !dx && !dy) { this.stopAutoScroll(); return; }
       const { scrollTop, scrollLeft } = this.host;
       this.host.scrollTop += dy; this.host.scrollLeft += dx;
-      if (this.host.scrollTop !== scrollTop || this.host.scrollLeft !== scrollLeft) this.dragTo(point);
+      // Dragged text shows where it would land in the text scrolled in; a selection drag takes that text in.
+      if (this.host.scrollTop !== scrollTop || this.host.scrollLeft !== scrollLeft) { if (textDrag) { textDrag.at = this.point(point, false); this.paint(); } else this.dragTo(point); }
     };
     if (!this.scrollTimer) { this.scrollTimer = setInterval(step, 30); step(); }
   }
@@ -1576,15 +1716,98 @@ export class CanvasEditor {
       if (Math.hypot(e.clientX - x, e.clientY - y) > 10) return;
       this.pointerDown(down, true);
     }
+    if (this.textDrag?.pointerId === e.pointerId) { this.endTextDrag(e); return; }
     const press = this.linkPress; this.linkPress = null;
     this.release(e);
     if (press?.pointerId === e.pointerId && Math.hypot(e.clientX - press.x, e.clientY - press.y) < 5 && !this.destroyed) this.linkClicked(press.range, e.clientX, e.clientY);
+  }
+  /** Follow a drag of the selected text: once the pointer has moved a little, a dashed caret shows where it would go. */
+  moveTextDrag(e) {
+    const drag = this.textDrag;
+    if (!drag.started && Math.hypot(e.clientX - drag.x, e.clientY - drag.y) < 4) return;
+    drag.started = true;
+    drag.at = this.point(e, false);
+    this.pages.style.cursor = e.altKey ? 'copy' : 'default';
+    this.paint();
+    // Near or past the top or bottom of the view, the pages scroll, as they do for a selection drag.
+    this.dragPoint = { clientX: e.clientX, clientY: e.clientY, altKey: e.altKey };
+    this.autoScroll();
+  }
+  /**
+   * Drop the dragged text where the pointer lifted, moved (Option or Alt: copied) as one undo step with its formatting,
+   * and selected there; dropped on itself, nothing changes. A press that did not move places the caret.
+   */
+  endTextDrag(e) {
+    const drag = this.textDrag;
+    this.textDrag = null; this.pages.style.cursor = ''; this.stopAutoScroll();
+    try { this.pages.releasePointerCapture(e.pointerId); } catch { /* released */ }
+    if (!drag.started) {
+      const position = this.point(e), link = this.pointLink;
+      this.model.select(position); this.preferredX = null;
+      this.syncInput(); this.paint(); this.onSelection();
+      // A click on a link in the selection is a click on the link, as anywhere else.
+      if (link && !this.destroyed) this.linkClicked(link, e.clientX, e.clientY);
+      return;
+    }
+    const at = this.point(e, false), [start, end] = drag.from;
+    if (drag.model !== this.model || drag.revision !== this.session.revision || at >= start && at <= end) { this.paint(); return; }
+    this.moveText(start, end, at, e.altKey);
+  }
+  /** Move (or `copy`) the text from `start` to `end` to `at`, with its formatting, as one undo step. */
+  moveText(start, end, at, copy = false) {
+    const objects = { token: this.clipboardToken, story: this.session.path };
+    this.model.select(start, end);
+    const fragment = copyFragment(this.model, { hidden: hiddenRun, objects });
+    if (!fragment) { this.paint(); return false; }
+    const length = fragment.paragraphs.map(p => p.text).join('\n').length;
+    // Whole words keep their spacing, as a word processor's smart cut and paste does: the space they leave behind
+    // goes with them, and where they land between words they get a space on each side.
+    const text = this.model.text, word = c => !!c && /[\p{L}\p{N}]/u.test(c);
+    const words = fragment.paragraphs.length === 1 && word(text[start]) && word(text[end - 1]) && !word(text[start - 1]) && !word(text[end]) && !this.model.trackChanges;
+    return this.execute(() => {
+      let target = at;
+      if (!copy) {
+        // The original goes first; text after it moves back by what left (with Track Changes on, nothing does).
+        let from = start, to = end;
+        if (words && text[from - 1] === ' ' && (to === text.length || /[\s.,;:!?)\]}”’]/u.test(text[to]))) from--;
+        else if (words && (from === 0 || text[from - 1] === '\n') && text[to] === ' ') to++;
+        const before = this.model.text.length;
+        this.model.select(from, to);
+        if (!this.model.replace('')) return false;
+        if (at >= to) target = at - (before - this.model.text.length);
+      }
+      this.model.select(target);
+      if (!pasteFragment(this.model, fragment, objects)) throw new Error('The text cannot be moved there.');
+      let after = this.model.selection.focus, first = after - length;
+      if (words) {
+        const now = this.model.text;
+        if (word(now[after])) { this.model.select(after); this.model.replace(' '); }
+        if (word(now[first - 1])) { this.model.select(first); this.model.replace(' '); first++; after++; }
+      }
+      this.model.select(first, after);
+      return true;
+    }, undefined, { label: copy ? 'Copy' : 'Move' });
+  }
+  /** The dashed caret where dragged text would be dropped. */
+  paintDropCaret(ctx, index) {
+    let caret;
+    try { caret = caretRect(this.selectionLayout, this.textDrag.at, 'forward', null); } catch { return; }
+    if (caret.page !== index) return;
+    // The insertion caret's blue, dashed, with a white surround that keeps it visible on dark shading.
+    const unit = 1 / (this.zoom || 1);
+    ctx.save();
+    ctx.beginPath(); ctx.moveTo(caret.x, caret.y); ctx.lineTo(caret.x, caret.y + caret.height);
+    ctx.strokeStyle = '#FFFFFF'; ctx.lineWidth = 3.5 * unit; ctx.stroke();
+    ctx.strokeStyle = '#375f91'; ctx.lineWidth = 1.5 * unit; ctx.setLineDash([3 * unit, 2 * unit]); ctx.stroke();
+    ctx.restore();
   }
   /** The end of a press on the pages: a picture move or resize, a drag, or a drag out of an empty control. */
   release(e) {
     if (this.imageInteraction.end(e)) return;
     const control = this.dragControl, wasDragging = this.dragging;
     this.dragging = false; this.dragControl = null; this.stopAutoScroll();
+    // The words or paragraph a double or triple press (and a drag from it) chose, while nothing else has changed it.
+    if (this.unit?.model === this.model) this.unit.chosen = { anchor: this.model.selection.anchor, focus: this.model.selection.focus, revision: this.session.revision };
     if (!wasDragging || !control || this.readOnly || this.composition ||
       control.model !== this.model || control.revision !== this.session.revision) return;
     const position = this.point(e);
@@ -1628,7 +1851,7 @@ export class CanvasEditor {
       else if (this.session.path !== null) this.editStory(null);
     }
     // The second press already took the word, and a drag since extended it word by word.
-    if (this.unit?.presses === 2 && this.unit.model === this.model && this.unit.path === this.session.path) return;
+    if ((this.unit?.presses === 2 || this.unit?.margin) && this.unit.model === this.model && this.unit.path === this.session.path) return;
     const pos = this.point(e);
     if (this.pointImage) {
       this.model.select(this.pointImage.start, this.pointImage.end); this.focus(); this.onSelection();
@@ -1658,7 +1881,7 @@ export class CanvasEditor {
     return side && side.offset !== position ? Math.min(position, side.offset) : position;
   }
   selectParagraph(e) {
-    if (this.unit?.presses === 3 && this.unit.model === this.model && this.unit.path === this.session.path) return;
+    if ((this.unit?.presses === 3 || this.unit?.margin) && this.unit.model === this.model && this.unit.path === this.session.path) return;
     const pos = this.point(e, false);
     if (this.pointImage) return;
     const { index, offset } = locate(this.model.paragraphs, pos), start = pos - offset;
@@ -1701,6 +1924,16 @@ export class CanvasEditor {
     if (!canvas) return null;
     return { page: caret.page, top: canvas.offsetTop + caret.y * this.zoom, left: canvas.offsetLeft + caret.x * this.zoom, height: caret.height * this.zoom,
       pageLeft: canvas.offsetLeft, pageRight: canvas.offsetLeft + canvas.offsetWidth, pageTop: canvas.offsetTop, textRight: (() => { const g = this.layout.pages[caret.page] || this.layout.page; return canvas.offsetLeft + (g.width - (g.right || 0)) * this.zoom; })() };
+  }
+  /** Where the caret is drawn in the window ({ left, top, height }), or null: for the chrome to keep clear of it. */
+  caretClientRect() {
+    if (!this.layout || this.accessible) return null;
+    try {
+      const caret = caretRect(this.selectionLayout, this.model.selection.focus, this.caretAffinity, this.caretPage), canvas = this.canvases?.[caret.page];
+      if (!canvas) return null;
+      const box = canvas.getBoundingClientRect();
+      return { left: box.left + caret.x * this.zoom, top: box.top + caret.y * this.zoom, height: caret.height * this.zoom };
+    } catch { return null; }
   }
   revealCaret() {
     if (this.accessible) { this.revealFieldCaret(); return; }
@@ -1946,7 +2179,9 @@ export class CanvasEditor {
       const columnBreak = () => this.model.tableContext ? splitTable(this.model) : this.model.insertColumnBreak();
       const pageBreak = () => this.model.tableContext ? insertTablePageBreak(this.model) : this.model.insertPageBreak();
       const capital = this.continuedCapital(...this.model.range);
-      const done = this.execute(() => mod ? (e.shiftKey ? columnBreak() : pageBreak()) : e.shiftKey ? this.model.replace('\v') : this.model.insertParagraph());
+      // A new paragraph or line break leaves the copy of the document for the next command's undo step to be
+      // made from its own, as a typed character does (StorySession typingCopy), rather than all of it at idle.
+      const done = this.execute(() => mod ? (e.shiftKey ? columnBreak() : pageBreak()) : e.shiftKey ? this.model.replace('\v') : this.model.insertParagraph(), undefined, mod ? undefined : { typing: true });
       // A new paragraph ends the word before it, which may be an address to link.
       if (done && !mod && !e.shiftKey) {
         const caret = this.model.selection.focus, place = locate(this.model.paragraphs, caret);
@@ -1963,6 +2198,11 @@ export class CanvasEditor {
     if (e.key === 'Escape') { if (this.session.path !== null) { e.preventDefault(); this.editStory(null); } else this.leaveWithTab = true; return; }
     if (e.key === 'Tab' && !mod && !e.altKey && !leaveWithTab && this.model.tableContext) {
       e.preventDefault(); this.tabCell(e.shiftKey ? -1 : 1); return;
+    }
+    // Tab moves between cells, so Option+Tab (Alt+Tab) types a tab character in one, as in Word for the Mac;
+    // the browser otherwise moved focus out of the document. Ctrl+Tab, Word's key on Windows, switches browser tabs.
+    if (e.key === 'Tab' && e.altKey && !mod && !e.shiftKey && !leaveWithTab && this.model.tableContext) {
+      e.preventDefault(); this.insertTab(); return;
     }
     // At the start of list items, Tab demotes them and Shift+Tab promotes them, as in other word processors.
     // At the top level Shift+Tab still moves focus on.
@@ -2148,13 +2388,33 @@ export class CanvasEditor {
       const { index, offset } = locate(this.model.paragraphs, start);
       single = paragraphText(this.model.paragraphs[index])[start !== end || direction > 0 ? offset : offset - 1] ?? '';
     }
+    const word = start !== end && this.doubleClickedWordRange();
     try {
       done = this.execute(() => {
         if (past !== null) this.model.select(past);
-        return this.model.delete(direction);
+        if (word) this.model.select(...word);
+        // Delete in the paragraph between two tables joins them (table-editing.js).
+        return this.model.delete(direction) || direction > 0 && joinTables(this.model);
       }, undefined, { record: !merge, typing: true, label: 'Typing' });
     } finally { this.deleting = false; }
     if (done) this.deleteGroup = { direction, at: this.model.selection.focus, revision: this.session.revision, path: this.session.path, single };
+  }
+  /**
+   * A word chosen with a double click (and left as it was), deleted with Backspace or Delete, goes with one of the spaces around it, as
+   * a word processor's smart delete does: deleting "two" from "one two three" left two spaces, and from "one two."
+   * a space before the full stop. Returns the range to delete, or null to delete the selection as it is. Text
+   * tracked as deleted stays in the document beside the spaces, so with Track Changes on the selection is kept.
+   */
+  doubleClickedWordRange() {
+    const [start, end] = this.model.range, unit = this.unit, { anchor, focus } = this.model.selection;
+    if (unit?.presses !== 2 || unit.model !== this.model || unit.path !== this.session.path || this.model.trackChanges || this.model.activeCellBlock) return null;
+    if (unit.chosen?.anchor !== anchor || unit.chosen.focus !== focus || unit.chosen.revision !== this.session.revision) return null;
+    const { index, offset } = locate(this.model.paragraphs, start), text = paragraphText(this.model.paragraphs[index]), to = offset + end - start;
+    if (to > text.length || !/^\S/u.test(text[offset]) || !/\S$/u.test(text[to - 1])) return null;
+    const before = text[offset - 1], after = text[to];
+    if (before === ' ' && (after === undefined || after === ' ' || /^[.,;:!?)\]}”’]$/u.test(after))) return [start - 1, end];
+    if (before === undefined && after === ' ') return [start, end + 1];
+    return null;
   }
   // Corrections and links made as you type (the host decides which, from its
   // settings). Each is its own undo step, so Undo takes back the change alone.
@@ -2395,7 +2655,21 @@ export class CanvasEditor {
     // A chart, diagram or other drawing the clipboard cannot carry would be lost on its way: a paste brings back
     // only its plain-text stand-in. Cut leaves it in place and says so, as the Edit menu offers no Cut for it.
     if (uncopied) { this.onError(new Error(UNCUT_MESSAGE)); return; }
-    this.deleteSelection();
+    this.cutSelection();
+  }
+  /**
+   * Remove what a cut takes: whole selected rows or columns of a table (or the whole table) go, as they do in
+   * Word, where Delete only empties them. Anything else, whole rows while Track Changes is on (removed rows
+   * cannot be tracked yet), and columns that cannot be removed (rows that end unevenly) go as deleteSelection
+   * removes them.
+   */
+  cutSelection() {
+    const model = this.model, block = model.activeCellBlock, table = block?.table;
+    const rows = !!block && wholeRows(table, block), columns = !!block && wholeColumns(table, block);
+    if (!rows && !columns || model.trackChanges && !model.trackingInternal) return this.deleteSelection();
+    const widths = (this.selectionLayout?.tableWidths || this.layout?.tableWidths)?.[table.id]?.map(w => Math.round(w * 15));
+    return this.execute(() => rows && columns ? deleteTable(model) : rows ? deleteRows(model) : deleteColumns(model, { widths }), null, undefined, true)
+      || this.deleteSelection();
   }
   /**
    * Remove the selection, as a cut or Clear Contents does: the selected text, or the contents of a block of table
@@ -2437,8 +2711,9 @@ export class CanvasEditor {
     const rowIndex = dy > 0 ? (merge?.endRow ?? context.rowIndex) + 1 : dy < 0 ? (merge?.rowIndex ?? context.rowIndex) - 1 : context.rowIndex;
     const column = dx > 0 ? context.end : dx < 0 ? context.column - 1 : context.column;
     const row = table.rows[rowIndex];
-    // Up from the first row or Down from the last goes on out of the table, as a text selection.
-    if (!row) return false;
+    // Up from the first row or Down from the last goes on out of the table, as a text selection. Above a table that
+    // starts the document there is nothing to reach: the block stays (the text selection's start is its first cell).
+    if (!row) return dy < 0 && model.paragraphs.findIndex(p => p.cellId && cellContext(model.tables, p.cellId).table === table) === 0;
     const beside = rowGrid(row).find(c => c.column <= column && column < c.end)?.cell;
     // A cell merged down from above is selected through the cell it continues.
     const target = beside && (verticalMerges(table).get(beside.id)?.cell || beside);
@@ -2492,10 +2767,14 @@ export class CanvasEditor {
         if (!rows.has(rowIndex)) rows.set(rowIndex, []);
         rows.get(rowIndex).push(text);
       }
-      return { text: [...rows.values()].map(cells => cells.join('\t')).join('\n'), html: '' };
+      // Whole rows (a whole table) also copy as a table, which a paste outside tables makes again.
+      const rowsCopy = copyTableRows(model, block, { token: this.clipboardToken });
+      return { text: [...rows.values()].map(cells => cells.join('\t')).join('\n'), html: rowsCopy ? tableFragmentHtml(rowsCopy) : '' };
     }
     const text = this.model.clipboardText(noteText, undefined, hiddenRun);
-    const picture = pictureHtml(this.model) || drawingHtml(this, text) || equationHtml(this.model);
+    // A floating picture also carries itself whole, for a paste in this document that keeps its wrapping and position.
+    const floating = this.model.selectedImage?.anchor && copiesPicture(this.model) ? copyFragment(this.model, { hidden: hiddenRun, objects: { token: this.clipboardToken, story: this.session.path } }) : null;
+    const picture = pictureHtml(this.model, { fragment: floating }) || drawingHtml(this, text) || equationHtml(this.model);
     // A chart, diagram or drawing the clipboard cannot carry copies as its text stand-in for other applications;
     // pasted here, that stand-in ("[Image]", its title) would only be stray text, so the paste says why it can't.
     if (!picture && this.model.selectedImage) return { text, html: uncopiedHtml(text), uncopied: true };
@@ -2507,7 +2786,7 @@ export class CanvasEditor {
   pasteData(text, html = '') {
     // U+FFFC stands in for an object (a picture, field or note) in other applications' text, and is
     // this document's own placeholder for one: pasted as a character it would be an invisible stray.
-    text = String(text || '').replace(/\ufffc/g, '');
+    text = withoutPastedControls(String(text || '').replace(/\ufffc/g, ''));
     // A header, footer or note takes no page or column break: pasted text keeps them as paragraph breaks.
     const breakless = !!this.model.refusesBreaks;
     if (breakless) text = text.replace(/[\f\u000e]/g, '\n');
@@ -2518,7 +2797,21 @@ export class CanvasEditor {
     if (!this.readOnly && !this.viewOnly && this.selectedFloatingDrawing) { this.model.select(this.model.range[1]); this.syncInput(); }
     // A picture copied here comes back as the picture, not as its plain-text stand-in.
     const picture = htmlPicture(html);
-    if (picture) { if (!this.readOnly && !this.viewOnly) this.insertImageFile(picture.file, picture).catch(error => this.onError(error)); return; }
+    if (picture) {
+      if (this.readOnly || this.viewOnly) return;
+      // A floating picture copied in this document and story comes back whole, wrapped and positioned as it was.
+      const whole = html.includes(FRAGMENT_ATTRIBUTE) && carriesFormatting(this.model) && !this.model.tableContext ? htmlFragment(html) : null;
+      const own = whole?.objects && whole.objects.token === this.clipboardToken && (whole.objects.story ?? null) === this.session.path;
+      const pasteWhole = () => {
+        if (!pasteFragment(this.model, whole, { token: this.clipboardToken, story: this.session.path })) return false;
+        // The copy ends up selected, as a pasted picture is.
+        const end = this.model.selection.focus; this.model.select(end - 1, end);
+        if (!this.model.selectedImage) this.model.select(end);
+        return true;
+      };
+      if (own && this.execute(pasteWhole, () => {}, undefined, true)) return;
+      this.insertImageFile(picture.file, picture).catch(error => this.onError(error)); return;
+    }
     // A shape, text box or group copied here comes back as the drawing.
     const drawing = htmlDrawing(html);
     if (drawing) { if (!this.readOnly && !this.viewOnly) pasteDrawing(this, drawing).catch(error => this.onError(error)); return; }
@@ -2526,7 +2819,14 @@ export class CanvasEditor {
     // An equation copied here comes back as the equation, not its linear text.
     const equation = htmlEquation(html);
     if (equation) { this.execute(() => this.model.insertMathRun(pastedEquation(this.model, equation))); return; }
-    const fragment = html && carriesFormatting(this.model) && !this.model.tableContext ? htmlFragment(html) : null;
+    // Whole table rows copied in this application come back as a table outside tables, and as rows in a table of their columns.
+    // Another application's table pastes as a table outside tables.
+    const foreign = !this.readOnly && !this.viewOnly && !this.model.tableContext ? foreignHtmlTable(html) : null;
+    const rows = !this.readOnly && !this.viewOnly ? htmlTableFragment(html) || (foreign && foreignTableRows(this.model, foreign)) : null;
+    let pastedRows = false;
+    if (rows) this.execute(() => (pastedRows = pasteTableRows(this.model, rows, { token: this.clipboardToken })), () => {}, undefined, true);
+    if (pastedRows) return;
+    const fragment = html && carriesFormatting(this.model) && !this.model.tableContext ? pastedFragment(htmlFragment(html)) : null;
     if (fragment && fragment.paragraphs.some(p => p.text) && formattedPasteFits(fragment) && !(breakless && fragment.paragraphs.some(p => /[\f\u000e]/.test(p.text))) && this.execute(() => pasteFragment(this.model, fragment, { token: this.clipboardToken, story: this.session.path }), () => {}, undefined, true)) return;
     if (text) this.execute(() => this.model.replace(text));
   }

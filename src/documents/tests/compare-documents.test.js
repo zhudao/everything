@@ -105,6 +105,17 @@ describe('compare documents', () => {
     expect(model.revisions.every(r => r.author === 'Rev')).toBe(true);
   });
 
+  it('marks the changed words of Chinese, Japanese and Thai text, which has no spaces between words', async () => {
+    // Each sentence was one word: changing one word in it marked the whole sentence deleted and inserted again.
+    expect(changes((await compare(p('我喜欢吃苹果。'), p('我喜欢吃香蕉。'))).model)).toEqual([['del', '苹果'], ['ins', '香蕉']]);
+    const japanese = changes((await compare(p('私は東京に行きます。'), p('私は大阪に行きます。'))).model);
+    expect(japanese.map(([, text]) => text).join('').length).toBeLessThan(8);
+    expect(japanese.some(([type, text]) => type === 'del' && text.includes('東京'))).toBe(true);
+    const thai = changes((await compare(p('ฉันชอบกินข้าว'), p('ฉันชอบกินผลไม้'))).model);
+    expect(thai.some(([, text]) => text.includes('ฉันชอบ'))).toBe(false);
+    expect(tokenize('Word 文字').map(t => t.text)).toEqual(['Word', ' ', '文字']);
+  });
+
   it('compares by character when asked', async () => {
     const { model } = await compare(p('colour'), p('color'), { granularity: 'character' });
     expect(changes(model)).toEqual([['del', 'u']]);
@@ -141,6 +152,19 @@ describe('compare documents', () => {
     const { model } = await compare(table([['A', 'B'], ['C', 'D']]) + p('End'), table([['A', 'B']]) + p('End'));
     expect(model.text).toBe('A\nB\nC\nD\nEnd');
     expect(changes(model)).toEqual([['del', 'C\nD\n']]);
+  });
+
+  // A column the revised table no longer has vanished from the comparison, which then reported no change at all.
+  it('keeps the text of a column only the original has, as deleted text in the row\'s last cell', async () => {
+    const { model, result } = await compare(p('x') + table([['a', 'b', 'c'], ['d', 'e', 'f']]) + p('y'), p('x') + table([['a', 'b'], ['d', 'e']]) + p('y'));
+    expect(model.text).toBe('x\na\nb\nc\nd\ne\nf\ny');
+    expect(changes(model)).toEqual([['del', '\nc'], ['del', '\nf']]);
+    expect(result.tables[0].rows.map(row => row.cells.length)).toEqual([2, 2]);
+    const cells = new Map(); for (const q of model.paragraphs.filter(x => x.cellId)) cells.set(q.cellId, [...(cells.get(q.cellId) || []), q.runs.map(r => r.text).join('')]);
+    expect([...cells.values()]).toEqual([['a'], ['b', 'c'], ['d'], ['e', 'f']]);
+    const accepted = new TextDocument(model.paragraphs, model.pageSettings, model.numbering, model.styles, model.tables, model.assets);
+    accepted.resolveRevisions(true);
+    expect(accepted.text).toBe('x\na\nb\nd\ne\ny');
   });
 
   it('accepts to the revised text and rejects to the original when the last paragraphs change', async () => {
@@ -207,6 +231,22 @@ it('keeps the comment, bookmark and field of a last paragraph that joins a remov
     expect(reopened.text).toBe(accept ? 'Intro\nBrand new close by Ada' : 'Intro\nZzz qqq\nXxx yyy');
     if (accept) { expect(anchored(reopened)).toEqual(['Brand new close by Ada']); expect(fields(reopened)).toEqual([['AUTHOR', 'Ada']]); }
   }
+});
+
+// The other document's text copied in where a comment started went inside it: in Compare a comment on "red", which
+// replaced "brown", came out on "brownred". A comment stays on its own words, and a point comment stays a point.
+it.each(['compare', 'combine'])('%s leaves a comment on its own words beside copied text', async mode => {
+  const original = await open(docx(p('The quick brown fox.') + p('Last one here.'))), revised = await open(docx(p('The quick red fox.') + p('Last one there.')));
+  const [base, other] = mode === 'compare' ? [revised, original] : [original, revised];
+  const doc = new TextDocument(base.paragraphs, base.pageSettings, base.numbering, base.styles, base.tables, base.assets, { comments: [] });
+  const word = mode === 'compare' ? ['red', 'there'] : ['brown', 'here'], at = w => doc.text.indexOf(w);
+  doc.addComment({ author: 'A', text: 'one', range: [at(word[0]), at(word[0]) + word[0].length] });
+  doc.addComment({ author: 'A', text: 'two', range: [at(word[1]), at(word[1]) + word[1].length] });
+  doc.addComment({ author: 'A', text: 'point', range: [at(word[1]), at(word[1])] });
+  const result = mergeDocuments({ paragraphs: doc.paragraphs, tables: base.tables }, { paragraphs: other.paragraphs, tables: other.tables }, { mode, author: 'Rev' });
+  const model = new TextDocument(result.paragraphs, base.pageSettings, base.numbering, base.styles, result.tables, base.assets, { comments: doc.comments });
+  expect(model.text).toBe('The quick brownred fox.\nLast one herethere.');
+  expect(model.commentList.map(c => [c.text, model.text.slice(c.start, c.end)]).sort()).toEqual([['one', word[0]], ['point', ''], ['two', word[1]]]);
 });
 
 describe('combine documents', () => {

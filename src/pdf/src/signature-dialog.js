@@ -13,6 +13,8 @@ import { MAX_IMAGE_SIZE, isPng, isJpeg } from './core/document.js';
 import { normalizeJpegPadding } from './core/jpeg.js';
 
 const STORAGE_KEY = 'pdf-editor:signatures';
+/** How many drawn and typed signatures are kept, on the device and in the list alike. */
+const MAX_SAVED = 8;
 const FONT_FAMILY = 'Great Vibes';
 /** Signatures made in this session; kept on the device only when the person asks. */
 let saved = null;
@@ -39,6 +41,8 @@ function loadSaved() {
             item.strokes.some((stroke) => stroke.length)) ||
           (item?.type === 'type' && typeof item.text === 'string'),
       );
+    // A list from before the limit keeps its newest few.
+    saved = saved.slice(-MAX_SAVED);
   } catch {
     /* Remembered signatures are optional. */
   }
@@ -57,7 +61,7 @@ function persist(remember) {
     else
       localStorage.setItem(
         STORAGE_KEY,
-        JSON.stringify({ items: saved.filter((item) => item.type !== 'image').slice(-8) }),
+        JSON.stringify({ items: saved.filter((item) => item.type !== 'image').slice(-MAX_SAVED) }),
       );
   } catch {
     /* Storage can be full or blocked; the session copy still works. */
@@ -95,6 +99,35 @@ async function decodeImage(blob) {
       URL.revokeObjectURL(url);
     }
   }
+}
+/**
+ * The longest side, in pixels, an uploaded signature is kept at: about 340 dpi at the largest
+ * size a signature is placed at, and still about 180 dpi stretched across a letter page. A phone
+ * photo of a signature otherwise went into the PDF at its full 12 megapixels.
+ */
+export const SIGNATURE_PIXELS = 1500;
+/**
+ * An uploaded signature's bytes at no more than SIGNATURE_PIXELS on its longest side, from the
+ * decoded (and so already upright) picture: a PNG stays a PNG with its transparency, a JPEG a
+ * JPEG. A picture already that small, or one the browser cannot make smaller, is kept as it is.
+ */
+async function signatureBytes(bytes, image) {
+  const width = image.naturalWidth || image.width,
+    height = image.naturalHeight || image.height;
+  const scale = SIGNATURE_PIXELS / Math.max(width, height);
+  if (!(scale < 1)) return bytes;
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.max(1, Math.round(width * scale));
+  canvas.height = Math.max(1, Math.round(height * scale));
+  const context = canvas.getContext('2d');
+  context.imageSmoothingQuality = 'high';
+  context.drawImage(image, 0, 0, canvas.width, canvas.height);
+  const png = isPng(bytes);
+  const blob = await new Promise((resolve) =>
+    canvas.toBlob(resolve, png ? 'image/png' : 'image/jpeg', 0.92),
+  );
+  const smaller = blob && new Uint8Array(await blob.arrayBuffer());
+  return smaller?.length && smaller.length < bytes.length ? smaller : bytes;
 }
 /** Paint a signature preview; `frame` preserves the drawing pad's coordinate space on resize. */
 export function paintSignature(
@@ -246,7 +279,10 @@ export function signatureDialog({ signal } = {}) {
     pad.addEventListener('pointermove', (e) => {
       // Touch contacts receive implicit capture, including ignored secondary fingers.
       if (pending || current?.id !== e.pointerId || !pad.hasPointerCapture(e.pointerId)) return;
-      current.points.push(point(e));
+      // A busy page or a fast pen hands over several samples in one event; each is part of the
+      // stroke, or a quick zigzag would be drawn as a straight line through some of its turns.
+      const samples = e.getCoalescedEvents?.() || [];
+      for (const sample of samples.length ? samples : [e]) current.points.push(point(sample));
       repaint();
     });
     const endStroke = (e) => {
@@ -284,7 +320,11 @@ export function signatureDialog({ signal } = {}) {
       'aria-label': 'Signature text',
       maxlength: MAX_SIGNATURE_TEXT,
       autocomplete: 'name',
-      oninput: () => repaint(),
+      'aria-describedby': 'signature-type-status',
+      oninput: () => {
+        repaint();
+        checkTyped();
+      },
       // Enter places the typed signature, as Enter confirms a name typed in other dialogs.
       onkeydown: (e) => {
         if (e.key !== 'Enter' || e.isComposing || e.repeat) return;
@@ -292,6 +332,36 @@ export function signatureDialog({ signal } = {}) {
         place();
       },
     });
+    // A letter the script font lacks would show in the browser's own font in the preview and
+    // then be refused on placing; it is named as it is typed instead.
+    const typeStatus = el('p', {
+      class: 'signature-type-status',
+      id: 'signature-type-status',
+      role: 'status',
+    });
+    let typedCheck = 0;
+    async function checkTyped() {
+      const check = ++typedCheck,
+        text = nameInput.value.trim();
+      let message = '';
+      if (text) {
+        let tools;
+        try {
+          tools = await Promise.all([import('@pdf-lib/fontkit'), loadScriptFont()]);
+        } catch {
+          // The font is fetched again on placing, which reports a failure itself.
+        }
+        if (check !== typedCheck || !dialog.open) return;
+        try {
+          if (tools) typedOutline(tools[0].default, tools[1], text);
+        } catch (error) {
+          message = error.message;
+        }
+      }
+      typeStatus.textContent = message;
+      if (message) nameInput.setAttribute('aria-invalid', 'true');
+      else nameInput.removeAttribute('aria-invalid');
+    }
     const typePreview = el('canvas', {
       class: 'signature-preview',
       role: 'img',
@@ -330,7 +400,12 @@ export function signatureDialog({ signal } = {}) {
           image.close?.();
           return;
         }
-        upload = { type: 'image', bytes, image };
+        const placed = await signatureBytes(bytes, image);
+        if (!current()) {
+          image.close?.();
+          return;
+        }
+        upload = { type: 'image', bytes: placed, image };
         uploadPreview.hidden = false;
         repaint();
       } catch (error) {
@@ -403,6 +478,9 @@ export function signatureDialog({ signal } = {}) {
         if (!remember.checked || remembered) persist(remember.checked && items.length > 0);
       },
     });
+    // One color for drawn and typed signatures, shown on whichever of the two tabs is open.
+    const colorLabel = el('label', {}, 'Color ', color);
+    const typeRow = el('div', { class: 'signature-row' });
     const tabs = [
       ['draw', 'Draw'],
       ['type', 'Type'],
@@ -418,7 +496,7 @@ export function signatureDialog({ signal } = {}) {
           'aria-labelledby': 'signature-tab-draw',
         },
         el('div', { class: 'signature-pad-wrap' }, pad, padHint),
-        el('div', { class: 'signature-row' }, el('label', {}, 'Color ', color), clear),
+        el('div', { class: 'signature-row' }, colorLabel, clear),
       ),
       type: el(
         'div',
@@ -430,7 +508,9 @@ export function signatureDialog({ signal } = {}) {
           hidden: true,
         },
         nameInput,
+        typeStatus,
         typePreview,
+        typeRow,
       ),
       upload: el(
         'div',
@@ -491,6 +571,8 @@ export function signatureDialog({ signal } = {}) {
         b.tabIndex = key === id ? 0 : -1;
       });
       Object.entries(panels).forEach(([key, panel]) => (panel.hidden = key !== id));
+      if (id === 'type') typeRow.append(colorLabel);
+      else if (id === 'draw') panels.draw.querySelector('.signature-row').prepend(colorLabel);
       if (id === 'type') ensureFontFace()?.then(() => repaint());
       repaint();
       if (focus && id === 'type') nameInput.focus();
@@ -563,6 +645,7 @@ export function signatureDialog({ signal } = {}) {
           // Older saved signatures can contain text the PDF font cannot draw either.
           nameInput.value = signature.text;
           selectTab('type', { focus: false });
+          checkTyped();
           toast(error.message, { error: true });
           return;
         } finally {
@@ -585,8 +668,11 @@ export function signatureDialog({ signal } = {}) {
         !items.some(
           (item) => JSON.stringify({ ...item, image: undefined, bytes: undefined }) === key,
         )
-      )
+      ) {
         items.push(signature);
+        // The list holds what a reload brings back: the newest few.
+        items.splice(0, Math.max(0, items.length - MAX_SAVED));
+      }
       persist(keep);
       result = { signature, hex, outline };
       dialog.close();

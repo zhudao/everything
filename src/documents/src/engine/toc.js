@@ -50,7 +50,10 @@ export function parseTocInstruction(instruction) {
     else if (t === '\\l') options.tcLevels = range(take()) || [1, 9];
     else if (t === '\\b') options.bookmark = take();
     else if (t === '\\t') {
-      const list = (take() || '').split(/[,;]/).map(s => s.trim());
+      // Names and levels are separated by the list separator: a comma, or a semicolon where the writer's locale uses
+      // one (and where a style's name holds a comma, tocInstruction).
+      const value = take() || '', pairs = list => list.length % 2 === 0 && list.every((item, k) => k % 2 === 0 || /^[1-9]$/.test(item));
+      const list = [',', ';'].map(separator => value.split(separator).map(s => s.trim())).find(pairs) || value.split(/[,;]/).map(s => s.trim());
       for (let k = 0; k + 1 < list.length; k += 2) if (list[k] && /^[1-9]$/.test(list[k + 1])) options.styles.push({ name: list[k], level: Number(list[k + 1]) });
     } else options.extra.push(arg !== null ? `${t} ${quote(take())}` : t);
   }
@@ -61,7 +64,11 @@ export function parseTocInstruction(instruction) {
 export function tocInstruction(options = {}) {
   const parts = ['TOC'];
   if (options.headingRange) parts.push(`\\o ${quote(options.headingRange.join('-'))}`);
-  if (options.styles?.length) parts.push(`\\t ${quote(options.styles.map(s => `${s.name},${s.level}`).join(','))}`);
+  if (options.styles?.length) {
+    // A style named with a comma ("Heading, Appendix") would split in two: the list is then separated by semicolons.
+    const separator = options.styles.some(s => s.name.includes(',')) ? ';' : ',';
+    parts.push(`\\t ${quote(options.styles.map(s => `${s.name}${separator}${s.level}`).join(separator))}`);
+  }
   if (options.caption) parts.push(`\\c ${quote(options.caption)}`);
   if (options.captionNoLabel) parts.push(`\\a ${quote(options.captionNoLabel)}`);
   if (options.tcIdentifier) parts.push(`\\f ${options.tcIdentifier}`);
@@ -141,6 +148,9 @@ export function tocEntries(doc, options) {
     const size = length(p), text = clean(p.runs.map(r => r.image ? '' : r.text).join(''));
     if (text && !inside(at) && inScope(at)) {
       let level = null;
+      // A paragraph moved on with Ctrl+Enter starts with its page (or column) break, which ends the page before: the
+      // entry, and the bookmark its page number refers to, start after it.
+      const start = at + /^[\f\u000e]*/.exec(p.runs.map(r => r.text).join(''))[0].length;
       if (sequences) {
         const seq = sequences.get(p.id);
         if (seq) {
@@ -151,7 +161,7 @@ export function tocEntries(doc, options) {
             const tail = p.runs.map(r => r.text).join('').slice(seq.end - at);
             shown = clean(tail.replace(/^\s*[:.\-–—]?\s*/, '')) || text;
           }
-          entries.push({ level, text: shown, start: at, end: at + size, paragraphId: p.id });
+          entries.push({ level, text: shown, start, end: at + size, paragraphId: p.id });
         }
       } else {
         const outline = p.format?.outlineLevel ?? 9;
@@ -162,7 +172,7 @@ export function tocEntries(doc, options) {
           if (outline + 1 >= low && outline + 1 <= high) level = outline + 1;
         }
         // A numbered heading's entry starts with its number, as Word's tables show it.
-        if (level) entries.push({ level, text, start: at, end: at + size, paragraphId: p.id, number: p.list ? (numbers ??= entryNumbers(doc))(index) : null });
+        if (level) entries.push({ level, text, start, end: at + size, paragraphId: p.id, number: p.list ? (numbers ??= entryNumbers(doc))(index) : null });
       }
     }
     at += size + 1;

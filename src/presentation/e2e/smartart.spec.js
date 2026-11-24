@@ -4,7 +4,7 @@
 import { test, expect } from "@playwright/test";
 import { readFile } from "node:fs/promises";
 import { unzipSync } from "fflate";
-import { P, parseDeck } from "../src/model.js";
+import { P, createDeck, parseDeck } from "../src/model.js";
 
 test.setTimeout(120_000);
 
@@ -127,6 +127,77 @@ test("typing in a new graphic's Text Pane replaces the sample text", async ({
   ]);
 });
 
+test("a click on the sample text in the item being typed in chooses all of it", async ({
+  page,
+}) => {
+  await start(page);
+  await insertGraphic(page, "Process", "Chevron Flow");
+  const first = page.locator(".smartart-outline-input").first();
+  await expect(first).toBeFocused();
+  await first.click();
+  await page.keyboard.type("Plan");
+  await expect(first).toHaveValue("Plan");
+});
+
+test("Backspace takes away an empty first item, and Delete joins the next item on", async ({
+  page,
+}) => {
+  await start(page);
+  await insertGraphic(page, "Process", "Chevron Flow");
+  const inputs = page.locator(".smartart-outline-input");
+  const count = await inputs.count();
+  await expect(inputs.first()).toBeFocused();
+  await page.keyboard.type("Plan");
+  await page.keyboard.press("ArrowDown");
+  await page.keyboard.type("Build");
+  await inputs.first().click();
+  await page.keyboard.press("ControlOrMeta+a");
+  await page.keyboard.press("Backspace");
+  await page.keyboard.press("Backspace");
+  await expect(inputs).toHaveCount(count - 1);
+  await expect(inputs.first()).toHaveValue("Build");
+  await expect(inputs.first()).toBeFocused();
+  await page.keyboard.press("End");
+  await page.keyboard.press("Delete");
+  await expect(inputs).toHaveCount(count - 2);
+  await expect(inputs.first()).toHaveValue("Build[Text]");
+  await page.waitForTimeout(600);
+  const { model } = await download(page);
+  expect(model.items[0].text).toBe("Build[Text]");
+  expect(model.items).toHaveLength(count - 2);
+});
+
+test("Ctrl+Z and Ctrl+Y in the Text Pane undo and redo its edits, Enter and Tab included", async ({
+  page,
+}) => {
+  await start(page);
+  await insertGraphic(page, "Process", "Chevron Flow");
+  const inputs = page.locator(".smartart-outline-input");
+  const outline = () =>
+    inputs.evaluateAll((list) =>
+      list.map((i) => `${i.closest("li").dataset.level}:${i.value}`),
+    );
+  const before = await outline();
+  await expect(inputs.first()).toBeFocused();
+  await page.keyboard.type("Plan");
+  // Each change lands as its own step once the last has settled.
+  await page.waitForTimeout(1300);
+  await page.keyboard.press("Enter");
+  await page.waitForTimeout(1300);
+  await page.keyboard.type("Scope");
+  await page.keyboard.press("Tab");
+  await expect(inputs.nth(1)).toHaveValue("Scope");
+  await expect.poll(outline).toContain("1:Scope");
+  await page.keyboard.press("ControlOrMeta+z");
+  await expect.poll(outline).not.toContain("1:Scope");
+  await page.keyboard.press("ControlOrMeta+z");
+  await expect.poll(outline).toEqual(["0:Plan", ...before.slice(1)]);
+  await expect(page.locator(".smartart-pane input:focus")).toHaveCount(1);
+  await page.keyboard.press("ControlOrMeta+y");
+  await expect.poll(outline).not.toEqual(["0:Plan", ...before.slice(1)]);
+  await expect(page.locator(".smartart-pane input:focus")).toHaveCount(1);
+});
+
 test("SmartArt Design adds and moves shapes, and changes layout, colors and style", async ({
   page,
 }) => {
@@ -210,6 +281,89 @@ test("bulleted text converts to a graphic, and a graphic back to text", async ({
 
 // Find & Replace looked only through text boxes and tables, so it reported no
 // match for text that a SmartArt graphic showed on the slide.
+test("a graphic turned into text and back keeps its place behind other objects", async ({
+  page,
+}) => {
+  const pres = createDeck("blank");
+  const slide = P.getSlides(pres)[0];
+  P.addSlideSmartArt(slide, {
+    model: {
+      layout: "arrow-steps",
+      items: [
+        { text: "Plan", level: 0 },
+        { text: "Build", level: 0 },
+      ],
+      colors: "accent2",
+      style: "subtle",
+    },
+    x: P.inches(1),
+    y: P.inches(1),
+    w: P.inches(6),
+    h: P.inches(3),
+  });
+  P.addSlideShape(slide, {
+    preset: "rect",
+    x: P.inches(4),
+    y: P.inches(2.5),
+    w: P.inches(4),
+    h: P.inches(3),
+    name: "Cover",
+  });
+  // A comment on the graphic goes with it to what it becomes; it was left
+  // on a deleted object.
+  P.setSlideCommentThreads(slide, [
+    {
+      author: { name: "Grace" },
+      text: "Add a step",
+      shapeId: String(P.getShapeId(P.getSlideShapes(slide)[0])),
+    },
+  ]);
+  const commentOn = (shapes) =>
+    P.getSlideCommentThreads(P.getShapeSlide(shapes[0]))[0].shapeId;
+  await start(page);
+  await page.goto("/#/home");
+  const choose = page.waitForEvent("filechooser");
+  await page.getByRole("button", { name: "Import PPTX", exact: true }).click();
+  await (
+    await choose
+  ).setFiles({
+    name: "Graphic.pptx",
+    mimeType:
+      "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    buffer: Buffer.from(await P.savePresentation(pres)),
+  });
+  const hit = page.locator(".object-hit").first();
+  await expect(hit).toBeVisible();
+  const box = await hit.boundingBox();
+  await page.mouse.click(box.x + 10, box.y + 10);
+  await ribbonCommand(page, "SmartArt Design", "smartart-convert");
+  await page.getByRole("menuitem", { name: "Convert to Text" }).click();
+  await page.waitForTimeout(300);
+  let { shapes } = await download(page);
+  expect(shapes.map((s) => P.getShapeName(s))).toEqual([
+    expect.stringMatching(/^TextBox/),
+    "Cover",
+  ]);
+  expect(commentOn(shapes)).toBe(String(P.getShapeId(shapes[0])));
+  // The text box is selected; Convert to SmartArt turns it back.
+  await ribbonCommand(page, "Home", "convert-smartart");
+  await page.locator(".chart-menu-choice").first().click();
+  await expect(page.locator(".smartart-pane")).toBeVisible();
+  await page.waitForTimeout(300);
+  ({ shapes } = await download(page));
+  expect(shapes.map((s) => P.getShapeName(s))).toEqual([
+    expect.stringMatching(/^SmartArt/),
+    "Cover",
+  ]);
+  expect(commentOn(shapes)).toBe(String(P.getShapeId(shapes[0])));
+  await ribbonCommand(page, "SmartArt Design", "smartart-convert");
+  await page.getByRole("menuitem", { name: "Convert to Shapes" }).click();
+  await page.waitForTimeout(300);
+  ({ shapes } = await download(page));
+  expect(P.getShapeKind(shapes[0])).toBe("group");
+  expect(commentOn(shapes)).toBe(String(P.getShapeId(shapes[0])));
+});
+
 test("Find and Replace reach a graphic's text, Replace All in one step", async ({
   page,
 }) => {
@@ -243,4 +397,77 @@ test("Find and Replace reach a graphic's text, Replace All in one step", async (
   await page.keyboard.press("ControlOrMeta+z");
   ({ model } = await download(page));
   expect(model.items[1].text).toBe("Budget sign-off");
+});
+
+// Closing the Text Pane from the keyboard dropped the focus to the page.
+test("closing the Text Pane with Escape puts the keyboard back on the graphic", async ({
+  page,
+}) => {
+  await start(page);
+  await insertGraphic(page, "Process", "Chevron Flow");
+  await expect(page.locator(".smartart-outline-input").first()).toBeFocused();
+  await page.keyboard.press("Escape");
+  await expect(page.locator(".smartart-pane")).toHaveCount(0);
+  await expect(
+    page.locator("#slide-canvas .object-hit.selected"),
+  ).toBeFocused();
+});
+
+// Lines pasted into the Text Pane ran together in one item.
+test("lines pasted into the Text Pane become items of their own", async ({
+  page,
+}) => {
+  await start(page);
+  await insertGraphic(page, "Process", "Chevron Flow");
+  const inputs = page.locator(".smartart-outline-input");
+  await expect(inputs.first()).toBeFocused();
+  await inputs.first().evaluate((input) => {
+    const data = new DataTransfer();
+    data.setData("text/plain", "Plan\nBuild\n\tTest\nShip\n");
+    input.dispatchEvent(
+      new ClipboardEvent("paste", {
+        clipboardData: data,
+        bubbles: true,
+        cancelable: true,
+      }),
+    );
+  });
+  await expect(inputs.nth(3)).toBeFocused();
+  await page.keyboard.type("ped");
+  await page.waitForTimeout(600);
+  const { model } = await download(page);
+  expect(model.items.slice(0, 4)).toEqual([
+    { text: "Plan", level: 0 },
+    { text: "Build", level: 0 },
+    { text: "Test", level: 1 },
+    { text: "Shipped", level: 0 },
+  ]);
+});
+
+// Scaling the slides to a new size shrank a graphic's frame but left its
+// shapes drawn at the old size, running off the frame and the slide.
+test("a graphic scaled with the slide size is drawn within its frame", async ({
+  page,
+}) => {
+  await start(page);
+  await insertGraphic(page, "Process", "Chevron Flow");
+  await page.keyboard.press("Escape");
+  await ribbonCommand(page, "Design", "slide-size");
+  await page.getByRole("menuitemcheckbox", { name: "Standard (4:3)" }).click();
+  const dialog = page.getByRole("dialog", { name: "Slide size" });
+  await dialog.getByRole("button", { name: "Apply", exact: true }).click();
+  await expect(dialog).toBeHidden();
+  await page.waitForTimeout(300);
+  const { bytes, graphic } = await download(page);
+  const frame = P.getShapeBounds(graphic);
+  const files = unzipSync(bytes);
+  const drawing = Object.keys(files).find((n) =>
+    /^ppt\/diagrams\/drawing\d*\.xml$/.test(n),
+  );
+  const xml = new TextDecoder().decode(files[drawing]);
+  const rights = [
+    ...xml.matchAll(/<a:off x="(-?\d+)" y="-?\d+"\/><a:ext cx="(\d+)"/g),
+  ].map((m) => Number(m[1]) + Number(m[2]));
+  expect(rights.length).toBeGreaterThan(0);
+  expect(Math.max(...rights)).toBeLessThanOrEqual(frame.w + 1);
 });

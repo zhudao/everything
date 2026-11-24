@@ -157,7 +157,7 @@ test('inserting an unresolved named link cannot target an unrelated existing pag
       ),
     );
   await openPdf(page, target);
-  const jump = page.getByRole('button', { name: 'Link to another page', exact: true });
+  const jump = page.getByRole('button', { name: /^Link to (another page|page \d+)$/ });
   await expect(jump).toBeVisible();
   const chooser = page.waitForEvent('filechooser');
   await menu(page, 'Insert pages from PDF…');
@@ -403,7 +403,10 @@ test('inserting pages preserves a form draft entered while the source file is be
   await expect(page.getByLabel('Name (on page)', { exact: true })).toHaveValue(
     'Updated while reading',
   );
+  // Redo takes the reader to the inserted page again, as the insertion did.
   await page.getByRole('button', { name: 'Redo', exact: true }).click();
+  await expect(page.locator('.page-caption')).toHaveText('Page 2 of 2');
+  await page.getByRole('button', { name: 'Previous page', exact: true }).click();
   await expect(page.locator('.page-caption')).toHaveText('Page 1 of 2');
   await expect(page.getByLabel('Name (on page)', { exact: true })).toHaveValue(
     'Updated while reading',

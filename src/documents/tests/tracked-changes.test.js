@@ -293,6 +293,28 @@ describe('tracked change edge cases', () => {
     expect(summary(model)).toEqual([['ins', 'Ada', 'one '], ['del', 'Grace', 'two '], ['ins', 'Ada', 'three']]);
   });
 
+  it('accepts another reviewer\'s formatting of an insertion with Accept All', async () => {
+    // Ada inserted "bold"; Grace then made it bold (w:rPrChange inside w:ins), as Word records it.
+    const files = unzipSync(trackedDocx({ track: false }));
+    files['word/document.xml'] = strToU8(`<w:document xmlns:w="${W}"><w:body><w:p><w:r><w:t xml:space="preserve">A </w:t></w:r><w:ins w:id="1" w:author="Ada" w:date="2026-01-01T00:00:00Z"><w:r><w:rPr><w:b/><w:rPrChange w:id="2" w:author="Grace" w:date="2026-01-02T00:00:00Z"><w:rPr/></w:rPrChange></w:rPr><w:t>bold</w:t></w:r></w:ins><w:r><w:t xml:space="preserve"> B</w:t></w:r></w:p><w:sectPr/></w:body></w:document>`);
+    const source = zipSync(files);
+    // Accept All left Grace's change behind: the document still held a change, and the file a w:rPrChange.
+    let { pkg, model } = await open(source);
+    model.resolveRevisions(true);
+    expect(model.revisions).toEqual([]);
+    expect(model.paragraphs[0].runs.find(r => r.text.includes('bold')).bold).toBe(true);
+    const xml = strFromU8(unzipSync(await save(pkg, model))['word/document.xml']);
+    expect(xml).not.toMatch(/<w:(ins|rPrChange) /);
+    expect(xml).toMatch(/<w:b\/>/);
+    // Accepting only Ada's changes, or the insertion alone, leaves Grace's formatting a change of its own.
+    ({ model } = await open(source));
+    model.resolveRevisions(true, undefined, undefined, { only: change => change.author === 'Ada' });
+    expect(summary(model)).toEqual([['format', 'Grace', 'bold']]);
+    ({ model } = await open(source));
+    model.resolveRevisions(true, 3, 3);
+    expect(summary(model)).toEqual([['format', 'Grace', 'bold']]);
+  });
+
   it('accepts a deleted paragraph mark that cannot join the table after it', async () => {
     const cell = t => `<w:tc><w:tcPr><w:tcW w:w="2000" w:type="dxa"/></w:tcPr><w:p><w:pPr><w:rPr><w:del w:id="5" w:author="Ada" w:date="2026-01-01T00:00:00Z"/></w:rPr></w:pPr><w:r><w:t>${t}</w:t></w:r></w:p></w:tc>`;
     const files = unzipSync(trackedDocx({ track: false }));
@@ -593,19 +615,24 @@ describe('revision UTC times', () => {
     expect(pkg.readOnly).toBeFalsy();
     expect(summary(model)).toEqual([['ins', 'Ada', 'added'], ['del', 'Grace', ' removed'], ['format', 'Grace', ' end.'], ['ins', 'Ada', '\n', '¶']]);
     expect(unzipSync(await save(pkg, model))).toEqual(unzipSync(source));
-    // Editing the paragraph rewrites it; each recorded revision keeps its UTC time, new ones have none.
+    // Editing the paragraph rewrites it; each recorded revision keeps its UTC time, and the new one records its own.
     model.trackChanges = true; model.select(0); model.replace('New ');
     const saved = await save(pkg, model);
-    expect(utcTimes(saved)).toEqual(['del', 'ins', 'ins', 'rPrChange']);
+    expect(utcTimes(saved)).toEqual(['del', 'ins', 'ins', 'ins', 'rPrChange']);
     const reopened = await open(saved);
     expect(reopened.pkg.readOnly).toBeFalsy();
     expect(reopened.model.revisions.find(r => r.type === 'ins' && reopened.model.text.slice(r.start, r.end) === 'added')).toBeTruthy();
   });
-  it('leaves out the UTC time when the part does not declare it ignorable', async () => {
+  // Word reads w:date as local time and shows the UTC time when there is one: a part that declared the namespace but
+  // not as ignorable lost its UTC times. It is now listed in mc:Ignorable, and the times are kept.
+  it('declares the UTC time ignorable where the part does not, and keeps the times', async () => {
     const { pkg, model } = await open(utcDocx({ ignorable: false }));
     expect(pkg.readOnly).toBeFalsy();
     model.select(0); model.replace('New ');
-    expect(utcTimes(await save(pkg, model))).toEqual([]);
+    const saved = await save(pkg, model);
+    expect(utcTimes(saved)).toEqual(['del', 'ins', 'ins', 'rPrChange']);
+    expect(strFromU8(unzipSync(saved)['word/document.xml'])).toMatch(/^<w:document [^>]*mc:Ignorable="w16du"/);
+    expect((await open(saved)).model.revisions.map(r => r.dateUtc)).toEqual(['2026-01-01T08:00:00Z', '2026-01-01T08:00:00Z', '2026-01-01T08:00:00Z', '2026-01-01T08:00:00Z']);
   });
 });
 

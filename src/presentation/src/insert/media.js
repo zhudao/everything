@@ -3,6 +3,7 @@
 // volume, how they start in a slide show, looping, poster frames and
 // bookmarks.
 import { el, dialog, toast, icon, iconButton } from "../ui.js";
+import { checkPackageSize, packageSize } from "../model.js";
 import {
   bytesUrl,
   canvasPng,
@@ -133,7 +134,7 @@ export function createMediaFeatures(ctx) {
   }
 
   async function insertMediaFile(file, kindWanted) {
-    const type = mediaType(file);
+    let type = mediaType(file);
     if (!type || (kindWanted && type.kind !== kindWanted))
       throw new Error(
         kindWanted === "audio"
@@ -144,6 +145,9 @@ export function createMediaFeatures(ctx) {
       throw new Error(
         "Choose a file smaller than 150 MB; large media makes the presentation slow to save and share.",
       );
+    // Said before the file is read, rather than once it is on the slide.
+    const size = packageSize(ctx.pres());
+    checkPackageSize(size + file.size, size);
     const data = await fileBytes(file);
     const url = bytesUrl(data, type.contentType);
     try {
@@ -151,6 +155,15 @@ export function createMediaFeatures(ctx) {
       const durationMs = Number.isFinite(media.duration)
         ? Math.round(media.duration * 1000)
         : 0;
+      // A video file holding only sound (a recorded talk, a podcast) has no
+      // picture to show: placed as a video it was an empty, invisible box.
+      // It goes in as a sound, with the speaker to click.
+      if (type.kind === "video" && !media.videoWidth)
+        type = {
+          ...type,
+          kind: "audio",
+          contentType: type.extension === "webm" ? "audio/webm" : "audio/mp4",
+        };
       let poster, width, height;
       if (type.kind === "video") {
         ({ png: poster, width, height } = await videoFrame(media, 0));
@@ -770,14 +783,19 @@ export function createMediaFeatures(ctx) {
         const at = p.element.currentTime * 1000 - media.options.trimStart;
         time.textContent = formatTime(at);
         if (total > 0) scrub.value = String(Math.round((at / total) * 1000));
-        // Stop at the trimmed end.
+        // Stop at the trimmed end, or play from the start again when
+        // looping (the media may have stopped at its own end by now).
         if (
           p.element.currentTime * 1000 >=
           (durationOf(obj) || Infinity) - media.options.trimEnd
         ) {
-          p.element.pause();
-          if (!media.options.loop) ctx.refreshCanvas();
-          else p.element.currentTime = media.options.trimStart / 1000;
+          if (media.options.loop) {
+            p.element.currentTime = media.options.trimStart / 1000;
+            if (p.element.paused) p.element.play().catch(() => {});
+          } else {
+            p.element.pause();
+            ctx.refreshCanvas();
+          }
         }
       };
       p.element.addEventListener("timeupdate", update);

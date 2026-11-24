@@ -5,13 +5,14 @@
 // reads the change flags it leaves (`gridChanged`, `spanChanged`...), and
 // layout and painting simply follow the model.
 import { tableModelInternals as M, paragraph, paragraphText, locate } from './model.js';
-import { tableCells, editableCells, verticalMerges, headerRowCount, tableId, fixedColumnWidths, rowGrid, spanWidth, cellContext, documentBlocks } from './tables.js';
-import { cellBlockPlacements, normalizeCellBlock, blockBetween, ownerPlacements, blockRowRange, blockColumnRange } from './table-selection.js';
+import { tableCells, editableCells, verticalMerges, headerRowCount, tableId, fixedColumnWidths, rowGrid, spanWidth, cellContext, documentBlocks, windowShared, windowShares } from './tables.js';
+import { cellBlockPlacements, normalizeCellBlock, blockBetween, ownerPlacements, blockRowRange, blockColumnRange, wholeRows } from './table-selection.js';
 import { resolveStyledParagraph } from './styles.js';
 import { repairStructuralBookmarks, normalizeBlockBookmarkScopes } from './bookmarks.js';
 import { mergeCellControls } from './block-controls.js';
 import { MAX_DOCUMENT_CHARACTERS, DOCUMENT_CHARACTER_LIMIT_MESSAGE, xmlAttributeText } from './text-limits.js';
 import { checkedCellAlignment } from './cell-alignment.js';
+import { cellShadingFill } from './backgrounds.js';
 import { keptText } from './table-formula.js';
 import { checkedCellBorder, resolveCellBorders } from './cell-borders.js';
 import { resolveCellMargins } from './cell-margins.js';
@@ -197,6 +198,7 @@ export function insertColumns(model, { left = false, count = null, widths: measu
     if (rowIndex === block.top) selected = added[0].id;
   });
   setGrid(table, grid, { fixed: !automatic });
+  if (automatic && windowShared(table) && grid.every(w => w > 0)) windowShares(table, grid);
   M.applyTableContent(model, table, state);
   validate(model);
   if (selected) model.selectCell(selected);
@@ -267,6 +269,7 @@ export function deleteColumns(model, { widths: measured } = {}) {
   }
   for (const row of table.rows) row.cells = row.cells.filter(cell => !removed.has(cell.id));
   setGrid(table, automatic ? widths : integerWidths(widths), { fixed: !automatic });
+  if (automatic && windowShared(table) && widths.every(w => w > 0)) windowShares(table, widths);
   M.applyTableContent(model, table, state);
   validate(model);
   selectOwner(model, table, block.top, Math.min(column, table.grid.length - 1));
@@ -426,7 +429,10 @@ export function mergeBlock(model) {
   if (placements.length < 2) throw new Error('Select two or more cells to merge.');
   requireAligned(table, block);
   const owner = placements[0].cell, span = block.right - block.left;
-  const width = table.layout === 'fixed' ? { type: 'dxa', value: Math.round(spanWidth(fixedColumnWidths(table, model.sectionWritingWidth), block.left, span)) } : { type: 'auto', value: 0 };
+  const top = cellsInRow(table.rows[block.top], block.left, block.right);
+  // A merged cell of a table sharing the window (AutoFit to window) takes the share of the cells it joins.
+  const width = table.layout === 'fixed' ? { type: 'dxa', value: Math.round(spanWidth(fixedColumnWidths(table, model.sectionWritingWidth), block.left, span)) }
+    : top.length && top.every(c => c.cell.width?.type === 'pct') ? { type: 'pct', value: sum(top.map(c => c.cell.width.value)) } : { type: 'auto', value: 0 };
   if (width.value > MAX_WIDTH) throw new Error('The merged cell would be wider than 22 inches.');
   const state = M.tableContent(model, table);
   model.checkpoint();
@@ -542,7 +548,8 @@ export function splitCells(model, { rows = 1, columns = 2, widths: measured } = 
       const created = Array.from({ length: rows - 1 }, () => ({ ...copy(row), id: tableId('row'), headerChanged: true,
         cells: row.cells.map(source => {
           const cell = newCell(source);
-          if (pieceIds.has(source.id)) { cell.width = copy(source.width); cell.widthChanged = true; state.byCell.set(cell.id, [blankFor(state, target.cell, cell)]); }
+          // A piece the file gave no width (automatic, §17.4.72) keeps none; its copy says so already.
+          if (pieceIds.has(source.id)) { if (source.width) { cell.width = copy(source.width); cell.widthChanged = true; } state.byCell.set(cell.id, [blankFor(state, target.cell, cell)]); }
           else { cell.vMerge = 'continue'; cell.mergeChanged = true; }
           return cell;
         }) }));
@@ -599,6 +606,80 @@ export function splitTable(model) {
   repairStructuralBookmarks(model.paragraphs, state.bookmarks, model.tables, table.id);
   normalizeBlockBookmarkScopes(model.paragraphs, model.tables);
   model.select(model.paragraphOffset(model.paragraphs.indexOf(separator)));
+  model.didChange(); return true;
+}
+
+/**
+ * For joining tables of other columns: a function that puts both tables' rows on the union of their column lines (as
+ * twips from the table's left edge; lines within 20 twips of one another are one), or null when a grid holds no widths.
+ */
+function joinedGrid(first, second) {
+  if (first.grid.some(w => !(w > 0)) || second.grid.some(w => !(w > 0))) return null;
+  const lines = table => { let x = 0; return [0, ...table.grid.map(w => (x += w))]; };
+  const a = lines(first), b = lines(second), union = [...a];
+  for (const x of b) if (!union.some(y => Math.abs(y - x) <= 20)) union.push(x);
+  union.sort((x, y) => x - y);
+  if (union.length - 1 > 63) return null;
+  const at = x => union.findIndex(y => Math.abs(y - x) <= 20);
+  return () => {
+    const grid = union.slice(1).map((x, i) => x - union[i]), columns = grid.length;
+    for (const [table, positions] of [[first, a], [second, b]]) for (const row of table.rows) {
+      const entries = rowGrid(row), before = row.gridBefore || 0, after = row.gridAfter || 0, newBefore = at(positions[before]);
+      const newAfter = columns - at(positions[table.grid.length - after]);
+      if (newBefore !== before) { row.gridBefore = newBefore; row.gridBeforeChanged = true; row.widthBefore = { type: 'dxa', value: union[newBefore] }; row.widthBeforeChanged = true; }
+      if (newAfter !== after) { row.gridAfter = newAfter; row.gridAfterChanged = true; row.widthAfter = { type: 'dxa', value: union.at(-1) - union[columns - newAfter] }; row.widthAfterChanged = true; }
+      for (const { cell, column, span } of entries) {
+        const next = at(positions[column + span]) - at(positions[column]);
+        if (next !== span) { cell.span = next; cell.spanChanged = true; }
+      }
+    }
+    first.grid = grid; first.gridChanged = true;
+    if (first.width?.type === 'dxa') { first.width = { type: 'dxa', value: Math.min(MAX_WIDTH, union.at(-1)) }; first.widthChanged = true; }
+  };
+}
+
+/**
+ * Delete in the empty paragraph that keeps two tables apart joins them, as in Word: the second table's rows follow
+ * the first's, and the caret goes to the first of them. Tables of other columns join on the union of their column
+ * lines, each row keeping its cells' edges (joinedGrid). Only tables that would look the same as one do: the same
+ * table formatting and style (a style the document gave each its own copy of counts as the same). Others, floating tables, and a paragraph holding a section break, bookmark, comment, field or control stay
+ * as they are, as do tables with bookmarks or content controls around their rows or cells. Returns false then.
+ */
+export function joinTables(model) {
+  const [start, end] = model.range;
+  if (start !== end) return false;
+  const { index, offset } = locate(model.paragraphs, start), p = model.paragraphs[index];
+  if (offset || paragraphText(p) || p.sectionEnd || p.bookmarks?.length || p.fieldMarkers?.length || p.blockControls?.length || p.markRevision) return false;
+  const level = p.cellId || null;
+  // The table at the paragraph's level that holds a neighbouring paragraph (possibly in a table nested in it).
+  const tableAt = cellId => { for (let at = cellId && cellContext(model.tables, cellId); at; at = at.table.parentCellId && cellContext(model.tables, at.table.parentCellId)) if ((at.table.parentCellId || null) === level) return at.table; return null; };
+  const first = tableAt(model.paragraphs[index - 1]?.cellId), second = tableAt(model.paragraphs[index + 1]?.cellId);
+  if (!first || !second || first === second || first.floating || second.floating) return false;
+  const style = table => { const definition = model.styles.definitions[table.styleId]; return definition ? JSON.stringify({ ...definition, id: null, name: null }) : String(table.styleId ?? ''); };
+  const look = table => JSON.stringify([table.layout, table.alignment, table.indent, table.borders, table.margins, table.shading, table.look, table.conditionalStyle?.settings, table.styleRowBandSize, table.styleColBandSize]);
+  if (look(first) !== look(second) || style(first) !== style(second)) return false;
+  // A merge continuing from nothing at the top of the second table would join a merged cell above it.
+  if (second.rows[0].cells.some(cell => cell.vMerge === 'continue')) return false;
+  const state = M.tableContent(model, second), before = M.tableContent(model, first);
+  const contents = [...state.byCell.values(), ...before.byCell.values()].flat();
+  if (contents.some(q => q.blockControls?.length || q.bookmarks?.some(m => m.tableBoundary || m.columnRange || m.blockScope))) return false;
+  // Tables of other columns share one grid: every column line of either, each row keeping its own cells' edges
+  // (§17.4.48 tblGrid; a row narrower than the grid ends early, §17.4.14–15 gridBefore/gridAfter).
+  const sameGrid = first.grid.length === second.grid.length && first.grid.every((w, i) => w === second.grid[i]);
+  const regrid = !sameGrid && joinedGrid(first, second);
+  if (!sameGrid && !regrid) return false;
+  refuseUntracked(model, 'Joining tables');
+  model.checkpoint();
+  if (regrid) regrid();
+  for (const row of second.rows) if (row.header) { row.header = false; row.headerChanged = true; }
+  const own = new Set(tableCells(second).map(cell => cell.id));
+  for (const q of model.paragraphs) if (own.has(q.cellId)) q.tableStyleId = first.styleId;
+  first.rows.push(...second.rows);
+  model.tables = model.tables.filter(t => t !== second);
+  model.paragraphs.splice(index, 1);
+  M.refreshTableStyles(model, first);
+  validate(model);
+  model.select(start);
   model.didChange(); return true;
 }
 
@@ -706,14 +787,17 @@ export function fixColumnWidths(model, { widths: measured } = {}) {
 }
 
 /** AutoFit to contents or window, for the selected table (not only the caret's innermost one). */
-export function autofitTable(model, mode) {
+export function autofitTable(model, mode, { widths: measured } = {}) {
   const table = requireBlock(model).table;
   if (!['contents', 'window'].includes(mode)) throw new Error('Choose AutoFit to contents or window.');
   model.checkpoint();
   table.layout = 'autofit'; table.layoutChanged = true;
   table.width = mode === 'window' ? { type: 'pct', value: 5000 } : { type: 'auto', value: 0 }; table.widthChanged = true;
-  for (const cell of tableCells(table)) if (cell.width?.type !== 'auto') { cell.width = { type: 'auto', value: 0 }; cell.widthChanged = true; }
-  for (const row of table.rows) for (const side of ['Before', 'After']) if (row[`grid${side}`] && row[`width${side}`]?.type !== 'auto') { row[`width${side}`] = { type: 'auto', value: 0 }; row[`width${side}Changed`] = true; }
+  if (mode === 'window') windowShares(table, columnWidths(model, table, measured));
+  else {
+    for (const cell of tableCells(table)) if (cell.width?.type !== 'auto') { cell.width = { type: 'auto', value: 0 }; cell.widthChanged = true; }
+    for (const row of table.rows) for (const side of ['Before', 'After']) if (row[`grid${side}`] && row[`width${side}`]?.type !== 'auto') { row[`width${side}`] = { type: 'auto', value: 0 }; row[`width${side}Changed`] = true; }
+  }
   // Fitting the contents may widen a column past its old grid width: the grid stops being a cap.
   if (mode === 'contents' && table.grid.some(w => w)) { table.grid = table.grid.map(() => 0); table.gridChanged = true; }
   model.didChange(); return true;
@@ -725,23 +809,36 @@ export function autofitTable(model, mode) {
 export function eachSelectedCell(model, fn) {
   const block = model.cellBlock, selection = { ...model.selection }, cells = model.selectedTableCells;
   let changed = false;
-  for (const cell of cells) {
-    const first = model.paragraphs.findIndex(p => p.cellId === cell.id), last = model.paragraphs.findLastIndex(p => p.cellId === cell.id);
-    if (first < 0) continue;
-    model.select(model.paragraphOffset(first), model.paragraphOffset(last) + paragraphText(model.paragraphs[last]).length);
-    if (fn(cell)) changed = true;
-  }
+  // Each cell's whole content, an empty last paragraph included (TextDocument.selectedParagraphs).
+  model.inBlockCellPass = true;
+  try {
+    for (const cell of cells) {
+      const first = model.paragraphs.findIndex(p => p.cellId === cell.id), last = model.paragraphs.findLastIndex(p => p.cellId === cell.id);
+      if (first < 0) continue;
+      model.select(model.paragraphOffset(first), model.paragraphOffset(last) + paragraphText(model.paragraphs[last]).length);
+      if (fn(cell)) changed = true;
+    }
+  } finally { model.inBlockCellPass = false; }
   if (block) model.setCellBlock(block); else model.select(selection.anchor, selection.focus);
   return changed;
 }
 
-/** Alignment grid: the selected cells' text aligns horizontally and vertically at once. */
+/**
+ * Alignment grid: the selected cells' text aligns horizontally and vertically at once. Left and right
+ * name sides of the cell, as the grid shows them: a right-to-left paragraph stores the other value
+ * (setParagraphAlignment, rtl-paragraph.js).
+ */
 export function setCellAlignment(model, { horizontal, vertical } = {}) {
   if (vertical !== undefined && vertical !== null) checkedCellAlignment(vertical);
   if (horizontal !== undefined && !['left', 'center', 'right', 'both'].includes(horizontal)) throw new Error('Choose left, center or right alignment.');
   let changed = false;
   if (vertical !== undefined) changed = model.setCellVerticalAlignment(vertical) || changed;
-  if (horizontal !== undefined) changed = eachSelectedCell(model, () => model.setParagraphFormat({ alignment: horizontal })) || changed;
+  if (horizontal !== undefined) {
+    // Whole rows are one stretch of text already selected: one change aligns all their cells, where one per cell
+    // read the whole document again for each (seconds for a long table).
+    const block = model.activeCellBlock, align = () => model.setParagraphAlignment(horizontal);
+    changed = (block && wholeRows(block.table, block) ? align() : eachSelectedCell(model, align)) || changed;
+  }
   return changed;
 }
 
@@ -794,10 +891,11 @@ function blockEdges(table, block, which) {
   }
   return edges;
 }
-// The neighbouring cells whose opposite side touches this edge, outside the block.
-function neighbourEdges(table, placement, side) {
+// The neighbouring cells whose opposite side touches this edge, outside the block. `all`: the table's
+// ownerPlacements, worked out once for a command that asks about many edges.
+function neighbourEdges(table, placement, side, all = ownerPlacements(table)) {
   const opposite = { top: 'bottom', bottom: 'top', left: 'right', right: 'left' }[side];
-  return ownerPlacements(table).filter(p => side === 'top' ? p.endRow === placement.rowIndex - 1 && p.column < placement.end && p.end > placement.column
+  return all.filter(p => side === 'top' ? p.endRow === placement.rowIndex - 1 && p.column < placement.end && p.end > placement.column
     : side === 'bottom' ? p.rowIndex === placement.endRow + 1 && p.column < placement.end && p.end > placement.column
     : side === 'left' ? p.end === placement.column && p.rowIndex <= placement.endRow && p.endRow >= placement.rowIndex
     : p.column === placement.end && p.rowIndex <= placement.endRow && p.endRow >= placement.rowIndex).map(p => ({ cell: p.cell, side: opposite }));
@@ -829,10 +927,10 @@ export function applyBorderPreset(model, preset, pen, { toggle = true } = {}) {
   }[preset];
   const edges = blockEdges(table, block, pick);
   if (!edges.length) return false;
-  const placements = new Map(ownerPlacements(table).map(p => [p.cell.id, p]));
+  const owners = ownerPlacements(table), placements = new Map(owners.map(p => [p.cell.id, p]));
   const outside = edges.flatMap(edge => {
     const kind = (({ top: placements.get(edge.cell.id).rowIndex === block.top, bottom: placements.get(edge.cell.id).endRow === block.bottom, left: placements.get(edge.cell.id).column === block.left, right: placements.get(edge.cell.id).end === block.right })[edge.side]);
-    return kind ? neighbourEdges(table, placements.get(edge.cell.id), edge.side) : [];
+    return kind ? neighbourEdges(table, placements.get(edge.cell.id), edge.side, owners) : [];
   });
   const on = edges.every(({ cell, side }) => sameBorder(cell.borders?.[side], border));
   const value = preset === 'none' || toggle && on ? none : border;
@@ -1099,7 +1197,8 @@ function applyAutofit(table, autofit) {
   if (autofit === 'fixed' || !autofit) return;
   table.layout = 'autofit';
   table.width = autofit === 'window' ? { type: 'pct', value: 5000 } : { type: 'auto', value: 0 };
-  for (const cell of tableCells(table)) cell.width = { type: 'auto', value: 0 };
+  if (autofit === 'window') windowShares(table, table.grid);
+  else for (const cell of tableCells(table)) cell.width = { type: 'auto', value: 0 };
 }
 
 /**
@@ -1384,4 +1483,158 @@ export function setTablePositioning(model, patch) {
   table.floating = next; table.floatingChanged = true; table.floatingRewrite = true;
   if (overlap !== table.overlap) { table.overlap = overlap; table.overlapChanged = true; }
   model.didChange(); return true;
+}
+
+/* ---- Copying and pasting whole rows ---- */
+
+// Text the clipboard can carry in a copied table: no object, field, note, control or marked change.
+const clipboardRun = run => !run.image && !run.math && !run.vml && !run.bodySymbol && !run.noteMark && !run.contentControl && !run.field
+  && !run.revision && !run.formatRevision && !run.positionalTab && !/[\u000e￼]/.test(run.text);
+
+/**
+ * The selected whole rows (Select Table, Select Row) as a table for the clipboard: the table's properties, style and
+ * grid with those rows, their cells and the cells' paragraphs, so a paste makes the table again, as in Word. Null for
+ * a block of cells that is not whole rows, and for rows holding what the copy cannot carry yet (nested tables,
+ * pictures, fields, notes, bookmarks, comments, content controls or tracked changes), which copy as text. `token`
+ * names the open document: pasted in another, the cells' list numbering is left out.
+ */
+export function copyTableRows(model, block = model.activeCellBlock, { token = null } = {}) {
+  if (!block || !model.tables.includes(block.table) || !wholeRows(block.table, block)) return null;
+  const table = block.table, { top, bottom } = blockRowRange(block), rows = table.rows.slice(top, bottom + 1);
+  const ids = new Set(rows.flatMap(row => row.cells.map(cell => cell.id)));
+  if (!rows.length || model.tables.some(t => ids.has(t.parentCellId))) return null;
+  // A merge continuing into the first row from above would have nothing to continue.
+  if (rows[0].cells.some(cell => cell.vMerge === 'continue')) return null;
+  const paragraphs = model.paragraphs.filter(p => ids.has(p.cellId));
+  if (paragraphs.some(p => p.bookmarks?.length || p.fieldMarkers?.length || p.blockControls?.length || p.markRevision || !p.runs.every(clipboardRun))) return null;
+  const copied = { ...copy({ ...table, rows: [] }), rows: copy(rows) };
+  for (const key of ['parentCellId', 'floating', 'floatingChanged', 'floatingCreated', 'floatingRemoved', 'floatingRewrite', 'design']) delete copied[key];
+  // Only rows at the top of the copy repeat as header rows.
+  let leading = true;
+  for (const row of copied.rows) { if (!row.header) leading = false; else if (!leading) { row.header = false; row.headerChanged = true; } }
+  const style = table.styleId && model.styles.definitions[table.styleId] ? copy(model.styles.definitions[table.styleId]) : null;
+  return { token, table: copied, paragraphs: copy(paragraphs), style };
+}
+
+/**
+ * Paste rows copied with copyTableRows as a new table at the caret (outside tables: pasting rows into a table is not
+ * supported yet and returns false). The table goes before the caret's paragraph, which splits there as Insert Table
+ * splits it, with an empty paragraph after a table just above. One undo step with the caller's transaction.
+ */
+export function pasteTableRows(model, fragment, { token = null } = {}) {
+  if (!fragment?.table?.rows?.length || !Array.isArray(fragment.paragraphs)) return false;
+  // A pasted table would not be a tracked change: with Track Changes on the rows paste as text.
+  if (model.trackChanges && !model.trackingInternal) return false;
+  if (model.tableContext) return pasteRowsIntoTable(model, fragment, { token });
+  const same = !!token && fragment.token === token;
+  const table = copy(fragment.table), cellIds = new Map();
+  table.id = tableId('t');
+  for (const row of table.rows) {
+    row.id = tableId('row');
+    for (const cell of row.cells) { const id = tableId('cell'); cellIds.set(cell.id, id); cell.id = id; }
+  }
+  let styles = model.styles;
+  if (table.styleId && !styles.definitions[table.styleId]) {
+    if (fragment.style?.type === 'table') { styles = copy(styles); styles.definitions[table.styleId] = { ...copy(fragment.style), id: table.styleId }; }
+    else table.styleId = null;
+  }
+  const content = fragment.paragraphs.map(p => {
+    const q = { ...copy(p), id: paragraph().id, cellId: cellIds.get(p.cellId), tableStyleId: table.styleId };
+    if (!same) { delete q.list; if (q.styleId && !styles.definitions[q.styleId]) q.styleId = null; }
+    return q;
+  });
+  if (content.some(p => !p.cellId) || !table.rows.every(row => row.cells.every(cell => content.some(p => p.cellId === cell.id) || cell.vMerge === 'continue'))) return false;
+  checkLength(model, content.reduce((n, p) => n + paragraphText(p).length + 1, 0));
+  model.checkpoint();
+  if (model.range[0] !== model.range[1]) model.replace('', { checkpoint: false });
+  let here = locate(model.paragraphs, model.range[0]);
+  if (here.offset > 0 || tableJustBefore(model, here.index, null)) { model.replace('\n', { checkpoint: false }); here = locate(model.paragraphs, model.range[0]); }
+  model.styles = styles; model.stylesEnabled = true;
+  model.paragraphs.splice(here.index, 0, ...content.map(p => resolveStyledParagraph(p, styles, model.numbering)));
+  model.tables.push(table);
+  M.refreshTableStyles(model, table);
+  validate(model);
+  model.selectCell(content[0].cellId);
+  model.didChange(); return true;
+}
+
+/**
+ * Rows pasted with the caret in a table go in above the caret's row, as Word inserts copied rows, when they have the
+ * table's columns (the same grid, to within 20 twips a column) and no merged cell crosses into that row from above.
+ * They take the table's style and its look; other rows (another grid) paste as text, and so does a block of cells.
+ */
+function pasteRowsIntoTable(model, fragment, { token = null } = {}) {
+  const block = requireBlock(model), table = block.table, grid = fragment.table.grid || [];
+  if (model.range[0] !== model.range[1] || model.activeCellBlock) return false;
+  if (grid.length !== table.grid.length || grid.some((w, i) => !(w > 0) || !(table.grid[i] > 0) || Math.abs(w - table.grid[i]) > 20)) return false;
+  const at = block.top, row = table.rows[at];
+  if (row.cells.some(cell => cell.vMerge === 'continue') || fragment.table.rows.some(r => r.gridBefore || r.gridAfter) || row.gridBefore || row.gridAfter) return false;
+  if (table.rows.length + fragment.table.rows.length > 1000) throw new Error('A table can have up to 1,000 rows.');
+  const same = !!token && fragment.token === token, state = M.tableContent(model, table), cellIds = new Map();
+  const rows = copy(fragment.table.rows).map(r => {
+    r.id = tableId('row'); if (r.header) { r.header = false; r.headerChanged = true; }
+    for (const cell of r.cells) { const id = tableId('cell'); cellIds.set(cell.id, id); cell.id = id; }
+    return r;
+  });
+  const content = new Map();
+  for (const p of fragment.paragraphs) {
+    const q = { ...copy(p), id: paragraph().id, cellId: cellIds.get(p.cellId), tableStyleId: table.styleId };
+    delete q.tableStyleRegions;
+    if (!same) { delete q.list; if (q.styleId && !model.styles.definitions[q.styleId]) q.styleId = null; }
+    if (!q.cellId) return false;
+    if (!content.has(q.cellId)) content.set(q.cellId, []);
+    content.get(q.cellId).push(resolveStyledParagraph(q, model.styles, model.numbering));
+  }
+  if (!rows.every(r => r.cells.every(cell => content.has(cell.id) || cell.vMerge === 'continue'))) return false;
+  checkLength(model, fragment.paragraphs.reduce((n, p) => n + paragraphText(p).length + 1, 0));
+  model.checkpoint();
+  for (const [id, paragraphs] of content) state.byCell.set(id, paragraphs);
+  table.rows.splice(at, 0, ...rows);
+  M.applyTableContent(model, table, state);
+  M.refreshTableStyles(model, table);
+  validate(model);
+  model.selectCell(rows[0].cells.find(cell => content.has(cell.id)).id);
+  model.didChange(); return true;
+}
+
+/**
+ * Rows of cells read from another application's HTML table (foreignHtmlTable) as rows for pasteTableRows: a table as
+ * Insert Table makes one, as wide as the text, its columns sharing it evenly, with the cells' merges (colspan,
+ * rowspan), header rows (th, thead) and fills. Rows a merge leaves short end with empty cells. Null when the table is
+ * too large (32 columns, 1,000 rows) or its columns too narrow.
+ */
+export function foreignTableRows(model, rows, { width = writingWidth(model) } = {}) {
+  // Lay the cells on a grid, as a browser does: a cell merged down holds its columns in the rows below.
+  const placed = [], taken = [];
+  rows.forEach((cells, r) => {
+    let column = 0;
+    for (const cell of cells) {
+      while (taken[r]?.[column]) column++;
+      placed.push({ ...cell, row: r, column });
+      for (let dr = 0; dr < cell.rowspan && r + dr < rows.length; dr++) for (let dc = 0; dc < cell.colspan; dc++) (taken[r + dr] ||= [])[column + dc] = true;
+      column += cell.colspan;
+    }
+  });
+  const columns = Math.max(1, ...taken.map(row => row?.length || 0));
+  if (columns > 32 || rows.length > 1000) return null;
+  let built;
+  try { built = newTable(model, rows.length, columns, width); } catch { return null; }
+  const { table, styles } = built, template = table.rows[0].cells[0], paragraphs = [];
+  const cellOf = (span, extra = {}) => ({ ...copy(template), id: tableId('cell'), span, width: { type: 'dxa', value: sum(table.grid.slice(extra.column, extra.column + span)) }, ...(extra.vMerge ? { vMerge: extra.vMerge } : {}) });
+  table.rows.forEach((row, r) => {
+    const cells = [];
+    for (let column = 0; column < columns;) {
+      const start = placed.find(p => p.row === r && p.column === column);
+      const above = !start && placed.find(p => p.row < r && p.row + p.rowspan > r && p.column === column);
+      const span = Math.min(columns - column, (start || above)?.colspan || 1);
+      const cell = cellOf(span, { column, vMerge: start ? (start.rowspan > 1 ? 'restart' : null) : above ? 'continue' : null });
+      if (start?.fill) Object.assign(cell, { shading: start.fill, fill: cellShadingFill(start.fill), shadingExplicit: true, shadingChanged: true });
+      if (!above) for (const line of start?.lines || ['']) paragraphs.push(paragraph(line, { cellId: cell.id, tableStyleId: table.styleId }));
+      cells.push(cell); column += span;
+    }
+    row.cells = cells;
+  });
+  // Rows marked as headings at the top repeat as header rows.
+  for (const [r, row] of table.rows.entries()) { const header = rows[r].length && rows[r].every(cell => cell.header); if (!header) break; row.header = true; row.headerChanged = true; }
+  return { token: null, table, paragraphs, style: styles.definitions[table.styleId] };
 }

@@ -1,4 +1,6 @@
-import { describe, expect, it } from "vitest";
+import * as fflate from "fflate";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
 import {
   basename,
   dirname,
@@ -21,6 +23,15 @@ import {
   writeZip,
 } from "./index.ts";
 
+// The real library, watched: a save that compresses nothing new calls no
+// deflate.
+vi.mock("fflate", async (original) => {
+  const real = await original<typeof import("fflate")>();
+  return { ...real, deflateSync: vi.fn(real.deflateSync) };
+});
+const { zipSync } = fflate;
+const deflated = vi.mocked(fflate.deflateSync);
+
 const utf8 = (s: string): Uint8Array => new TextEncoder().encode(s);
 const decode = (b: Uint8Array): string => new TextDecoder().decode(b);
 
@@ -37,6 +48,148 @@ describe("zip", () => {
     for (let i = 0; i < original.length; i++) {
       expect(out.entries[i]?.data).toEqual(original[i]?.data);
     }
+  });
+
+  describe("archive bytes", () => {
+    afterEach(() => vi.useRealTimers());
+    const entries = () => [
+      { name: "[Content_Types].xml", data: utf8("<Types/>".repeat(50)) },
+      {
+        name: "ppt/slides/slide1.xml",
+        data: utf8("<p:sld>héllo</p:sld>".repeat(40)),
+      },
+      {
+        name: "ppt/media/image1.png",
+        data: new Uint8Array(3000).map((_, i) => (i * 31) & 255),
+      },
+      {
+        name: "ppt/embeddings/Ünïcode name.bin",
+        data: new Uint8Array([9, 8, 7]),
+      },
+      { name: "empty.xml", data: new Uint8Array(0) },
+    ];
+    const reference = (list: { name: string; data: Uint8Array }[]) =>
+      zipSync(
+        Object.fromEntries(
+          list.map((e) => [
+            e.name,
+            [e.data, { level: shouldStore(e.name) ? 0 : 6 }],
+          ]),
+        ) as never,
+      );
+
+    it("are the archive the ZIP library writes", () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date(2026, 10, 22, 13, 37, 42));
+      const list = entries();
+      expect(writeZip(list)).toEqual(reference(list));
+    });
+
+    // Checksums are worked out eight bytes at a time, with the bytes left
+    // over one at a time; every length agrees with the ZIP library.
+    it("checksum parts of every length as the ZIP library does", () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date(2026, 10, 22, 13, 37, 42));
+      let seed = 7;
+      const bytes = (n: number) =>
+        new Uint8Array(n).map(
+          () => (seed = (seed * 1103515245 + 12345) >>> 0) >>> 24,
+        );
+      const list = [...Array(41).keys(), 100_003, 262_144].map((n) => ({
+        name: `ppt/media/image${n}.png`,
+        data: bytes(n),
+      }));
+      list.push({
+        name: "ppt/media/ones.png",
+        data: new Uint8Array(77).fill(255),
+      });
+      expect(writeZip(list)).toEqual(reference(list));
+    });
+
+    // A part's bytes are compressed once: a later save of an unchanged part
+    // reuses them, and a part given new bytes is written anew.
+    it("stay right when a save reuses an unchanged part's compression", () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date(2026, 10, 22, 13, 37, 42));
+      const list = entries();
+      const first = writeZip(list);
+      deflated.mockClear();
+      expect(writeZip(list)).toEqual(first);
+      expect(deflated).not.toHaveBeenCalled();
+      list[1] = { name: list[1]!.name, data: utf8("<p:sld>changed</p:sld>") };
+      deflated.mockClear();
+      const next = writeZip(list);
+      expect(deflated).toHaveBeenCalledTimes(1);
+      expect(next).toEqual(reference(list));
+      const out = readZip(writeZip(list));
+      expect(decode(out.entries[1]!.data)).toBe("<p:sld>changed</p:sld>");
+      // The same bytes written at another level are compressed at that level.
+      expect(writeZip(list, { level: 1 })).toEqual(
+        zipSync(
+          Object.fromEntries(
+            list.map((e) => [
+              e.name,
+              [e.data, { level: shouldStore(e.name) ? 0 : 1 }],
+            ]),
+          ) as never,
+        ),
+      );
+    });
+
+    // An undo reads a snapshot written here back into fresh part bytes; its
+    // next save compresses only what changed since, and writes the same
+    // archive a save from scratch would.
+    it("reuse the compression of an archive written here when read back", () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date(2026, 10, 22, 13, 37, 42));
+      const archive = writeZip(entries());
+      const read = readZip(archive, { snapshot: true }).entries;
+      deflated.mockClear();
+      expect(writeZip(read)).toEqual(archive);
+      expect(deflated).not.toHaveBeenCalled();
+      read[1] = { name: read[1]!.name, data: utf8("<p:sld>edited</p:sld>") };
+      const next = writeZip(read);
+      expect(deflated).toHaveBeenCalledTimes(1);
+      expect(next).toEqual(reference(read));
+      // An archive from elsewhere, though byte for byte the same, or one
+      // not read as an unchanged snapshot, gives nothing to reuse.
+      for (const copy of [
+        readZip(archive.slice(), { snapshot: true }).entries,
+        readZip(archive).entries,
+      ]) {
+        deflated.mockClear();
+        expect(writeZip(copy)).toEqual(archive);
+        expect(deflated).toHaveBeenCalledTimes(
+          copy.filter((e) => !shouldStore(e.name)).length,
+        );
+      }
+    });
+
+    // Parts the deck in memory still holds are taken as they are, not
+    // unpacked into copies; the entries and their order are as unpacked.
+    it("take back the bytes still in memory when read back", () => {
+      const list = entries();
+      const archive = writeZip(list);
+      const read = readZip(archive, { snapshot: true }).entries;
+      const unpacked = readZip(archive).entries;
+      expect(read.map((e) => e.name)).toEqual(unpacked.map((e) => e.name));
+      expect(read).toEqual(unpacked);
+      read.forEach((e, i) => expect(e.data).toBe(list[i]!.data));
+      unpacked.forEach((e, i) => expect(e.data).not.toBe(list[i]!.data));
+    });
+
+    // Media added without its picture leaves a part with no bytes; the save
+    // goes ahead without it instead of failing.
+    it("leave out a part that has no bytes", () => {
+      const list = [
+        ...entries(),
+        { name: "ppt/media/image9.png", data: undefined as never },
+      ];
+      const out = readZip(writeZip(list));
+      expect(out.entries.map((e) => e.name)).toEqual(
+        entries().map((e) => e.name),
+      );
+    });
   });
 
   it("classifies known-compressed extensions as STORE", () => {

@@ -154,20 +154,18 @@ export function createLayoutTab({ editor, pkg, error, onChange = () => {}, comma
       const s = settings();
       return [['Portrait', 'portrait'], ['Landscape', 'landscape']].map(([label, value]) => ({
         label, picture: value, radio: true, checked: s?.orientation === value,
-        onSelect: () => {
-          const current = settings(); if (!current || current.orientation === value) return;
-          // Turning the page swaps its sides and rotates the margins with it.
-          setPage({ orientation: value, width: current.height, height: current.width,
-            ...(value === 'landscape' ? { top: current.left, bottom: current.right, left: current.bottom, right: current.top }
-              : { top: current.right, bottom: current.left, left: current.top, right: current.bottom }) });
-        },
+        // Turning the page swaps its sides and rotates the margins with it: each selected section its own.
+        onSelect: () => setPage(current => current.orientation === value ? {} : { orientation: value, width: current.height, height: current.width,
+          ...(value === 'landscape' ? { top: current.left, bottom: current.right, left: current.bottom, right: current.top }
+            : { top: current.right, bottom: current.left, left: current.top, right: current.bottom }) }),
       }));
     },
     sizeItems() {
       const s = settings();
       return [...PAPER_PRESETS.map(([label, hint, width, height]) => {
         const [w, h] = s?.orientation === 'landscape' ? [height, width] : [width, height];
-        return { label, hint, radio: true, checked: !!s && near(s.width, w) && near(s.height, h), onSelect: () => setPage({ width: w, height: h }) };
+        // Each selected section keeps its own orientation.
+        return { label, hint, radio: true, checked: !!s && near(s.width, w) && near(s.height, h), onSelect: () => setPage(current => current.orientation === 'landscape' ? { width: height, height: width } : { width, height }) };
       }), { separator: true }, { label: 'More Paper Sizes…', icon: 'pageSetup', disabled: !ready(), onSelect: () => commands.openPageSetup('page') }];
     },
     columnItems() {
@@ -179,7 +177,11 @@ export function createLayoutTab({ editor, pkg, error, onChange = () => {}, comma
         // With text selected, the columns go to that text alone, between two continuous section breaks.
         onSelect: () => { const current = settings(); setPage({ columns: presetColumns(id, writingWidth(current), current.columns?.space || 720) }, selected ? { scope: 'selection', breakType: 'continuous' } : undefined); },
       })), { separator: true },
-      { label: 'Line Between', checked: !!s?.columns?.separator, disabled: !ready() || (s?.columns?.count || 1) < 2, onSelect: () => setPage({ columns: { ...settings().columns, separator: !settings().columns.separator } }) },
+      // Each selected section keeps its own columns; one without columns has no line to draw.
+      { label: 'Line Between', checked: !!s?.columns?.separator, disabled: !ready() || (s?.columns?.count || 1) < 2, onSelect: () => {
+        const on = !settings().columns.separator;
+        setPage(current => (current.columns?.count || 1) < 2 ? {} : { columns: { ...current.columns, separator: on } });
+      } },
       { label: 'More Columns…', icon: 'columnsDialog', disabled: !ready(), onSelect: () => commands.columnsDialog() }];
     },
     breakItems() {

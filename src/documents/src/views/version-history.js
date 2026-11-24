@@ -39,11 +39,13 @@ export function createVersionHistory({ editor, pkg, doc, error, author, live = (
   const previewTitle = el('h2.vh-preview-title', {}, 'Version');
   // The note is filled only while a version is shown, so a hidden pane never reads as the document's own "Read only" state.
   const previewNote = el('p.vh-preview-note');
+  // A document open read-only cannot take a version back, as its list's Restore buttons say (restore() does nothing).
+  const previewRestore = el('button.btn.btn-primary.btn-sm', { type: 'button', onclick: () => preview && restore(preview.version) }, 'Restore');
   const previewNode = el('aside.vh-preview', { hidden: true, 'aria-label': 'Earlier version (read only)' },
     el('div.vh-preview-head', {}, el('div', {}, previewTitle, previewNote),
       el('div.vh-preview-actions', {},
         el('button.btn.btn-outline.btn-sm', { type: 'button', onclick: () => preview && compareWith(preview.version) }, 'Compare'),
-        el('button.btn.btn-primary.btn-sm', { type: 'button', onclick: () => preview && restore(preview.version) }, 'Restore'),
+        previewRestore,
         el('button.icon-btn', { type: 'button', 'aria-label': 'Close version', title: 'Close', onclick: () => closePreview() }, '×'))),
     previewHost);
   previewNode.addEventListener('keydown', e => { if (e.key === 'Escape') { e.preventDefault(); closePreview(); } });
@@ -51,6 +53,8 @@ export function createVersionHistory({ editor, pkg, doc, error, author, live = (
   // The document's first save, a rename or a copy gives it another file, with that file's history.
   const onPath = () => { if (pane.isOpen) load(); };
   doc.addEventListener?.('path', onPath);
+  // A version written while the pane is open (the snapshot a save leaves once it is done) joins the list.
+  doc.addEventListener?.('versions', onPath);
 
   async function load() {
     status.textContent = '';
@@ -112,6 +116,7 @@ export function createVersionHistory({ editor, pkg, doc, error, author, live = (
     closePreview();
     previewTitle.textContent = versionName(v);
     previewNote.textContent = 'Read only';
+    previewRestore.disabled = !!pkg()?.readOnly;
     previewNode.hidden = false;
     previewHost.replaceChildren(el('p.rv-status', {}, 'Opening…'));
     const token = preview = { version: v, engine: null };
@@ -198,6 +203,6 @@ export function createVersionHistory({ editor, pkg, doc, error, author, live = (
     restore,
     get isOpen() { return pane.isOpen; },
     refresh() { if (preview?.engine) fit(preview.engine); },
-    destroy() { doc.removeEventListener?.('path', onPath); closePreview(); pane.destroy(); },
+    destroy() { doc.removeEventListener?.('path', onPath); doc.removeEventListener?.('versions', onPath); closePreview(); pane.destroy(); },
   };
 }

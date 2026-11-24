@@ -5,6 +5,7 @@ import {
   PDFDocument,
   PDFHexString,
   PDFName,
+  PDFNumber,
   PDFRawStream,
   PDFString,
   StandardFontEmbedder,
@@ -375,6 +376,34 @@ describe('sanitizeDocument', () => {
     expect(await recoverable(bytes)).not.toContain('EMBEDDEDCLIP');
   });
 
+  it('removes the title and author an article thread keeps of its own', async () => {
+    // Article threads (reading paths through columns) carry an information dictionary with
+    // the same entries as the document's: the author's name stayed after Metadata was removed.
+    const doc = await PDFDocument.create();
+    const page = doc.addPage([400, 400]);
+    const ctx = doc.context;
+    const bead = ctx.register(ctx.obj({ Type: 'Bead', P: page.ref, R: [0, 0, 100, 100] }));
+    const thread = ctx.register(
+      ctx.obj({
+        Type: 'Thread',
+        F: bead,
+        I: { Title: PDFString.of('THREADTITLE'), Author: PDFString.of('THREADAUTHOR') },
+      }),
+    );
+    for (const key of ['T', 'N', 'V']) ctx.lookup(bead).set(n(key), key === 'T' ? thread : bead);
+    doc.catalog.set(n('Threads'), ctx.obj([thread]));
+    page.node.set(n('B'), ctx.obj([bead]));
+    const off = Object.fromEntries(Object.keys(SANITIZE_DEFAULTS).map((key) => [key, false]));
+    const { bytes, report } = await sanitize(await doc.save(), { ...off, metadata: true });
+    expect(report.metadata).toBeGreaterThanOrEqual(1);
+    const corpus = await recoverable(bytes);
+    expect(corpus).not.toContain('THREADTITLE');
+    expect(corpus).not.toContain('THREADAUTHOR');
+    // The thread itself still guides reading.
+    const kept = await PDFDocument.load(bytes);
+    expect(kept.catalog.lookup(n('Threads'))?.size()).toBe(1);
+  });
+
   it('counts a script removed from a rendition action, so the removal is kept', async () => {
     const doc = await PDFDocument.create();
     const page = doc.addPage([400, 400]);
@@ -488,6 +517,92 @@ describe('sanitizeDocument', () => {
     expect(jpeg.getData({ width: 64, height: 48, forceRGB: true })).toEqual(
       original.getData({ width: 64, height: 48, forceRGB: true }),
     );
+  });
+
+  it('clears the tags’ replacement and alternate text for the hidden content it removes', async () => {
+    const doc = await PDFDocument.create();
+    const ctx = doc.context;
+    const font = await doc.embedFont(StandardFonts.Helvetica);
+    const page = doc.addPage([400, 400]);
+    const layer = ctx.register(ctx.obj({ Type: 'OCG', Name: PDFString.of('Drafts') }));
+    doc.catalog.set(n('OCProperties'), ctx.obj({ OCGs: [layer], D: { OFF: [layer] } }));
+    const picture = ctx.register(
+      ctx.flateStream(new Uint8Array(4).fill(90), {
+        Type: 'XObject',
+        Subtype: 'Image',
+        Width: 2,
+        Height: 2,
+        ColorSpace: 'DeviceGray',
+        BitsPerComponent: 8,
+      }),
+    );
+    page.node.set(
+      n('Resources'),
+      ctx.obj({ Font: { F: font.ref }, Properties: { Off: layer }, XObject: { Im: picture } }),
+    );
+    const content = [
+      '/P <</MCID 0>> BDC BT /F 12 Tf 10 300 Td 3 Tr (scanned words) Tj 0 Tr ET EMC',
+      '/OC /Off BDC /P <</MCID 1>> BDC BT /F 12 Tf 10 200 Td (draft words) Tj ET EMC EMC',
+      '/OC /Off BDC /Figure <</MCID 2>> BDC q 20 0 0 20 10 150 cm /Im Do Q EMC EMC',
+      '/P <</MCID 3>> BDC BT /F 12 Tf 10 100 Td (Shown) Tj ET EMC',
+    ].join('\n');
+    page.node.set(n('Contents'), ctx.register(ctx.flateStream(content)));
+    const root = ctx.nextRef();
+    const top = ctx.nextRef();
+    const element = (role, mcid, key, text) =>
+      ctx.register(
+        ctx.obj({ Type: 'StructElem', S: role, P: top, Pg: page.ref, K: mcid, [key]: text }),
+      );
+    const kids = [
+      element('P', 0, 'ActualText', PDFHexString.fromText('OCR layer words')),
+      element('P', 1, 'ActualText', PDFHexString.fromText('Draft clause')),
+      element('Figure', 2, 'Alt', PDFHexString.fromText('Draft floor plan')),
+      element('P', 3, 'ActualText', PDFHexString.fromText('Shown words')),
+    ];
+    ctx.assign(top, ctx.obj({ Type: 'StructElem', S: 'Document', P: root, K: kids }));
+    ctx.assign(
+      root,
+      ctx.obj({ Type: 'StructTreeRoot', K: [top], ParentTree: { Nums: [0, kids] } }),
+    );
+    doc.catalog.set(n('StructTreeRoot'), root);
+    page.node.set(n('StructParents'), PDFNumber.of(0));
+    const { bytes } = await sanitize(await doc.save());
+    const corpus = await recoverable(bytes);
+    for (const secret of ['OCR layer words', 'Draft clause', 'Draft floor plan'])
+      expect(contains(corpus, secret), secret).toBe(false);
+    expect(contains(corpus, 'Shown words')).toBe(true);
+  });
+
+  it('keeps a PDF/A file’s identification, and nothing else, when it removes metadata', async () => {
+    const { convertToPdfA, pdfaIdentification, pdfaSaveOptions, preflightPdfA } =
+      await import('../src/core/pdfa.js');
+    const { readFileSync } = await import('node:fs');
+    const assets = new URL('../node_modules/pdfjs-dist/', import.meta.url);
+    const doc = await PDFDocument.create();
+    doc.setTitle('Merger plan');
+    doc.setAuthor('Secret Author');
+    const font = await doc.embedFont(StandardFonts.Helvetica);
+    doc.addPage([300, 300]).drawText('Archived', { x: 20, y: 200, size: 12, font });
+    const session = new PdfSession(await doc.save());
+    await session.change(
+      (current) =>
+        convertToPdfA(current, {
+          part: 2,
+          conformance: 'b',
+          loadAsset: async (path) => new Uint8Array(readFileSync(new URL(path, assets))),
+        }),
+      { saveOptions: pdfaSaveOptions(2) },
+    );
+    await session.change(async (current) => {
+      await sanitizeDocument(current);
+    });
+    const cleaned = await PDFDocument.load(session.bytes, { updateMetadata: false });
+    expect(pdfaIdentification(cleaned)).toEqual({ part: 2, conformance: 'b' });
+    const issues = preflightPdfA(cleaned, { part: 2, conformance: 'b', bytes: session.bytes });
+    expect(issues.issues.filter((issue) => issue.severity === 'error')).toEqual([]);
+    const corpus = await recoverable(session.bytes);
+    for (const secret of ['Secret Author', 'Merger plan'])
+      expect(contains(corpus, secret), secret).toBe(false);
   });
 
   it('counts nothing when the chosen kinds are absent', async () => {

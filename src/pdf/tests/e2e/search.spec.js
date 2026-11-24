@@ -239,6 +239,16 @@ test('a word hyphenated at the end of a line is found whole', async ({ page }) =
   await expect(page.locator('.search-hit-current')).toHaveText(['exam', 'ple']);
 });
 
+test('a hyphenated word broken at the end of a line is found with its hyphen', async ({ page }) => {
+  const input = await openSearchDocument(page, ['A forward-\nthinking plan, forward-thinking']);
+  await input.fill('forward-thinking');
+  await expect(page.locator('.search-count')).toHaveText('1 of 2');
+  await expect(page.locator('.search-hit-current')).toHaveText(['forward', 'thinking']);
+  await input.press('Enter');
+  await expect(page.locator('.search-count')).toHaveText('2 of 2');
+  await expect(page.locator('.search-hit-current')).toHaveText('forward-thinking');
+});
+
 test('a word is found whole when its line-end hyphen is set in another font', async ({ page }) => {
   const input = await openSearchDocument(page, [], async (doc) => {
     const regular = await doc.embedFont(StandardFonts.Helvetica);
@@ -272,4 +282,34 @@ test('straight and curly quotes find each other, as PDF readers find them', asyn
   await input.fill('"never"');
   await expect(page.locator('.search-count')).toHaveText('1 of 1');
   await expect(page.locator('.search-hit-current')).toHaveText('\u201cnever\u201d');
+});
+
+test('Find stays on its match when the page is rotated or zoomed', async ({ page }) => {
+  const input = await openSearchDocument(page, [
+    'apple',
+    'apple one\napple two\napple three',
+    'apple',
+  ]);
+  await input.fill('apple');
+  await expect(page.locator('.search-count')).toHaveText('1 of 5');
+  for (const count of ['2 of 5', '3 of 5', '4 of 5']) {
+    await input.press('Enter');
+    await expect(page.locator('.search-count')).toHaveText(count);
+  }
+  const current = page.locator('.search-hit-current');
+  await expect(current).toHaveCount(1);
+  await expect(page.locator('.page-caption')).toHaveText('Page 2 of 3');
+  await page.keyboard.press('ControlOrMeta+=');
+  await expect(page.locator('.search-count')).toHaveText('4 of 5');
+  // Rotating saves a change and reads the text again; Find is still on the third apple.
+  await page.locator('.workspace').focus();
+  await page.keyboard.press('ControlOrMeta+Shift+r');
+  await expect(page.getByRole('button', { name: 'Undo', exact: true })).toBeEnabled();
+  await expect(page.locator('.editor')).toHaveAttribute('aria-busy', 'false');
+  await expect(page.locator('.search-count')).toHaveText('4 of 5');
+  await expect(current).toHaveCount(1);
+  expect(await current.evaluate((mark) => mark.parentElement.textContent)).toContain('three');
+  await input.press('Enter');
+  await expect(page.locator('.search-count')).toHaveText('5 of 5');
+  await expect(page.locator('.page-caption')).toHaveText('Page 3 of 3');
 });

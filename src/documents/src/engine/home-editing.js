@@ -2,6 +2,7 @@ import { locate, paragraphText, RUN_FORMAT, PARAGRAPH_FORMAT, runFormat } from '
 import { effectiveStyleId, resolveCharacterRun, resolveStyledParagraph, paragraphRunStyle } from './styles.js';
 import { clearedRun, clearParagraph } from './direct-formatting.js';
 import { moveTableRows } from './table-editing.js';
+import { levelFor } from './numbering.js';
 
 /**
  * Home tab editing commands that work on the canvas model through its own
@@ -37,7 +38,12 @@ export function nextCycleCase(text) {
  */
 export function convertCase(text, mode, sentenceStart = true, { before = '', after = '' } = {}) {
   const chars = [...text];
-  let start = sentenceStart, wordStart = true;
+  // A period, question or exclamation mark (or an ellipsis) ends a sentence once white space follows it, closing
+  // quotes and brackets allowed between: "index.html" and "3.14" go on in lowercase.
+  // A selection that starts inside a word goes on with that word: Capitalize Each Word capitalizes the letters that
+  // start words in the document, not the selection's first letter ("plain" stays "plain", not "plAin").
+  const previous = [...before].at(-1);
+  let start = sentenceStart, wordStart = !previous || !/[\p{L}\p{N}\p{M}'’]/u.test(previous), ended = false;
   return chars.map((ch, index) => {
     const letter = /\p{L}/u.test(ch);
     let out = ch;
@@ -50,9 +56,14 @@ export function convertCase(text, mode, sentenceStart = true, { before = '', aft
       else if (mode === 'sentence') out = start ? upper : lower;
       if (out.length !== ch.length) out = ch;
       else if (out === 'σ' && ch === 'Σ' && finalSigma(chars, index, before, after)) out = 'ς';
-      start = false;
+      start = false; ended = false;
     }
-    if (mode === 'sentence' && /[.!?\n\f\v]/.test(ch)) start = true;
+    if (mode === 'sentence' && !letter) {
+      if (/[\n\f\v]/.test(ch)) start = true;
+      else if (/[.!?…]/.test(ch)) ended = true;
+      else if (/\s/u.test(ch)) { if (ended) start = true; ended = false; }
+      else if (!/[\p{M}"'”’)\]]/u.test(ch)) ended = false;
+    }
     // A combining mark (a decomposed accent) belongs to the letter before it, as digits and apostrophes stay in a word.
     wordStart = !(letter || /[\p{N}\p{M}'’]/u.test(ch));
     return out;
@@ -77,10 +88,11 @@ function finalSigma(chars, index, before, after) {
 // regular expression anchored only at the end (/[\s"…]+$/) tries every start position, so a run of thousands
 // of quotation marks earlier in the paragraph made each change of case take seconds.
 function sentenceStartsAt(text, position) {
-  let end = position;
-  while (end > 0 && /[\s"'“‘(\[]/u.test(text[end - 1])) end--;
+  let end = position, spaced = false;
+  while (end > 0 && /[\s"'“‘(\[]/u.test(text[end - 1])) { spaced ||= /\s/u.test(text[end - 1]); end--; }
   const before = text.slice(0, end);
-  return !before || /[.!?\n\f\v]$/.test(before);
+  // A period ends a sentence only with white space after it (and closing quotes or brackets before that).
+  return !before || /[\n\f\v]$/.test(before) || spaced && /[.!?…]["'”’)\]]*$/.test(before.slice(-32));
 }
 
 /**
@@ -177,8 +189,25 @@ export function captureFormat(model) {
   return {
     characterStyle: model.stylesEnabled ? run.styleId || '' : null,
     run: directRun(model, run, p),
-    paragraph: wholeParagraph ? { styleId: model.stylesEnabled ? effectiveStyleId(p, model.styles) || '' : null, format: directParagraph(model, p) } : null,
+    paragraph: wholeParagraph ? { styleId: model.stylesEnabled ? effectiveStyleId(p, model.styles) || '' : null, format: directParagraph(model, p),
+      // The list the paragraph is an item of in its own right (not through its style, which the style brings along).
+      list: p.list?.direct ? { numId: p.list.numId, level: p.list.level } : null } : null,
   };
+}
+
+/**
+ * Paint a paragraph's list membership, as Word's Format Painter does: the selected paragraphs become items of the
+ * copied paragraph's list at its level, or, copied from a paragraph that is no list item in its own right, stop
+ * being items of a list of their own. A list this document does not have (formatting copied in another one) is
+ * left alone.
+ */
+function paintList(model, list) {
+  if (list) { try { levelFor(model.numbering, list); } catch { return; } }
+  const targets = model.selectedParagraphs.filter(p => list ? p.list?.numId !== list.numId || p.list.level !== list.level || !p.list.direct : p.list?.direct);
+  if (!targets.length) return;
+  model.checkpoint();
+  for (const p of targets) { p.list = list ? { numId: list.numId, level: list.level, direct: true } : null; p.listChanged = true; }
+  model.didChange();
 }
 
 // Each property applies on its own: one the target cannot take (a page break in a table cell) is skipped
@@ -210,6 +239,7 @@ export function applyFormat(model, captured) {
     if (styleId === '' || styleId && model.styles.definitions[styleId]?.type === 'paragraph') model.setParagraphStyle(styleId);
     model.clearDirectParagraphFormatting();
     applyEach(format, patch => model.setParagraphFormat(patch));
+    if (captured.paragraph.list !== undefined) paintList(model, captured.paragraph.list);
   }
   return model.revision !== before;
 }

@@ -3,9 +3,20 @@
  * "Export comments" and "Import comments" write and read), and a plain-text comment summary.
  */
 import { DOMParser, XMLSerializer } from '@xmldom/xmldom';
-import { PDFArray, PDFDict, PDFHexString, PDFName, PDFNumber, PDFRef, PDFString } from 'pdf-lib';
+import {
+  PDFArray,
+  PDFDict,
+  PDFDocument,
+  PDFHexString,
+  PDFName,
+  PDFNumber,
+  PDFObjectCopier,
+  PDFParser,
+  PDFRef,
+  PDFString,
+} from 'pdf-lib';
 import { annotationList, annotationsOf } from './structure.js';
-import { parsePdfDate } from './notes.js';
+import { POPUP_FLAGS, parsePdfDate } from './notes.js';
 import {
   FLAGS,
   annotationName,
@@ -524,13 +535,103 @@ function dictFromElement(doc, page, element, subtype) {
 }
 
 /**
- * Add the comments in an XFDF file to their pages, drawing each one's appearance. Comments
- * whose name a page already has are skipped, so importing the same file twice adds nothing;
- * replies follow their parents, which may be comments already in the document. Returns
- * { imported, comments, replies, statuses, skipped, duplicates }.
+ * The text of an XFDF file's bytes. XML says its own encoding: a byte order mark, or the
+ * encoding its declaration names (older tools write ISO-8859-1 or windows-1252). UTF-8 is the
+ * default, as for any XML file.
+ */
+export function decodeXfdf(bytes) {
+  const [a, b, c] = bytes;
+  let label = 'utf-8';
+  if (a === 0xef && b === 0xbb && c === 0xbf) label = 'utf-8';
+  else if (a === 0xfe && b === 0xff) label = 'utf-16be';
+  else if (a === 0xff && b === 0xfe) label = 'utf-16le';
+  // UTF-16 without a mark still begins with "<?" (XML 1.0, appendix F).
+  else if (a === 0x00 && b === 0x3c) label = 'utf-16be';
+  else if (a === 0x3c && b === 0x00) label = 'utf-16le';
+  else {
+    const head = new TextDecoder('latin1').decode(bytes.subarray(0, 200));
+    const declared = /^\s*<\?xml[^>]*?\sencoding\s*=\s*["']([A-Za-z0-9._:-]+)["']/.exec(head)?.[1];
+    // A file that begins in single bytes is not UTF-16, whatever its declaration says.
+    if (declared && !/^utf-?16/i.test(declared)) label = declared;
+  }
+  try {
+    return new TextDecoder(label).decode(bytes);
+  } catch {
+    // An encoding no browser knows is read as UTF-8, the XML default.
+    return new TextDecoder('utf-8').decode(bytes);
+  }
+}
+
+/** Whether these bytes are an FDF file, the PDF-syntax comments file Acrobat also exports. */
+const isFdf = (bytes) =>
+  bytes instanceof Uint8Array &&
+  String.fromCharCode(...bytes.subarray(0, 1024))
+    .trimStart()
+    .startsWith('%FDF-');
+
+/**
+ * The comments of an FDF file as XFDF, with how many it holds that no page could take. FDF
+ * writes each comment as the PDF dictionary it is, numbering its page (Page); they are put on
+ * the pages of a scratch PDF and written out as XFDF, so both files are imported the same way.
+ */
+async function fdfAsXfdf(bytes) {
+  const copy = bytes.slice();
+  // The same syntax under a PDF header, which the parser looks for.
+  const at = String.fromCharCode(...copy.subarray(0, 1024)).indexOf('%FDF-');
+  copy[at + 1] = 0x50;
+  let context;
+  try {
+    const parser = PDFParser.forBytesWithOptions(copy, Infinity, false, false);
+    await parser.parseDocument();
+    context = parser.context;
+  } catch {
+    throw new Error('This comments file could not be read.');
+  }
+  const root = context.lookup(context.trailerInfo.Root);
+  const fdf = root instanceof PDFDict ? root.lookup(PDFName.of('FDF')) : null;
+  const annots = fdf instanceof PDFDict ? fdf.lookup(PDFName.of('Annots')) : null;
+  if (!(fdf instanceof PDFDict)) throw new Error('This comments file could not be read.');
+  const scratch = await PDFDocument.create();
+  const copier = PDFObjectCopier.for(context, scratch.context);
+  let skipped = 0;
+  const entries = annots instanceof PDFArray ? annots.asArray() : [];
+  if (entries.length > MAX_XFDF_ANNOTATIONS)
+    throw new Error('This comments file has too many comments to import.');
+  for (const entry of entries) {
+    const dict = context.lookup(entry);
+    const page = dict instanceof PDFDict ? dict.lookup(PDFName.of('Page'))?.asNumber?.() : null;
+    if (!Number.isInteger(page) || page < 0 || page > 9999) {
+      skipped++;
+      continue;
+    }
+    while (scratch.getPageCount() <= page) scratch.addPage();
+    const ref =
+      entry instanceof PDFRef ? copier.copy(entry) : scratch.context.register(copier.copy(dict));
+    const own = scratch.context.lookup(ref);
+    own.delete(PDFName.of('Page'));
+    own.set(PDFName.of('P'), scratch.getPage(page).ref);
+    annotationList(scratch.getPage(page)).push(ref);
+  }
+  return { xfdf: exportXfdf(scratch), skipped };
+}
+
+/**
+ * Add the comments in an XFDF file (its text, or its bytes) to their pages, drawing each one's
+ * appearance. Comments whose name a page already has are skipped, so importing the same file
+ * twice adds nothing; replies follow their parents, which may be comments already in the
+ * document. Returns { imported, comments, replies, statuses, skipped, duplicates }.
  */
 export async function importXfdf(doc, xfdf) {
-  const source = String(xfdf ?? '');
+  if (xfdf instanceof Uint8Array && xfdf.length > MAX_XFDF_SIZE)
+    throw new Error('This comments file is too large to import.');
+  // An FDF file (Acrobat's other comments file) is read as the XFDF it amounts to.
+  if (isFdf(xfdf)) {
+    const { xfdf: converted, skipped } = await fdfAsXfdf(xfdf);
+    const result = await importXfdf(doc, converted);
+    result.skipped += skipped;
+    return result;
+  }
+  const source = xfdf instanceof Uint8Array ? decodeXfdf(xfdf) : String(xfdf ?? '');
   if (source.length > MAX_XFDF_SIZE) throw new Error('This comments file is too large to import.');
   const unreadable = () => new Error('This comments file could not be read.');
   let xml;
@@ -549,19 +650,30 @@ export async function importXfdf(doc, xfdf) {
   if (elements.length > MAX_XFDF_ANNOTATIONS)
     throw new Error('This comments file has too many comments to import.');
   const pages = doc.getPages();
-  // Names already in the document, so replies can find their parents and repeats are skipped.
+  // Names already in the document, so replies can find their parents and repeats are skipped:
+  // each comment's reference, or where a dictionary written into Annots directly is.
   const named = new Map();
+  // A reply must point at an object; a direct parent becomes one when a reply first needs it.
+  const parentRef = (nm) => {
+    const found = named.get(nm);
+    if (found instanceof PDFRef) return found;
+    const ref = doc.context.register(found.dict);
+    annotationList(found.page).set(found.position, ref);
+    named.set(nm, ref);
+    return ref;
+  };
   // Comments without a name went out as annot-<object>-<generation> (see exportXfdf). Such a
   // name is this PDF's comment only while that object is still the same kind of comment, on
   // the same page and in the same place: another PDF's objects can share the numbers.
   const unnamed = new Map();
   pages.forEach((page, index) => {
-    for (const ref of annotationsOf(page)?.asArray() || []) {
+    for (const [position, ref] of (annotationsOf(page)?.asArray() || []).entries()) {
       const dict = doc.context.lookup(ref);
-      if (!(dict instanceof PDFDict) || !(ref instanceof PDFRef)) continue;
+      if (!(dict instanceof PDFDict)) continue;
       const nm = text(dict, 'NM');
-      if (nm && !named.has(nm)) named.set(nm, ref);
-      if (!nm)
+      if (nm && !named.has(nm))
+        named.set(nm, ref instanceof PDFRef ? ref : { page, position, dict });
+      if (!nm && ref instanceof PDFRef)
         unnamed.set(`annot-${ref.objectNumber}-${ref.generationNumber}`, { ref, dict, index });
     }
   });
@@ -610,7 +722,7 @@ export async function importXfdf(doc, xfdf) {
       try {
         dict = page && dictFromElement(doc, page, element, subtype);
         if (dict && parentName) {
-          dict.set(name('IRT'), named.get(parentName));
+          dict.set(name('IRT'), parentRef(parentName));
           const group = element.getAttribute('replyType') === 'group';
           dict.set(name('RT'), name(group ? 'Group' : 'R'));
           // Replies and states live in their parent's thread, never as icons of their own.
@@ -620,7 +732,7 @@ export async function importXfdf(doc, xfdf) {
               PDFNumber.of(FLAGS.hidden | FLAGS.print | FLAGS.nozoom | FLAGS.norotate),
             );
           if (!dict.has(name('Rect'))) {
-            const parent = doc.context.lookup(named.get(parentName));
+            const parent = doc.context.lookup(parentRef(parentName));
             const rect = parent instanceof PDFDict ? numbers(parent.lookup(name('Rect'))) : null;
             dict.set(name('Rect'), doc.context.obj(rect?.length === 4 ? rect : [0, 0, 20, 20]));
           }
@@ -650,7 +762,7 @@ export async function importXfdf(doc, xfdf) {
                 ? popupRect
                 : [rect[2] + 4, rect[3] - 120, rect[2] + 184, rect[3]],
             Open: popupElement?.getAttribute('open') === 'yes',
-            F: 0,
+            F: POPUP_FLAGS,
           }),
         );
         dict.set(name('Popup'), popup);

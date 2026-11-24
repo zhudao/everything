@@ -8,6 +8,7 @@ import {
   PDFRawStream,
   decodePDFRawStream,
 } from 'pdf-lib';
+import { annotationPosition, annotationsOf } from './structure.js';
 
 const name = PDFName.of;
 /** Attached files are capped like inserted pictures, so one cannot exhaust the editor. */
@@ -57,23 +58,45 @@ export function listAttachments(doc) {
   });
 }
 
+/** The decoded bytes of the file a file specification embeds, or null. */
+function specBytes(spec) {
+  const stream =
+    spec instanceof PDFDict && spec.lookupMaybe(name('EF'), PDFDict)?.lookup(name('F'));
+  if (!(stream instanceof PDFRawStream)) return null;
+  try {
+    return decodePDFRawStream(stream).decode();
+  } catch {
+    return null;
+  }
+}
+
 /** The bytes of a document-level attachment, decoded, or null when it cannot be read. */
 export function attachmentBytes(doc, key) {
   const tree = embeddedFiles(doc);
   if (!tree) return null;
   for (const [entryKey, value] of leaves(doc, tree)) {
     if (entryKey !== key) continue;
-    const spec = doc.context.lookup(value);
-    const stream =
-      spec instanceof PDFDict && spec.lookupMaybe(name('EF'), PDFDict)?.lookup(name('F'));
-    if (!(stream instanceof PDFRawStream)) return null;
-    try {
-      return decodePDFRawStream(stream).decode();
-    } catch {
-      return null;
-    }
+    return specBytes(doc.context.lookup(value));
   }
   return null;
+}
+
+/**
+ * The file a paperclip comment (FileAttachment) on page `index` holds: { name, bytes }, or null
+ * when the comment is gone or its file cannot be read.
+ */
+export function commentFile(doc, index, id) {
+  const annots = annotationsOf(doc.getPage(index));
+  const position = annotationPosition(annots, id);
+  const dict = position < 0 ? null : doc.context.lookup(annots.get(position));
+  if (!(dict instanceof PDFDict) || dict.lookup(name('Subtype')) !== name('FileAttachment'))
+    return null;
+  const spec = dict.lookup(name('FS'));
+  const bytes = specBytes(spec);
+  if (!bytes) return null;
+  const fileName = text(spec.lookup(name('UF'))) || text(spec.lookup(name('F'))) || 'attachment';
+  // Only the name: a writer may put a path to the file there.
+  return { name: fileName.split(/[\\/]/).pop() || 'attachment', bytes };
 }
 
 /** Attach a file to the document, as a desktop editor's Attachments panel does. */
@@ -90,10 +113,51 @@ export async function addAttachment(doc, { name: fileName, bytes, mimeType, desc
     creationDate: new Date(),
     modificationDate: new Date(),
   };
+  const ref = await embedFile(doc, bytes, key, options);
   const kids = embeddedFiles(doc)?.lookupMaybe(name('Kids'), PDFArray);
-  if (kids) await attachUnderKids(doc, kids, bytes, key, options);
-  else await doc.attach(bytes, key, options);
+  if (kids) attachUnderKids(doc, kids, ref, key);
+  else {
+    // As pdf-lib's attach files it, in the root's own Names array.
+    const within = (dict, key, made) => {
+      const found = dict.lookupMaybe(name(key), made.constructor);
+      if (found) return found;
+      dict.set(name(key), made);
+      return made;
+    };
+    const names = within(doc.catalog, 'Names', doc.context.obj({}));
+    const entries = within(
+      within(names, 'EmbeddedFiles', doc.context.obj({})),
+      'Names',
+      doc.context.obj([]),
+    );
+    entries.push(PDFHexString.fromText(key));
+    entries.push(ref);
+    listAsAssociated(doc, ref);
+  }
   return key;
+}
+
+/**
+ * The file's stream and file specification, now. pdf-lib writes the specification's file name
+ * (F) as a literal string as it is given: a name with a parenthesis that is not closed, as in
+ * "smile :).txt", ended the string early and left the saved PDF unreadable there, the file
+ * gone from it. F keeps the name's printable ASCII, escaped; UF holds the full name.
+ */
+async function embedFile(doc, bytes, key, options) {
+  const ref = await FileEmbedder.for(bytes, key, options).embedIntoContext(doc.context);
+  const spec = doc.context.lookup(ref, PDFDict);
+  const plain = key.replace(/[^\x20-\x7E]/g, '_').replace(/[\\()]/g, '\\$&');
+  spec.set(name('F'), PDFString.of(plain));
+  return ref;
+}
+/** List the file among the document's associated files (PDF/A-3), as pdf-lib does. */
+function listAsAssociated(doc, ref) {
+  let associated = doc.catalog.lookup(name('AF'));
+  if (!associated) {
+    associated = doc.context.obj([]);
+    doc.catalog.set(name('AF'), associated);
+  }
+  if (associated instanceof PDFArray) associated.push(ref);
 }
 
 const keyBytes = (value) =>
@@ -105,8 +169,7 @@ const keyBytes = (value) =>
  * as longer lists are written, must not hold entries itself: readers follow only its Kids, so
  * the file never appeared. Give it a leaf of its own among the Kids, in key order.
  */
-async function attachUnderKids(doc, kids, bytes, key, options) {
-  const ref = await FileEmbedder.for(bytes, key, options).embedIntoContext(doc.context);
+function attachUnderKids(doc, kids, ref, key) {
   const entry = PDFHexString.fromText(key);
   const leaf = doc.context.obj({ Names: [entry, ref], Limits: [entry, entry] });
   const sortKey = keyBytes(entry);
@@ -121,13 +184,7 @@ async function attachUnderKids(doc, kids, bytes, key, options) {
     }
   }
   kids.insert(at, doc.context.register(leaf));
-  // As pdf-lib does, list the file among the document's associated files (PDF/A-3).
-  let associated = doc.catalog.lookup(name('AF'));
-  if (!associated) {
-    associated = doc.context.obj([]);
-    doc.catalog.set(name('AF'), associated);
-  }
-  if (associated instanceof PDFArray) associated.push(ref);
+  listAsAssociated(doc, ref);
 }
 
 /** Remove a document-level attachment by its name tree key. False when it was not found. */

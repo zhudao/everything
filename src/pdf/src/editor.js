@@ -2,17 +2,17 @@ import * as pdfjs from 'pdfjs-dist';
 import workerUrl from 'virtual:pdf-worker-url';
 import { PDFDocument, PDFName, PDFString } from 'pdf-lib';
 import { loadPdfDocument, savePdf } from './core/version.js';
-import { indexPageText, searchQuery } from './core/search.js';
+import { findMatches, indexPageText, searchQuery } from './core/search.js';
 import { inspectText, matrix, textColor } from './core/text-edit.js';
 import { groupTextRuns, replaceTextGroup } from './core/text-group.js';
 import { draftText, needsDraftText, textLineInput } from './text-line-input.js';
 import { groupTextParagraphs } from './core/text-paragraph.js';
 import { readingOrder, reorderSegments, reorderText } from './core/bidi.js';
 import { textPositionControls } from './text-position.js';
-import { placeTextCaret } from './text-caret.js';
+import { placeTextCaret, wrappedTextareaValue } from './text-caret.js';
 import { textWidthControls } from './text-width.js';
 import { createFormLayer } from './form-layer.js';
-import { choiceInputOptions } from './core/form-draft.js';
+import { choiceInputOptions, structureAnnotations } from './core/form-draft.js';
 import { createImageLayer } from './image-layer.js';
 import { createPropertiesPanel } from './properties-panel.js';
 import { createToolsPanel } from './shell/tools-panel.js';
@@ -38,16 +38,28 @@ import { userMenuSlot } from './user-menu.js';
 import { createAttachmentsPanel, createLayersPanel } from './side-panels.js';
 import { createSignaturesPanel, createSignatureBar } from './signatures-panel.js';
 import { chooseDigitalId, signatureDetailsDialog } from './digital-id-dialog.js';
-import { addAttachment, attachmentBytes, removeAttachment } from './core/attachments.js';
+import {
+  MAX_ATTACHMENT_SIZE,
+  addAttachment,
+  attachmentBytes,
+  commentFile,
+  removeAttachment,
+} from './core/attachments.js';
 import {
   listFonts,
   readInitialView,
+  pdfaClaimOf,
   readPdfaClaim,
   writeInitialView,
 } from './core/initial-view.js';
 import { createAccessibilityReport } from './accessibility-report.js';
 import { createFormDesigner, fieldTypeLabel } from './form-designer.js';
-import { createAnnotationLayer, ANNOTATION_KINDS } from './annotation-layer.js';
+import {
+  createAnnotationLayer,
+  ANNOTATION_KINDS,
+  reshapable,
+  resizeBox,
+} from './annotation-layer.js';
 import { measureLabel, MEASURE_UNITS } from './core/measure.js';
 import {
   addTextBox,
@@ -65,9 +77,11 @@ import {
   MAX_XFDF_SIZE,
   exportCommentSummary,
   annotationAccepts,
+  directAnnotationIds,
   REVIEW_STATES,
 } from './core/annotations.js';
-import { ensureStyledFontFaces, cjkDraftFace } from './text-fonts.js';
+import { COMMENT_KINDS } from './core/comments.js';
+import { ensureStyledFontFaces, cjkDraftFace, fallbackDraftFace } from './text-fonts.js';
 import {
   documentAccess,
   requireDocumentAccess,
@@ -83,6 +97,7 @@ import { addLink, normalizeUrl, removeLink, safeLinkUrl, updateLink } from './co
 import { annotationLayerVisible } from './core/optional-content.js';
 import { flattenCounts, flattenDocument } from './core/flatten.js';
 import {
+  MAX_SPLIT_BYTES,
   MAX_SPLIT_FILES,
   parseSplitPoints,
   splitPdf,
@@ -119,6 +134,7 @@ import {
   copyText,
   formatBytes,
   contrastInk,
+  fieldEditingKey,
 } from './lib/ui.js';
 import * as P from './lib/puter.js';
 import { waitFor } from './lib/abort.js';
@@ -149,6 +165,9 @@ import {
   radioButtonChoices,
   sharedChoiceSelections,
   fillFields,
+  previewCalculations,
+  resetFieldNames,
+  resetFields,
   flattenFonts,
   MAX_FILE_SIZE,
   MAX_IMAGE_SIZE,
@@ -248,6 +267,9 @@ export function createEditor({
     tool = 'select',
     destroyed = false,
     busy = true,
+    // Busy with a job that only reads the PDF (printing, pictures, an Office file): leaving
+    // then loses no changes, and the job stops with the editor.
+    readingOnly = false,
     initializing = true,
     saving = false,
     generation = 0,
@@ -261,6 +283,14 @@ export function createEditor({
   let toolsBusy = null; // the busy state the tools pane last showed
   let shownTitle = null; // the document's own title, when it asks to be shown by it
   let pdfaClaim = null; // the PDF/A level the file claims, read when it opens or is converted
+  // The pages' own labels (front matter in roman numerals, an appendix as A-1, A-2), when the
+  // PDF gives any that differ from the page numbers; read with each document, as edits move them.
+  let pageLabels = null;
+  /** Page `i`'s label, or null when it has none or it is just its number. */
+  const pageLabel = (i) => {
+    const label = pageLabels?.[i];
+    return label && label !== String(i + 1) ? label : null;
+  };
   let thumbnailObserver,
     searchGeneration = 0,
     pendingSearch = null,
@@ -342,6 +372,10 @@ export function createEditor({
   let committingDrawing = false;
   let editDocument,
     textEdit = null,
+    // The text a finger is tapping, and the target a finger drags (see syncTextTouch).
+    touchedText = null,
+    textTap = null,
+    movableTextTarget = null,
     finishingText = null,
     textCheckpoint = null,
     textPointer = null,
@@ -494,13 +528,34 @@ export function createEditor({
   // field and turn that draft into an unintended PDF transaction.
   undoButton.addEventListener('pointerdown', (e) => {
     if (e.button === 0 && pageImages.dirty) e.preventDefault();
+    // Arrow-key moves waiting to be saved are saved by the Undo itself (see applyHistory).
+    // Saved as the press takes the focus, the save would turn Undo off before the click.
+    if (e.button === 0) holdNudges();
   });
+  redoButton.addEventListener('pointerdown', (e) => {
+    if (e.button === 0) holdNudges();
+  });
+  function holdNudges() {
+    textEdit?.positionControl?.keys?.hold();
+    textEdit?.widthControl?.keys?.hold();
+    annotationLayer.hold();
+  }
+  /** Whether the selected text has arrow-key moves not yet saved. */
+  const textKeysWaiting = () =>
+    !!(
+      textEdit &&
+      !textEdit.editing &&
+      (textEdit.positionControl?.keys?.waiting || textEdit.widthControl?.keys?.waiting)
+    );
   let pageInputDirty = false;
   const pageInput = el('input', {
     type: 'number',
     min: 1,
     value: 1,
     class: 'page-input',
+    // Only page numbers (not labels like "iv") go here: phones offer the number pad.
+    inputmode: 'numeric',
+    enterkeyhint: 'go',
     'aria-label': 'Page number',
     oninput: () => {
       pageInputDirty = true;
@@ -901,6 +956,9 @@ export function createEditor({
     input.onchange = safe(async () => {
       const file = input.files?.[0];
       if (!file || destroyed) return;
+      // A file too large to attach is turned down before it is read: a video of several
+      // gigabytes would otherwise be held in memory first, and could take the tab down.
+      if (file.size > MAX_ATTACHMENT_SIZE) throw new Error('Attach files of up to 20 MB.');
       const bytes = new Uint8Array(await file.arrayBuffer());
       await mutate(
         (doc) => addAttachment(doc, { name: file.name, bytes, mimeType: file.type || undefined }),
@@ -928,6 +986,8 @@ export function createEditor({
       await renderPage();
       stack.invalidate();
       renderThumbnails();
+      // The Layers panel stays at hand beside Organize pages, whose tiles follow it too.
+      organizer.refresh();
     }),
   });
   layers.el.id = 'sidebar-panel-layers';
@@ -947,12 +1007,11 @@ export function createEditor({
   signaturesPanel.el.setAttribute('role', 'tabpanel');
   signaturesPanel.el.setAttribute('aria-labelledby', 'sidebar-tab-signatures');
   signaturesPanel.el.hidden = true;
-  const signatureBar = createSignatureBar({
-    onOpenPanel: safe(async () => {
-      showSidebarTab('signatures');
-      if (editorRoot.classList.contains('hide-pages')) await toggleSidebar(true);
-    }),
-  });
+  async function openSignaturesPanel() {
+    showSidebarTab('signatures');
+    if (editorRoot.classList.contains('hide-pages')) await toggleSidebar(true);
+  }
+  const signatureBar = createSignatureBar({ onOpenPanel: safe(openSignaturesPanel) });
   // The accessibility check's report, in its own panel once a check has run.
   const accessibilityReport = createAccessibilityReport({
     onFix: (fix) => safe(() => fixAccessibility(fix))(),
@@ -1023,13 +1082,33 @@ export function createEditor({
           : 'This PDF has no certificate signatures.',
       );
   }
-  /** Editing a signed PDF rewrites it, which invalidates its signatures; ask once first. */
-  async function confirmSignedEdit() {
-    if (signedEditAccepted || !signatureReports.some((report) => report.byteRange)) return true;
+  /**
+   * Editing a signed PDF rewrites it, which invalidates its signatures; ask once first. Filling
+   * in `fields` (their names) is added to the file after what was signed, which keeps the
+   * signatures valid, unless one allows no changes or locks one of those fields.
+   */
+  async function confirmSignedEdit(fields) {
+    const signed = signatureReports.filter((report) => report.byteRange);
+    if (signedEditAccepted || !signed.length) return true;
+    const locks = (lock, name) =>
+      !!lock &&
+      (lock.action === 'All' ||
+        (lock.action === 'Include') ===
+          lock.fields.some((locked) => name === locked || name.startsWith(`${locked}.`)));
+    if (
+      fields &&
+      !signed.some(
+        (report) =>
+          report.certification?.level === 1 || fields.some((name) => locks(report.fieldLock, name)),
+      )
+    )
+      return true;
     const count = signatureReports.length;
     const ok = await confirmAction(
       'Edit a signed PDF?',
-      `This PDF has ${count === 1 ? 'a certificate signature' : `${count} certificate signatures`}. Editing it here saves a new copy of the file, and every signature in it will show as invalid. Sign again after editing if the document needs a valid signature.`,
+      fields
+        ? `${count === 1 ? 'The signature in this PDF does' : 'A signature in this PDF does'} not allow ${fields.length === 1 ? 'this field' : 'these fields'} to change. If you fill ${fields.length === 1 ? 'it' : 'them'} in, the signature will show that the document was changed after it was signed.`
+        : `This PDF has ${count === 1 ? 'a certificate signature' : `${count} certificate signatures`}. Editing it here saves a new copy of the file, and every signature in it will show as invalid. Sign again after editing if the document needs a valid signature.`,
       'Edit anyway',
     );
     if (ok) signedEditAccepted = true;
@@ -1099,7 +1178,11 @@ export function createEditor({
                         tabs.length
                     ];
             if (!next) return;
-            showSidebarTab(next.dataset.tab);
+            // With the panel closed the keys only move between the tabs: a tab chosen there
+            // showed nothing, and was taken as open. Enter or Space opens the one with the focus.
+            if (editorRoot.classList.contains('hide-pages')) {
+              for (const tab of tabs) tab.tabIndex = tab === next ? 0 : -1;
+            } else showSidebarTab(next.dataset.tab);
             next.focus();
           },
         },
@@ -1133,10 +1216,12 @@ export function createEditor({
     else if (id === 'attachments' && pdf) loadAttachments(pdf);
     else if (id === 'outline') outline.setCurrent(pageIndex, { reveal: true });
   }
-  // PDF.js names annotations "12R"; the editors use pdf-lib's "12 0 R".
+  // PDF.js names annotations "12R"; the editors use pdf-lib's "12 0 R". Comments written into
+  // the page's Annots directly have IDs of PDF.js's own making, paired as the page is drawn.
+  let directIds = new Map();
   function editorAnnotationId(id) {
     const m = /^(\d+)R(\d*)$/.exec(id);
-    return m ? `${m[1]} ${m[2] || 0} R` : id;
+    return m ? `${m[1]} ${m[2] || 0} R` : (directIds.get(id) ?? id);
   }
   /** Open the note or select the markup a comment points to, once its page is rendered. */
   async function applyRevealComment() {
@@ -1163,13 +1248,19 @@ export function createEditor({
   }
   async function selectComment(pending) {
     const id = editorAnnotationId(pending.id);
-    if (pending.kind === 'annotation') return annotationLayer.focus(id);
+    if (pending.kind === 'annotation') {
+      annotationChoice = null;
+      annotationLayer.focus(id);
+      // On a phone its settings open below the page and take part of its view: the comment
+      // is brought into view once they are shown, not into the space they take.
+      return annotationChoice;
+    }
     const entry =
       pending.kind === 'note'
         ? notes.find((note) => note.id === id) || notes[pending.noteOrdinal]
         : highlights.find((highlight) => highlight.id === id);
-    // A read-only markup has no edit controls on its page, so it is shown there, not selected.
-    if (!entry || (pending.kind !== 'note' && entry.readOnly)) return;
+    // A read-only markup is selected to be read, without its edit controls.
+    if (!entry) return;
     // Navigation or an earlier draft can take time. Keep a newer focus choice while
     // still selecting the requested comment. A draft may focus the overlay or rebuild
     // the comments list, restoring focus to the same comment's replacement button.
@@ -1227,10 +1318,59 @@ export function createEditor({
   // The area drawn in crop mode stays until it is applied, redrawn, or dropped.
   let cropDraft = null;
   const pageForms = createFormLayer({
-    onChange: () => updateStatus(),
-    onCommit: safe(() => finishDrafts()),
+    onChange: () => {
+      updateStatus();
+      previewFormCalculations();
+    },
+    // A value a field refuses is said above the page, at the field it names; a message over
+    // the page said it again, read out twice and covering the fields on a phone.
+    onCommit: () =>
+      finishDrafts().catch((error) => {
+        if (destroyed || (!pageForms.error.hidden && pageForms.error.textContent === error.message))
+          return;
+        toast(error.message || 'This action could not be completed.', { error: true });
+      }),
     onTabOut: (direction) => tabToFormPage(direction),
+    // The form's own Print and Reset buttons.
+    onAction: (action) => {
+      if (busy) return;
+      if (action.kind === 'print') pageDialog(printDialog)();
+      else if (action.kind === 'signature')
+        // An empty signature field is signed; a signed one shows its signature in the panel.
+        safe(async () => {
+          const { listSignatureFields } = await import('./core/digital-signature.js');
+          const field = (await listSignatureFields(session.bytes)).find(
+            ({ name }) => name === action.name,
+          );
+          if (field?.signed) await openSignaturesPanel();
+          else await signWithCertificate({ fieldName: action.name, page: pageIndex });
+        })();
+      else
+        safe(async () => {
+          await finishDrafts();
+          // Only fields change, which a signed PDF takes after what was signed.
+          let fields;
+          try {
+            fields = editDocument ? resetFieldNames(editDocument, action) : undefined;
+          } catch {
+            fields = undefined;
+          }
+          await mutate((doc) => resetFields(doc, action), null, 'fill', { fields });
+        })();
+    },
   });
+  /**
+   * Totals and other calculated fields on the page show what the fields filled in so far work
+   * out to, as they will once saved. The document the page was drawn from is read for it.
+   */
+  function previewFormCalculations() {
+    if (!pageForms.calculates || !editDocument) return;
+    try {
+      pageForms.showCalculated(previewCalculations(editDocument, pageForms.draft.values));
+    } catch {
+      // A form that cannot be worked out shows its saved values.
+    }
+  }
   // The pages with fields to fill, read from the PDF once the fields are first used.
   const fillablePages = new WeakMap();
   pageForms.root.addEventListener('focusin', () => {
@@ -1267,12 +1407,17 @@ export function createEditor({
   }
   const properties = createPropertiesPanel();
   // Comments drawn as annotations, selectable in Select.
+  // The settings of the comment being chosen, once they are shown (see onSelect below).
+  let annotationChoice = null;
   const annotationLayer = createAnnotationLayer({
     onSelect: (entry, { refresh = false } = {}) => {
       if (!entry || refresh) return showAnnotationProperties(entry);
       // Choosing a comment finishes drafts and lets go of a picture, shape, or markup, as
       // choosing any other object does. A draft that cannot be saved keeps the selection.
-      safe(() =>
+      const keep = keepChosenInView(() =>
+        annotationLayer.root.querySelector('.annotation-target.is-selected'),
+      );
+      annotationChoice = safe(() =>
         selectionProperties(async () => {
           cancelTextSelection();
           try {
@@ -1289,7 +1434,7 @@ export function createEditor({
           const chosen = annotationLayer.selected;
           if (chosen) showAnnotationProperties(chosen);
         }),
-      )();
+      )().then(keep);
     },
     // Pressing the comment saves its Comment field first; the move or deletion waits for that.
     onMove: (entry, rect) =>
@@ -1297,6 +1442,13 @@ export function createEditor({
         await annotationTextDraft?.();
         const move = (doc) => editAnnotation(doc, pageIndex, entry.id, { rect });
         await mutate(move, null, 'annotate', { retainScale: true });
+      })(),
+    // A corner dragged resizes the comment, or a callout's text box, its point staying put.
+    onResize: (entry, key, rect) =>
+      safe(async () => {
+        await annotationTextDraft?.();
+        const resize = (doc) => editAnnotation(doc, pageIndex, entry.id, { [key]: rect });
+        await mutate(resize, null, 'annotate', { retainScale: true });
       })(),
     onDelete: (entry) => {
       // Without permission to comment, the Delete button is disabled; the key matches it.
@@ -1382,6 +1534,8 @@ export function createEditor({
         overlay.focus({ preventScroll: true });
     },
     preparePreview: prepareImagePreview,
+    // A tap or the keyboard selects an object; the dock that opens on a phone may cover it.
+    onSelected: () => revealSelected(),
   });
   // Hidden until the first page has its size: an unsized canvas would show as a small blank
   // rectangle while the document loads.
@@ -1416,6 +1570,7 @@ export function createEditor({
     getPdf: () => pdf,
     getZoom: () => zoom,
     getRevision: () => session.revision,
+    getPageIds: (revision) => session.pagesAt(revision),
     getLayers: () => documentLayers || undefined,
     currentIndex: () => pageIndex,
     canFollowScroll: () =>
@@ -1477,6 +1632,8 @@ export function createEditor({
   const organizer = createOrganizeView({
     getPdf: () => pdf,
     getRevision: () => session.revision,
+    getPageIds: (revision) => session.pagesAt(revision),
+    getPageLabel: (i) => pageLabel(i),
     getLayers: () => documentLayers || undefined,
     currentIndex: () => pageIndex,
     can: (permission) => !!access()[permission],
@@ -1532,6 +1689,7 @@ export function createEditor({
     touchScreen?.matches
       ? text
           .replace(/double-click/g, 'double-tap')
+          .replace(/Double-click/g, 'Double-tap')
           .replace(/\bClick\b/g, 'Tap')
           .replace(/\bclick\b/g, 'tap')
       : text;
@@ -1577,6 +1735,7 @@ export function createEditor({
         textSize = Number(e.target.value);
         if (textEdit) {
           textEdit.size = textSize / textEdit.physicalScale;
+          textEdit.sizeControl?.sync();
           layoutTextEdit();
           updateStatus();
         }
@@ -1605,24 +1764,30 @@ export function createEditor({
     edit.run
       ? edit.bold !== edit.original.bold || edit.italic !== edit.original.italic
       : edit.bold || edit.italic;
-  /** The face a draft is previewed and measured with; the text's own unless the style changed. */
-  function draftFace(edit, run = edit.run) {
+  /**
+   * The face a draft is previewed and measured with; the text's own unless the style changed.
+   * `value`, the draft's text, is passed when faces are chosen for each of its runs: reading it
+   * walks every run, and text drawn glyph by glyph has thousands.
+   */
+  function draftFace(edit, run = edit.run, value = edit.input.value) {
     const bold = edit.run && edit.bold === edit.original.bold ? isBoldRun(run) : edit.bold;
     const italic =
       edit.run && edit.italic === edit.original.italic ? isItalicRun(run) : edit.italic;
     const cjk = cjkDraftFace(
       run,
-      edit.input.value,
+      value,
       !edit.run || styleChanged(edit) ? textVariant(bold, italic) : undefined,
     );
     if (cjk) return cjk;
     if (edit.run && !styleChanged(edit))
-      return {
-        weight: edit.run?.fontWeight || 'normal',
-        style: edit.run?.fontStyle || 'normal',
-        family: edit.run?.fontFamily || null,
-        ligatures: edit.run?.fontVariantLigatures || 'normal',
-      };
+      return (
+        (!edit.run.parts && fallbackDraftFace(edit.run, value)) || {
+          weight: edit.run?.fontWeight || 'normal',
+          style: edit.run?.fontStyle || 'normal',
+          family: edit.run?.fontFamily || null,
+          ligatures: edit.run?.fontVariantLigatures || 'normal',
+        }
+      );
     return {
       weight: bold ? 'bold' : 'normal',
       style: italic ? 'italic' : 'normal',
@@ -1644,19 +1809,33 @@ export function createEditor({
     );
     return Promise.all([...weights].map((weight) => ensureStyledFontFaces(weight, text)));
   }
+  /**
+   * Load the Noto Sans faces a draft previews in for characters its own font lacks, and lay it
+   * out again once each has loaded: until then the browser measures a stand-in face.
+   */
+  function loadFallbackFaces(edit, variants) {
+    for (const variant of new Set(variants)) {
+      if (edit.fallbackFaces?.has(variant)) continue;
+      (edit.fallbackFaces ||= new Set()).add(variant);
+      ensureStyledFontFaces(variant).then((loaded) => {
+        if (loaded && textEdit === edit) layoutTextEdit();
+      });
+    }
+  }
   function applyDraftStyle(edit) {
-    if (hasCjkText(edit.input.value))
+    const value = edit.input.value;
+    if (hasCjkText(value))
       loadDraftCjkFaces(edit).then(() => {
         if (textEdit === edit) layoutTextEdit();
       });
-    const face = draftFace(edit);
+    const face = draftFace(edit, edit.run, value);
     if (!edit.run || styleChanged(edit))
       Promise.all(
         (edit.run?.parts || [edit.run]).map((run) => {
-          const face = draftFace(edit, run);
+          const face = draftFace(edit, run, value);
           return ensureStyledFontFaces(
             textVariant(face.weight === 'bold', face.style === 'italic'),
-            edit.input.value,
+            value,
           );
         }),
       ).then(() => {
@@ -2037,26 +2216,92 @@ export function createEditor({
   }
   const activeToolOption = () =>
     suggestedTools().findIndex((option) => option.classList.contains('active'));
+  /** The names and hints of a tool's commands, as the tools pane shows them. */
+  function commandWords(entry) {
+    let sections;
+    try {
+      sections = entry.sections?.() || [];
+    } catch {
+      return '';
+    }
+    return sections
+      .flatMap((section) => (section && section.search !== false && section.items) || [])
+      .map((item) => (item ? `${item.label || ''} ${item.hint || ''}` : ''))
+      .join(' ');
+  }
+  /**
+   * The tools every word is found in, those named for it first, then those holding a command of
+   * that name: "shape", "underline" or "blank page" found nothing, though Add comments and
+   * Organize pages offer them.
+   */
+  function matchingTools(words) {
+    const found = (text) => words.every((word) => word.test(text.toLowerCase()));
+    const named = (entry) => `${entry.label} ${entry.keywords || ''} ${entry.description || ''}`;
+    const tools = toolCatalog().filter((entry) => !entry.hidden);
+    const byName = tools.filter((entry) => found(named(entry)));
+    const byCommand = tools.filter(
+      (entry) => !byName.includes(entry) && found(`${named(entry)} ${commandWords(entry)}`),
+    );
+    return [...byName, ...byCommand];
+  }
+  /** Other words for menu commands, as people ask for them. */
+  const COMMAND_WORDS = {
+    Download: 'save device copy',
+    'Full screen mode': 'fullscreen presentation',
+    'Dark page colors': 'dark pages night invert',
+    'Read this page': 'read aloud speak speech listen',
+    'Read to end of document': 'read aloud speak speech listen',
+    'Outline panel': 'bookmarks table of contents',
+    'Go to page…': 'jump page number',
+  };
+  /**
+   * Menu commands every word is found in, for Find text or tools: Download, Full screen or Go
+   * to page found nothing there, though the menus have them. The side panel's own panels
+   * (attachments, layers) are offered too.
+   */
+  function matchingCommands(words) {
+    const found = (text) => words.every((word) => word.test(text.toLowerCase()));
+    const panel = (id, label, glyph, extra) => {
+      const tab = sidebarTabs.querySelector(`[data-tab="${id}"]`);
+      return (
+        tab &&
+        !tab.hidden && {
+          label,
+          glyph,
+          words: extra,
+          onSelect: safe(async () => {
+            showSidebarTab(id);
+            if (editorRoot.classList.contains('hide-pages')) await toggleSidebar(true);
+          }),
+        }
+      );
+    };
+    const seen = new Set();
+    return [
+      ...menuCommands([...fileItems(), ...editItems(), ...viewItems(), ...pageItems()]),
+      panel('attachments', 'Attachments panel', 'Paperclip', 'attached files paperclip'),
+      panel('layers', 'Layers panel', 'Layers', 'optional content'),
+    ].filter((command) => {
+      if (!command?.onSelect || command.label === 'Find in PDF' || seen.has(command.label))
+        return false;
+      seen.add(command.label);
+      return found(`${command.label} ${command.words || COMMAND_WORDS[command.label] || ''}`);
+    });
+  }
   function suggestTools() {
     const query = searchInput.value.trim().toLowerCase();
     // Words are matched from their start, as typed: "rot" finds the tool that rotates pages,
-    // not Protect a PDF, which merely contains the letters.
-    const words = new RegExp(
-      `(?:^|[^\\p{L}\\p{N}])${query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`,
-      'u',
-    );
-    const matches =
-      query.length < 2
-        ? []
-        : toolCatalog()
-            .filter(
-              (entry) =>
-                !entry.hidden &&
-                words.test(
-                  `${entry.label} ${entry.keywords || ''} ${entry.description || ''}`.toLowerCase(),
-                ),
-            )
-            .slice(0, 5);
+    // not Protect a PDF, which merely contains the letters. Each word is looked for on its own,
+    // so "delete page" or "edit text" finds a tool whose words are not side by side.
+    const words = query
+      .split(/\s+/)
+      .map(
+        (word) =>
+          new RegExp(`(?:^|[^\\p{L}\\p{N}])${word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`, 'u'),
+      );
+    const matches = query.length < 2 ? [] : matchingTools(words).slice(0, 5);
+    const commands =
+      query.length < 2 ? [] : matchingCommands(words).slice(0, Math.max(2, 7 - matches.length));
     toolList.replaceChildren(
       ...matches.map((entry, i) =>
         el(
@@ -2086,9 +2331,34 @@ export function createEditor({
           el('span', {}, entry.label),
         ),
       ),
+      commands.length
+        ? el('div', { class: 'find-tool-heading', 'aria-hidden': 'true' }, 'Commands')
+        : null,
+      ...commands.map((command, i) =>
+        el(
+          'button',
+          {
+            type: 'button',
+            class: 'find-tool-item',
+            id: `find-tool-option-${matches.length + i}`,
+            role: 'option',
+            'aria-selected': 'false',
+            'aria-label': command.label,
+            disabled: !!command.disabled,
+            onclick: () => {
+              closeSearch();
+              command.onSelect();
+            },
+          },
+          icon(command.glyph || 'ChevronRight', 18),
+          el('span', {}, command.label),
+        ),
+      ),
     );
+    // The Tools heading stands over tools alone.
+    toolSuggestions.querySelector('.find-tool-heading').hidden = !matches.length;
     activateToolOption(-1);
-    showToolSuggestions(matches.length > 0);
+    showToolSuggestions(matches.length + commands.length > 0);
   }
   // Reached with Tab, the suggestions take the arrow keys too; Escape goes back to the words.
   toolList.addEventListener('keydown', (e) => {
@@ -2483,7 +2753,9 @@ export function createEditor({
       access().copy ||
       destroyed ||
       event.target === searchInput ||
-      ['owner-password', 'unlock-password'].includes(event.target?.id)
+      ['owner-password', 'unlock-password'].includes(event.target?.id) ||
+      // The app's own drag sources (Organize pages' tiles) move pages; they carry no content.
+      (event.type === 'dragstart' && event.target.closest?.('[draggable="true"]'))
     )
       return;
     event.preventDefault();
@@ -2505,6 +2777,7 @@ export function createEditor({
       textEdit &&
       (textEdit.positionControl?.pending ||
         textEdit.widthControl?.pending ||
+        textEdit.sizeControl?.pending ||
         drawnText(textEdit, textEdit.input.value) !== (textEdit.run?.text || '') ||
         (textEdit.run?.parts &&
           JSON.stringify(drawnSegments(textEdit, textEdit.input.segments())) !==
@@ -2524,6 +2797,7 @@ export function createEditor({
     if (node.textContent !== text) node.textContent = text;
   };
   function updateStatus() {
+    syncTextTouch();
     if (destroyed) return;
     // A brief refresh must still block duplicate actions, without flashing every control
     // gray. Keep each button's resting appearance until the new page is ready; buttons
@@ -2557,7 +2831,7 @@ export function createEditor({
     nameButton.setAttribute('aria-label', `Rename ${name}`);
     // The name is clipped on narrow screens, so the tooltip carries it in full.
     nameButton.title = name;
-    pageForms.setBusy(busy || !pageReady || !access().fill);
+    pageForms.setBusy(busy || !pageReady, { locked: !access().fill });
     pageImages.setBusy(busy || !pageReady || !access().edit);
     const pendingText =
       pendingTextEdit() || pendingNoteEdit() || pageForms.draft.dirty || pageImages.dirty;
@@ -2635,11 +2909,13 @@ export function createEditor({
     }
     const destination = clampPageIndex(pendingNavigation?.index ?? pageIndex);
     // Side by side, the buttons turn pairs: the other page of the pair on view is in sight.
-    const turn = (index) => (stack.twoUp ? Math.floor(index / 2) : index);
+    const turn = (index) => (stack.twoUp ? stack.pairOf(index) : index);
     setStepOff(prevButton, !pageCount || turn(destination) === 0);
     setStepOff(nextButton, !pageCount || turn(destination) >= turn(pageCount - 1));
     editorRoot.setAttribute('aria-busy', String(busy));
-    if (organizer.visible && organizer.busy !== busy) organizer.updateState();
+    // A page chosen elsewhere while organizing (a thumbnail, a find result) moves the grid's mark.
+    if (organizer.visible && (organizer.busy !== busy || organizer.current !== pageIndex))
+      organizer.updateState();
     // The tools pane's commands follow the busy state; redraw only when it changes.
     if (toolsBusy !== busy) {
       toolsBusy = busy;
@@ -2653,6 +2929,7 @@ export function createEditor({
     textRunCache.clear();
     imageRunCache.clear();
     searchTextCache.clear();
+    const keptMatch = currentMatch();
     resetSearch();
     pageRenderGeneration++;
     pageReady = false;
@@ -2688,17 +2965,30 @@ export function createEditor({
       const task = loadPdf(session.bytes.slice());
       loadingTask = task;
       const next = await task.promise;
+      // Read before the pages are shown, so their thumbnails and caption name them at once.
+      const labels = await next.getPageLabels().catch(() => null);
       if (destroyed || token !== generation) {
         await task.destroy();
         return;
       }
       pdf = next;
+      pageLabels =
+        labels?.length === next.numPages && labels.some((label, i) => label !== String(i + 1))
+          ? labels
+          : null;
       // A PDF that asks to be shown by its title is named by the title it has now: details,
       // an accessibility fix, removing hidden information, or undo can each change it.
+      // Undo, redo, or an edit can add or take away the PDF/A claim too; opening reads it
+      // from the file itself (see applyInitialView).
+      const changed = !initializing;
       Promise.all([next.getViewerPreferences(), next.getMetadata()])
-        .then(([prefs, { info }]) => {
+        .then(([prefs, { info, metadata }]) => {
           if (destroyed || pdf !== next) return;
           shownTitle = (prefs?.get('DisplayDocTitle') && String(info?.Title ?? '').trim()) || null;
+          if (changed) {
+            pdfaClaim = pdfaClaimOf(metadata?.getRaw?.());
+            showStandardsBar();
+          }
           updateStatus();
         })
         .catch(() => {});
@@ -2768,7 +3058,7 @@ export function createEditor({
       // Pages added or removed move the others; the current page comes back into view.
       if (rebuilt && !destroyed && pdf === next) stack.scrollTo(pageIndex);
       if (!destroyed && pdf === next) stack.refresh();
-      if (searchInput.value.trim()) scheduleSearch();
+      if (searchInput.value.trim()) scheduleSearch(0, false, keptMatch);
     } finally {
       // The draft is removed by finishTextEdit in this same microtask turn.
       retainedFonts.forEach((face) => document.fonts.delete(face));
@@ -2804,7 +3094,10 @@ export function createEditor({
     closeNoteEditor();
     noteTargets.replaceChildren();
     gesture = null;
-    discardCropDraft();
+    // A crop area drawn on this page stays through a zoom or a turned phone, drawn again at the
+    // new size; another page lets go of it.
+    const keptCrop = tool === 'crop' && cropDraft?.page === pageIndex ? cropDraft : null;
+    if (!keptCrop) discardCropDraft();
     if (!committingDrawing) clearOverlay();
     paper.setAttribute('aria-busy', 'true');
     updateStatus();
@@ -2861,6 +3154,16 @@ export function createEditor({
         layers,
       ]);
       if (token !== pageRenderGeneration || destroyed) return;
+      directIds = new Map();
+      const pairs = (a) =>
+        COMMENT_KINDS[a.subtype] || a.subtype === 'Link' || a.subtype === 'Redact';
+      if (annotations.some((a) => pairs(a) && !/^\d+R\d*$/.test(a.id))) {
+        const doc =
+          editDocument || (await loadPdfDocument(session.bytes, { updateMetadata: false }));
+        if (token !== pageRenderGeneration || destroyed) return;
+        editDocument = doc;
+        directIds = directAnnotationIds(doc.getPage(pageIndex), annotations);
+      }
       const hiddenAnnotations = new Set();
       const visibleAnnotations = annotations.filter((annotation) => {
         if (annotationLayerVisible(annotation, layerConfig)) return true;
@@ -2872,7 +3175,8 @@ export function createEditor({
       const bareRedactions = new Set(
         visibleAnnotations
           .filter((a) => a.subtype === 'Redact' && !a.hasAppearance && !(a.annotationFlags & 34))
-          .map((a) => a.id),
+          // One written straight into /Annots has a PDF.js ID of its own; the marks use its place.
+          .map((a) => (/^\d+R\d*$/.test(a.id) ? a.id : directIds.get(a.id))),
       );
       if (bareRedactions.size) {
         const doc =
@@ -2907,6 +3211,13 @@ export function createEditor({
       const overlayRatio = Math.min(1, ratio);
       overlay.width = Math.max(1, Math.floor(viewport.width * overlayRatio));
       overlay.height = Math.max(1, Math.floor(viewport.height * overlayRatio));
+      if (keptCrop && cropDraft === keptCrop) {
+        const { x, y, width, height } = keptCrop.rect;
+        const [ax, ay] = viewport.convertToViewportPoint(x, y),
+          [bx, by] = viewport.convertToViewportPoint(x + width, y + height);
+        keptCrop.screen = normalizeRect({ x: ax, y: ay }, { x: bx, y: by });
+        drawCropDraft();
+      }
       // PDF.js validates `url`; `unsafeUrl` is whatever the file said, so it is checked here
       // before it can be opened. A link whose address is refused stays listed so it
       // can still be edited or removed, but it opens nothing.
@@ -2918,8 +3229,10 @@ export function createEditor({
           const url = a.url || safeLinkUrl(a.unsafeUrl);
           const action = !url && !a.dest && namedPage(a.action, 0) != null ? a.action : null;
           return {
-            id: a.id,
+            id: directIds.get(a.id) ?? a.id,
             rect: a.rect,
+            // A link over words that wrap onto another line (QuadPoints) covers only those words.
+            quads: a.quadPoints?.length >= 8 ? Array.from(a.quadPoints) : null,
             url,
             address: a.unsafeUrl || a.url || '',
             dest: a.dest,
@@ -3002,13 +3315,18 @@ export function createEditor({
       // The page's tab order (/Tabs), which PDF.js does not report, for a page with fields to
       // visit. The document is loaded already to edit in Select; a form that may only be
       // filled in is read for it.
-      let tabs;
+      let tabs, structureOrder;
       if (annotations.filter((a) => a.fieldName && a.fieldType !== 'Sig').length > 1) {
         const doc =
           editDocument || (await loadPdfDocument(session.bytes, { updateMetadata: false }));
         if (token !== pageRenderGeneration || destroyed) return;
         editDocument = doc;
         tabs = doc.getPage(pageIndex).node.lookup(PDFName.of('Tabs'))?.asString?.().slice(1);
+        // In structure order (/Tabs /S), fields are visited as the tags read them.
+        if (tabs === 'S') {
+          structureOrder = structureAnnotations(await page.getStructTree().catch(() => null));
+          if (token !== pageRenderGeneration || destroyed) return;
+        }
       }
       pageForms.render(
         annotations,
@@ -3020,8 +3338,9 @@ export function createEditor({
         radioChoices,
         listSelections,
         tabs,
+        structureOrder,
       );
-      pageForms.setBusy(busy || !pageReady || !access().fill);
+      pageForms.setBusy(busy || !pageReady, { locked: !access().fill });
       pageForms.setEnabled(tool === 'select' && !preparing);
       highlights = [];
       if (
@@ -3070,14 +3389,18 @@ export function createEditor({
       );
       pageImages.setEnabled(tool === 'select' && access().edit);
       pageReady = true;
-      accessibleText.textContent = access().accessibility
-        ? content.items.map((i) => i.str || '').join(' ')
-        : '';
+      // Words as Read aloud speaks them: a word split between fonts ("Im" in bold, "portant")
+      // or hyphenated at a line end is one word, not two.
+      accessibleText.textContent = access().accessibility ? pageSpeechText(content.items) : '';
       textContainer.setAttribute('aria-hidden', String(!access().accessibility));
       markSearch();
       // A comment chosen from the list opens once the page is ready to show its editor.
       if (revealComment) applyRevealComment().catch(() => {});
-      pageCaption.textContent = `Page ${pageIndex + 1} of ${pdf.numPages}`;
+      // A labelled page is named by its label first, as PDF readers show it: "Page iv (4 of 120)".
+      const label = pageLabel(pageIndex);
+      pageCaption.textContent = label
+        ? `Page ${label} (${pageIndex + 1} of ${pdf.numPages})`
+        : `Page ${pageIndex + 1} of ${pdf.numPages}`;
       outline.setCurrent(pageIndex);
       thumbnails
         .querySelectorAll('.thumbnail')
@@ -3170,7 +3493,20 @@ export function createEditor({
   /** Keep the current page's thumbnail inside the panel's scroll viewport. */
   function revealThumbnail() {
     if (editorRoot.classList.contains('hide-pages')) return;
-    thumbnails.children[pageIndex]?.scrollIntoView({ block: 'nearest' });
+    const item = thumbnails.children[pageIndex];
+    // The list scrolls itself rather than through scrollIntoView, which also moved the browser's
+    // starting point for Tab: a keyboard's first Tab in a PDF just opened went to the thumbnails,
+    // past the skip link, the menus and the tools.
+    if (item) {
+      const list = thumbnails.getBoundingClientRect(),
+        box = item.getBoundingClientRect();
+      if (box.top < list.top) thumbnails.scrollTop -= list.top - box.top;
+      else if (box.bottom > list.bottom)
+        thumbnails.scrollTop += Math.min(box.bottom - list.bottom, box.top - list.top);
+      if (box.left < list.left) thumbnails.scrollLeft -= list.left - box.left;
+      else if (box.right > list.right)
+        thumbnails.scrollLeft += Math.min(box.right - list.right, box.left - list.left);
+    }
     revealedThumbnail = pageIndex;
   }
   function renderThumbnails() {
@@ -3184,7 +3520,22 @@ export function createEditor({
         }
       : null;
     if (restore && movedThumbnail?.from === restore.index) restore.index = movedThumbnail.to;
+    // A drawn thumbnail stands in until its page is drawn again: the picture of the same page
+    // object, which a page moved, or with pages added or removed before it, keeps. Taken by
+    // place, a deleted page's picture showed in the next page's place until that was redrawn.
     const canvases = [...thumbnails.querySelectorAll('.thumb-paper canvas')];
+    const pageRefs = session.pages?.length === pdf.numPages ? session.pages : null;
+    const drawn = new Map();
+    if (pageRefs)
+      for (const canvas of canvases)
+        if (canvas.dataset.page && !drawn.has(canvas.dataset.page))
+          drawn.set(canvas.dataset.page, canvas);
+    const standIn = (i) => {
+      if (!pageRefs) return canvases.length === pdf.numPages ? canvases[i] : null;
+      const canvas = drawn.get(pageRefs[i]);
+      drawn.delete(pageRefs[i]);
+      return canvas;
+    };
     thumbnails.replaceChildren();
     const stop = Number.isInteger(restore?.index)
       ? Math.min(restore.index, pdf.numPages - 1)
@@ -3227,6 +3578,7 @@ export function createEditor({
                 }).promise;
                 if (destroyed || pdf !== thisPdf || !c.isConnected) return;
                 paintCanvas(c, rendered, v);
+                if (page.ref) c.dataset.page = `${page.ref.num} ${page.ref.gen}`;
               } finally {
                 rendered.width = rendered.height = 0;
               }
@@ -3246,7 +3598,9 @@ export function createEditor({
           type: 'button',
           class: 'thumbnail',
           'data-index': i,
-          'aria-label': `Go to page ${i + 1}`,
+          'aria-label': pageLabel(i)
+            ? `Go to page ${i + 1} (${pageLabel(i)})`
+            : `Go to page ${i + 1}`,
           'aria-current': i === pageIndex ? 'page' : 'false',
           tabindex: i === stop && !restore?.menu ? 0 : -1,
           onclick: () => {
@@ -3255,8 +3609,8 @@ export function createEditor({
             navigate(i);
           },
         },
-        el('div', { class: 'thumb-paper' }, canvases[i] || el('canvas', { 'aria-hidden': 'true' })),
-        el('span', {}, String(i + 1)),
+        el('div', { class: 'thumb-paper' }, standIn(i) || el('canvas', { 'aria-hidden': 'true' })),
+        el('span', {}, pageLabel(i) ?? String(i + 1)),
       );
       // Each page has its own menu, on a button beside it and on a right click.
       const menuButton = iconButton(
@@ -3325,11 +3679,27 @@ export function createEditor({
   );
   thumbnails.addEventListener('keydown', (e) => {
     const target = e.target.closest?.('.thumbnail, .thumb-menu');
-    if (!target || e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
+    if (!target || e.altKey || e.ctrlKey || e.metaKey) return;
     const item = target.closest('.thumb-item'),
       items = thumbnails.children,
       index = Number(item.dataset.index),
       menu = target.classList.contains('thumb-menu');
+    if (e.shiftKey && e.key === 'F10' && !menu) {
+      // The keyboard's way to the page's menu, as a right click opens it: macOS browsers send
+      // no context menu event for Shift+F10, and Mac keyboards have no menu key.
+      e.preventDefault();
+      const box = target.getBoundingClientRect();
+      openMenu({
+        anchor: item.querySelector('.thumb-menu'),
+        items: pageItems(index),
+        label: `Page ${index + 1}`,
+        x: box.left + 16,
+        y: box.bottom,
+        minWidth: 230,
+      });
+      return;
+    }
+    if (e.shiftKey) return;
     let next;
     if (e.key === 'ArrowDown' || e.key === 'ArrowUp')
       next = items[index + (e.key === 'ArrowDown' ? 1 : -1)]?.querySelector(
@@ -3357,9 +3727,9 @@ export function createEditor({
     // other page of the pair on view is already in sight.
     if (stack.twoUp) {
       // From the first or last pair there is none to turn to.
-      const pair = Math.floor(from / 2) + direction;
-      if (pair < 0 || pair > Math.floor((pageCount - 1) / 2)) return false;
-      return navigate(pair * 2);
+      const pair = stack.pairOf(from) + direction;
+      if (pair < 0 || pair > stack.pairOf(pageCount - 1)) return false;
+      return navigate(stack.firstOfPair(pair));
     }
     return navigate(from + direction);
   }
@@ -3442,11 +3812,18 @@ export function createEditor({
       toggleToolsPanel(false);
     editorRoot.classList.toggle('hide-pages', !show);
     pagesButton.setAttribute('aria-expanded', String(show));
+    // The tab of the panel shown takes the keyboard's stop again, wherever the arrow keys moved
+    // it while the panel was closed.
+    if (show)
+      for (const tab of sidebarTabs.querySelectorAll('[role="tab"]'))
+        tab.tabIndex = tab.dataset.tab === sidebarTab ? 0 : -1;
     // A control inside a panel that just closed would leave focus on nothing; hand it back to
     // the toggle that opens the panel again.
     if (!show && hadFocus) pagesButton.focus({ preventScroll: true });
-    // A hidden panel could not scroll, so an opening one catches up with the current page.
-    if (show) revealThumbnail();
+    // A hidden panel could not scroll, so an opening one catches up with the current page:
+    // its thumbnail, or its bookmark when the Outline tab is the one open.
+    if (show && sidebarTab === 'outline') outline.setCurrent(pageIndex, { reveal: true });
+    else if (show) revealThumbnail();
     snapPaper();
     // Only a fit-width page whose workspace changed size needs another render: on narrow
     // screens the panel overlays the page, and a fixed zoom keeps its geometry either way.
@@ -3494,9 +3871,27 @@ export function createEditor({
       stack.refresh();
     }
   }
+  const COVER_PAGE_KEY = 'pdf-editor:cover-page';
+  function setCoverPage(on, { remember = true } = {}) {
+    stack.setCover(on);
+    if (remember)
+      try {
+        if (on) localStorage.setItem(COVER_PAGE_KEY, 'on');
+        else localStorage.removeItem(COVER_PAGE_KEY);
+      } catch {
+        /* The preference is optional. */
+      }
+    if (pdf && stack.twoUp) {
+      safe(() => renderPage())();
+      stack.scrollTo(pageIndex);
+      stack.refresh();
+      updateStatus();
+    }
+  }
   try {
     const stored = localStorage.getItem(PAGE_DISPLAY_KEY);
     if (PAGE_DISPLAYS[stored]) setPageDisplay(stored, { remember: false });
+    if (localStorage.getItem(COVER_PAGE_KEY)) setCoverPage(true, { remember: false });
   } catch {
     /* The preference is optional. */
   }
@@ -3606,11 +4001,12 @@ export function createEditor({
     operation,
     message,
     permission = 'edit',
-    { signal, canCommit, onCommit, retainScale = false } = {},
+    { signal, canCommit, onCommit, retainScale = false, fields } = {},
   ) {
     if (busy || destroyed) return;
     requireAccess(...(Array.isArray(permission) ? permission : [permission]));
-    if (!(await confirmSignedEdit()) || busy || destroyed) return;
+    // `fields`: the edit fills in these fields and nothing else.
+    if (!(await confirmSignedEdit(fields)) || busy || destroyed) return;
     const retainedScale = retainScale
       ? { page: pageIndex, mode: scaleMode, request: pendingZoom }
       : null;
@@ -3618,6 +4014,8 @@ export function createEditor({
     updateStatus();
     try {
       const previousPage = pageIndex;
+      const place = pagePlace();
+      pageOnViewRemoved = false;
       try {
         if (
           (await session.change(operation, {
@@ -3625,6 +4023,7 @@ export function createEditor({
             canCommit,
             streamProtection: protection?.original,
             saveOptions: pdfaClaim?.part === 1 ? { useObjectStreams: false } : undefined,
+            incremental: !!fields,
           })) === false
         )
           return;
@@ -3633,7 +4032,13 @@ export function createEditor({
         throw error;
       }
       onCommit?.();
+      rememberPageStep(previousPage);
       await reload(retainedScale);
+      // A page moved with the page on view, or by pages added or removed before it, takes the
+      // view along, the page staying where it was on screen. A page taking the place of the
+      // one deleted is shown from its top.
+      if (previousPage !== pageIndex) restorePagePlace(pageOnViewRemoved ? null : place);
+      settledNavigation = navigationGeneration;
       if (message && !destroyed) toast(message);
     } finally {
       busy = false;
@@ -3642,7 +4047,7 @@ export function createEditor({
     }
   }
   /** Keep a dialog edit local until it succeeds; closing the dialog abandons pending work. */
-  async function mutateDialog(dialog, operation, message, permission = 'edit') {
+  async function mutateDialog(dialog, operation, message, permission = 'edit', { fields } = {}) {
     if (busy || destroyed || !dialog.open) return false;
     let committed = false;
     const controller = new AbortController();
@@ -3661,6 +4066,7 @@ export function createEditor({
     dialog.setAttribute('aria-busy', 'true');
     try {
       await mutate(operation, message, permission, {
+        fields,
         signal: controller.signal,
         // Native close events are queued; the open flag changes synchronously.
         canCommit: () => dialog.open && !destroyed,
@@ -3691,6 +4097,37 @@ export function createEditor({
     }
     return committed;
   }
+  /** Where the page being worked on sits in the view, while it is in sight. */
+  function pagePlace() {
+    if (!stack.continuous || paper.hidden || !paper.isConnected) return null;
+    const box = paper.getBoundingClientRect(),
+      view = workspace.getBoundingClientRect();
+    return box.bottom > view.top && box.top < view.bottom ? box.top : null;
+  }
+  /** Bring the page being worked on, moved to another place, back to `place` in the view. */
+  function restorePagePlace(place) {
+    if (destroyed) return;
+    if (place == null || !stack.continuous || paper.hidden) return stack.scrollTo(pageIndex);
+    workspace.scrollTop += paper.getBoundingClientRect().top - place;
+    stack.quiet();
+  }
+  /**
+   * The page each edit moved the reader from and to, by the revision it made. A page added,
+   * deleted, or moved before or at the page on view takes the reader along to the same page;
+   * undoing or redoing it does the same, as long as the reader has not moved on since.
+   */
+  const pageSteps = new Map();
+  // Whether the edit under way deletes the page on view.
+  let pageOnViewRemoved = false;
+  // The navigation count when the last edit or history step settled: a page chosen since, even
+  // the same one again, means the reader has moved on.
+  let settledNavigation = -1;
+  function rememberPageStep(before) {
+    if (before === pageIndex) return;
+    pageSteps.set(session.revision, { before, after: pageIndex, same: !pageOnViewRemoved });
+    // The history keeps 25 steps; older ones can no longer be undone.
+    for (const key of pageSteps.keys()) if (pageSteps.size > 50) pageSteps.delete(key);
+  }
   let historyTail = Promise.resolve(),
     pendingHistory = 0;
   function history(action) {
@@ -3717,6 +4154,9 @@ export function createEditor({
     const focusPage = () => {
       if (document.activeElement !== undoButton || undoButton.disabled) overlay.focus();
     };
+    // Arrow-key moves still waiting to be saved are saved, then undone (and can be redone),
+    // as when the keys have rested; any other change to the text is discarded as a draft.
+    if (action === 'undo' && textKeysWaiting()) await finishTextEdit();
     if (action === 'undo' && pendingTextEdit()) {
       await finishTextEdit(false);
       focusPage();
@@ -3735,7 +4175,14 @@ export function createEditor({
     if (pageForms[action]()) return;
     if (pageForms.draft.dirty) return;
     await finishDrafts();
+    const undone = session.revision;
     if (session[action]()) {
+      const step = pageSteps.get(action === 'undo' ? undone : session.revision);
+      const [from, to] =
+        action === 'undo' ? [step?.after, step?.before] : [step?.before, step?.after];
+      const follow = step && pageIndex === from && navigationGeneration === settledNavigation;
+      const place = follow && step.same ? pagePlace() : null;
+      if (follow) pageIndex = to;
       // Pressed from the keyboard, the button is disabled while the PDF is redrawn, which drops
       // the focus; it takes it back for the next press unless the focus has moved meanwhile.
       const pressed = [undoButton, redoButton].find((b) => b === document.activeElement);
@@ -3746,6 +4193,9 @@ export function createEditor({
       updateStatus();
       try {
         await reload();
+        // The page goes back to its place in the PDF, and stays where it was on screen.
+        if (follow) restorePagePlace(place);
+        settledNavigation = navigationGeneration;
       } finally {
         busy = false;
         updateStatus();
@@ -3769,6 +4219,7 @@ export function createEditor({
     toolButtons.forEach((b, id) => b.setAttribute('aria-pressed', String(id === tool)));
     const passive = tool === 'select' || tool === 'hand';
     overlay.classList.toggle('active', !passive);
+    overlay.classList.toggle('tap-to-place', tool === 'text' || tool === 'note');
     overlay.tabIndex = passive ? -1 : 0;
     textTargets.hidden = !['text', 'select'].includes(tool);
     textTargets.classList.toggle('select-text-objects', tool === 'select');
@@ -3982,6 +4433,8 @@ export function createEditor({
   /** The Delete and Backspace keys delete a markup, as they delete other comments. */
   const deleteHighlightKey = (entry) => (e) => {
     if (!['Delete', 'Backspace'].includes(e.key) || e.repeat || !access().annotate) return;
+    // A locked or read-only markup stays, as its absent Delete button says.
+    if (entry.readOnly) return;
     e.preventDefault();
     const control = e.currentTarget;
     safe(() => deleteHighlight(entry, control))();
@@ -3992,8 +4445,9 @@ export function createEditor({
     properties.clear('highlight');
     if (tool !== 'select' || !viewport) return;
     for (const entry of highlights) {
-      if (entry.readOnly) continue;
       const label = MARKUP_KINDS[entry.kind].label;
+      // A locked or read-only markup opens to be read, with its thread, as a locked note does.
+      const editable = !entry.readOnly && access().annotate;
       entry.quads.forEach((quad, i) => {
         const points = [];
         for (let j = 0; j < 8; j += 2)
@@ -4007,13 +4461,20 @@ export function createEditor({
         const target = el('button', {
           class: 'highlight-target',
           type: 'button',
-          'aria-label': `Edit ${label}${entry.text ? ': ' + entry.text.slice(0, 80) : ''}${i ? ` (part ${i + 1})` : ''}`,
+          'aria-label': `${editable ? 'Edit' : 'Read'} ${label}${entry.text ? ': ' + entry.text.slice(0, 80) : ''}${i ? ` (part ${i + 1})` : ''}`,
           'aria-pressed': selectedHighlight?.id === entry.id,
           'data-highlight-id': entry.id,
-          disabled: !access().annotate,
+          // One Tab stop for each markup: one across many lines was a stop for every line.
+          ...(i > 0 && { tabindex: -1 }),
           onkeydown: deleteHighlightKey(entry),
-          onclick: safe(() =>
-            selectionProperties(async () => {
+          onclick: safe(async () => {
+            const keep = keepChosenInView(
+              () =>
+                highlightTargets.querySelectorAll(`[data-highlight-id="${CSS.escape(entry.id)}"]`)[
+                  i
+                ],
+            );
+            await selectionProperties(async () => {
               if (busy || !pageReady) return;
               const focusFrom = document.activeElement;
               cancelTextSelection();
@@ -4028,8 +4489,9 @@ export function createEditor({
                 properties.root
                   .querySelector('.highlight-edit-panel input')
                   ?.focus({ preventScroll: true });
-            }),
-          ),
+            });
+            keep();
+          }),
         });
         Object.assign(target.style, {
           left: `${x}px`,
@@ -4041,10 +4503,11 @@ export function createEditor({
         highlightTargets.append(target);
       });
     }
-    if (!selectedHighlight || !access().annotate) return;
+    if (!selectedHighlight) return;
     const entry = selectedHighlight,
       label = MARKUP_KINDS[entry.kind].label,
       Label = label[0].toUpperCase() + label.slice(1);
+    const editable = !entry.readOnly && access().annotate;
     const picker = el('input', {
       type: 'color',
       value: entry.hex,
@@ -4090,15 +4553,20 @@ export function createEditor({
     });
     const panel = el(
       'div',
-      { class: 'highlight-edit-panel', role: 'group', 'aria-label': `Edit ${label}` },
-      picker,
-      button(
-        `Delete ${label}`,
-        'Trash2',
-        safe((e) => deleteHighlight(entry, e.currentTarget)),
-        'text-btn',
-        { 'data-markup-mutation': '' },
-      ),
+      {
+        class: 'highlight-edit-panel',
+        role: 'group',
+        'aria-label': `${editable ? 'Edit' : 'Read'} ${label}`,
+      },
+      editable && picker,
+      editable &&
+        button(
+          `Delete ${label}`,
+          'Trash2',
+          safe((e) => deleteHighlight(entry, e.currentTarget)),
+          'text-btn',
+          { 'data-markup-mutation': '' },
+        ),
       iconButton(`Close ${label} editor`, 'X', closeHighlightEditor),
     );
     // Its replies and review status, as every other comment shows them.
@@ -4125,7 +4593,7 @@ export function createEditor({
             'div',
             { class: 'annotation-props' },
             meta ? el('p', { class: 'muted annotation-meta' }, meta) : null,
-            words ? el('p', { class: 'markup-comment' }, words) : null,
+            words ? el('p', { class: 'markup-comment', dir: 'auto' }, words) : null,
             panel,
             thread && thread.status,
             thread && thread.replies,
@@ -4138,9 +4606,14 @@ export function createEditor({
   /** Reply to the selected markup or set its status, keeping it selected afterwards. */
   async function changeHighlightThread(entry, operation, message, control) {
     await finishDrafts();
+    // One written into the page's Annots directly takes a new ID when a reply first points at
+    // it; its place in the list stays.
+    const ordinal = entry.id.startsWith('direct:')
+      ? highlights.findIndex((h) => h.id === entry.id)
+      : -1;
     await mutate((doc) => operation(doc, entry.id), message, 'annotate', { retainScale: true });
     if (destroyed || tool !== 'select' || selectedHighlight) return;
-    selectedHighlight = highlights.find((h) => h.id === entry.id) || null;
+    selectedHighlight = highlights.find((h) => h.id === entry.id) || highlights[ordinal] || null;
     if (!selectedHighlight) return;
     renderHighlightTargets();
     properties.root.querySelector(`[aria-label="${control}"]`)?.focus({ preventScroll: true });
@@ -4271,41 +4744,72 @@ export function createEditor({
       height,
     );
   };
+  /** Add text where the Text tool was pressed, or let go of the text being edited. */
+  function placeText(e) {
+    if (busy || !pageReady || gesture || tool !== 'text') return;
+    if (textEdit) {
+      safe(deselectObjects)();
+      return;
+    }
+    const overText = textLayer?.textDivs.some((node) => {
+      const r = node.getBoundingClientRect();
+      return (
+        node.textContent.trim() &&
+        e.clientX >= r.left &&
+        e.clientX <= r.right &&
+        e.clientY >= r.top &&
+        e.clientY <= r.bottom
+      );
+    });
+    if (overText) {
+      toast('This text cannot yet be edited. Choose an empty area to add text.');
+      return;
+    }
+    const p = screenPoint(e);
+    safe(() => textDialog(p))();
+  }
+  /** Add a note where the Note tool was pressed, or let go of the note being edited. */
+  function placeNote(e) {
+    if (busy || !pageReady || gesture || tool !== 'note') return;
+    if (noteEdit) {
+      safe(deselectObjects)();
+      return;
+    }
+    const p = screenPoint(e);
+    safe(() => openNoteEditor({ point: p }))();
+  }
+  /** The tools that put something where the page is pressed, and what each puts there. */
+  const placeOnPress = { text: placeText, note: placeNote };
+  // With the Text and Note tools a finger scrolls or zooms the page, as it does in Select mode;
+  // a tap (a finger lifted where it came down, which a scroll cancels) adds the text or note.
+  let textTouch = null,
+    placeTap = null;
+  overlay.addEventListener('pointerup', (e) => {
+    const touch = textTouch;
+    if (touch?.pointerId !== e.pointerId) return;
+    textTouch = null;
+    if (Math.hypot(e.clientX - touch.clientX, e.clientY - touch.clientY) < 10) placeTap = touch;
+  });
+  overlay.addEventListener('pointercancel', (e) => {
+    if (textTouch?.pointerId === e.pointerId) textTouch = null;
+  });
+  // The tap's click comes after the focus its press gave the page; what it adds then takes it.
+  overlay.addEventListener('click', () => {
+    const tap = placeTap;
+    placeTap = null;
+    if (tap) placeOnPress[tool]?.(tap);
+  });
   overlay.addEventListener('pointerdown', (e) => {
+    textTouch = placeTap = null;
     if (busy || !pageReady || gesture || !e.isPrimary || tool === 'select' || e.button !== 0)
       return;
+    if (placeOnPress[tool] && e.pointerType === 'touch') {
+      textTouch = e;
+      return;
+    }
     e.preventDefault();
+    if (placeOnPress[tool]) return placeOnPress[tool](e);
     const p = screenPoint(e);
-    if (tool === 'note') {
-      if (noteEdit) {
-        safe(deselectObjects)();
-        return;
-      }
-      safe(() => openNoteEditor({ point: p }))();
-      return;
-    }
-    if (tool === 'text') {
-      if (textEdit) {
-        safe(deselectObjects)();
-        return;
-      }
-      const overText = textLayer?.textDivs.some((node) => {
-        const r = node.getBoundingClientRect();
-        return (
-          node.textContent.trim() &&
-          e.clientX >= r.left &&
-          e.clientX <= r.right &&
-          e.clientY >= r.top &&
-          e.clientY <= r.bottom
-        );
-      });
-      if (overText) {
-        toast('This text cannot yet be edited. Choose an empty area to add text.');
-        return;
-      }
-      safe(() => textDialog(p))();
-      return;
-    }
     if (tool === 'crop') discardCropDraft();
     if (tool === 'measure' && measureMode.value !== 'distance') {
       // Corners clicked on another page are no part of this one.
@@ -4666,6 +5170,21 @@ export function createEditor({
       },
     ].filter(Boolean);
   }
+  /** Where a named page action ("NextPage" and the like) goes, in words. */
+  const NAMED_PAGES = {
+    FirstPage: 'the first page',
+    LastPage: 'the last page',
+    NextPage: 'the next page',
+    PrevPage: 'the previous page',
+  };
+  // The page each destination of the PDF on view leads to, found once for its links' names.
+  let linkPages = { pdf: null, pages: new Map() };
+  function linkPage(dest) {
+    if (linkPages.pdf !== pdf) linkPages = { pdf, pages: new Map() };
+    const key = JSON.stringify(dest);
+    if (!linkPages.pages.has(key)) linkPages.pages.set(key, destinationPage(pdf, dest));
+    return linkPages.pages.get(key);
+  }
   /** Link targets edit on activation; following a destination is always an explicit action. */
   function renderLinkTargets() {
     linkTargets.replaceChildren();
@@ -4688,7 +5207,9 @@ export function createEditor({
             ? link.address
               ? 'Link with an unsupported address'
               : 'Link with an unsupported action'
-            : 'Link to another page',
+            : link.action
+              ? `Link to ${NAMED_PAGES[link.action]}`
+              : 'Link to another page',
         'aria-haspopup': canEditLink(link) ? 'dialog' : 'menu',
         onclick: safe(() => {
           if (busy) return;
@@ -4697,6 +5218,19 @@ export function createEditor({
         }),
       });
       target.dataset.linkId = link.id;
+      // A screen reader names the page a link leads to, as a reader's tooltip shows it, once
+      // the destination is found; one that leads nowhere keeps the general name.
+      if (link.dest && !link.url)
+        linkPage(link.dest).then((to) => {
+          // A labelled page is named by its label first, as the page caption names it.
+          if (to != null && target.isConnected)
+            target.setAttribute(
+              'aria-label',
+              pageLabel(to)
+                ? `Link to page ${pageLabel(to)} (${to + 1})`
+                : `Link to page ${to + 1}`,
+            );
+        });
       target.addEventListener('contextmenu', (e) => {
         e.preventDefault();
         openMenu({
@@ -4707,12 +5241,36 @@ export function createEditor({
           y: e.clientY,
         });
       });
+      const left = Math.min(a[0], b[0]),
+        top = Math.min(a[1], b[1]);
       Object.assign(target.style, {
-        left: `${Math.min(a[0], b[0])}px`,
-        top: `${Math.min(a[1], b[1])}px`,
+        left: `${left}px`,
+        top: `${top}px`,
         width: `${width}px`,
         height: `${height}px`,
       });
+      // A link over words that wrap (QuadPoints, a box for each line) takes the pointer only
+      // over those words: its rectangle spans the lines, and with them other words and links.
+      if (link.quads) {
+        target.classList.add('is-parted');
+        for (let i = 0; i + 8 <= link.quads.length; i += 8) {
+          const xs = [],
+            ys = [];
+          for (let j = i; j < i + 8; j += 2) {
+            const [x, y] = viewport.convertToViewportPoint(link.quads[j], link.quads[j + 1]);
+            xs.push(x);
+            ys.push(y);
+          }
+          const part = el('span', { class: 'link-part', 'aria-hidden': 'true' });
+          Object.assign(part.style, {
+            left: `${Math.min(...xs) - left}px`,
+            top: `${Math.min(...ys) - top}px`,
+            width: `${Math.max(...xs) - Math.min(...xs)}px`,
+            height: `${Math.max(...ys) - Math.min(...ys)}px`,
+          });
+          target.append(part);
+        }
+      }
       linkTargets.append(target);
     }
   }
@@ -4762,6 +5320,12 @@ export function createEditor({
       operation.closed = linkDialog(initial, link, (dialog) => (operation.dialog = dialog));
       const choice = await operation.closed;
       if (!choice || destroyed) return;
+      if (choice.remove) {
+        await mutate((doc) => removeLink(doc, sourcePage, link.id), 'Link removed.', 'annotate');
+        if (!destroyed && document.activeElement === document.body)
+          overlay.focus({ preventScroll: true });
+        return;
+      }
       // Opening, cancelling, or saving an unchanged link must not create history or
       // replace an existing page destination's precise position and zoom.
       if (choice.page != null ? choice.page === initial.page : choice.url === initial.url) return;
@@ -4868,6 +5432,20 @@ export function createEditor({
             }),
           ),
         );
+      // Also here, not only in the link's right-click menu: a phone or a keyboard on a Mac
+      // has no way to open that menu, and the link could not be removed.
+      if (link)
+        actions.unshift(
+          button(
+            'Remove link',
+            'Unlink',
+            () => {
+              result = { remove: true };
+              dialog.close();
+            },
+            'btn danger',
+          ),
+        );
       const dialog = modal(initial ? 'Edit link' : 'Add link', form, actions);
       dialog.addEventListener('close', () => resolve(result), { once: true });
       onOpen?.(dialog);
@@ -4893,12 +5471,16 @@ export function createEditor({
     cropDraft = null;
     properties.clear('crop');
   }
-  /** Show the kept area with the choice of cropping this page or all of them. */
-  function renderCropDraft() {
-    if (!cropDraft || cropDraft.page !== pageIndex || !viewport) return;
+  /** Dim the page around the kept area. */
+  function drawCropDraft() {
     const ctx = clearOverlay();
     ctx.setTransform(overlay.width / viewport.width, 0, 0, overlay.height / viewport.height, 0, 0);
     drawCropPreview(ctx, cropDraft.screen);
+  }
+  /** Show the kept area with the choice of cropping this page or all of them. */
+  function renderCropDraft() {
+    if (!cropDraft || cropDraft.page !== pageIndex || !viewport) return;
+    drawCropDraft();
     const panel = el(
       'div',
       { class: 'crop-panel', role: 'group', 'aria-label': 'Crop area' },
@@ -5159,6 +5741,7 @@ export function createEditor({
     else edit.input.contentEditable = String(editing);
     edit.input.setAttribute('aria-readonly', String(!editing));
     edit.input.tabIndex = editing ? 0 : -1;
+    syncTextTouch();
     layoutTextEdit();
     if (focus && editing) {
       edit.input.focus({ preventScroll: true });
@@ -5166,6 +5749,102 @@ export function createEditor({
       else edit.input.select();
     } else if (focus) edit.positionControl.handle.focus({ preventScroll: true });
     syncStyleButtons();
+  }
+  /**
+   * Finds `edit`'s text once it is saved and the page indexed again: the editable run with its
+   * words (spaces aside, as wrapping moves them) nearest where it was.
+   */
+  function savedTextRun(edit) {
+    const text = drawnText(edit, edit.input.value).replace(/\s/g, '');
+    const anchor = edit.run
+      ? [edit.run.transform[4] + edit.offset[0], edit.run.transform[5] + edit.offset[1]]
+      : [edit.point.x, edit.point.y];
+    return () => {
+      const candidates = textRuns.filter(
+        (run) => run.editable && run.text.replace(/\s/g, '') === text,
+      );
+      candidates.sort(
+        (a, b) =>
+          Math.hypot(a.transform[4] - anchor[0], a.transform[5] - anchor[1]) -
+          Math.hypot(b.transform[4] - anchor[0], b.transform[5] - anchor[1]),
+      );
+      return candidates[0];
+    };
+  }
+  /**
+   * Save the text from the keyboard (Ctrl/⌘ Enter). The keyboard carries on from the saved
+   * text's own target, as it does when the edit is cancelled, rather than from the page's start.
+   */
+  async function finishTextFromKeyboard() {
+    const edit = textEdit;
+    if (!edit) return;
+    const saved = savedTextRun(edit);
+    await finishTextEdit();
+    if (destroyed || textEdit || ![document.body, overlay].includes(document.activeElement)) return;
+    const run = saved();
+    const target = run && textTargetOf.get(run);
+    if (target?.isConnected) target.focus({ preventScroll: true });
+  }
+  /**
+   * Show `size` (points) in the Text size list. The list offers the usual sizes and this one: the
+   * odd sizes of text selected before (9.26 pt, 13.55 pt…) leave it rather than pile up.
+   */
+  function showTextSize(size) {
+    for (const option of sizeInput.querySelectorAll('option[data-text-size]'))
+      if (Number(option.value) !== size) option.remove();
+    if (![...sizeInput.options].some((option) => Number(option.value) === size)) {
+      const larger = [...sizeInput.options].find((option) => Number(option.value) > size);
+      sizeInput.insertBefore(
+        el('option', { value: size, 'data-text-size': '' }, `${size} pt`),
+        larger || null,
+      );
+    }
+    sizeInput.value = String(size);
+  }
+  /**
+   * A field in the text's properties that takes any size typed, such as 14 pt, where the Text
+   * size list offers only the usual ones. Both show the size the text has.
+   */
+  function textSizeControl(edit) {
+    const current = () => Number((edit.size * edit.physicalScale).toFixed(2));
+    const field = el('input', {
+      type: 'number',
+      step: 'any',
+      required: true,
+      // Text smaller or larger than the usual range still opens as it is.
+      min: String(Math.min(1, current())),
+      max: String(Math.max(1000, current())),
+      'aria-label': 'Font size in points',
+      title: 'Type any size in points, such as 14.',
+    });
+    let shown;
+    const sync = () => {
+      if (document.activeElement === field) return;
+      shown = String(current());
+      field.value = shown;
+    };
+    field.oninput = updateStatus;
+    field.onchange = () => {
+      if (!field.checkValidity() || textEdit !== edit) return;
+      textSize = Number(field.value);
+      edit.size = textSize / edit.physicalScale;
+      showTextSize(textSize);
+      shown = field.value;
+      layoutTextEdit();
+      updateStatus();
+    };
+    sync();
+    return {
+      root: el('div', { class: 'text-position-controls' }, el('label', {}, 'Size', field, 'pt')),
+      sync,
+      get pending() {
+        return field.value !== shown;
+      },
+      validate: () => {
+        if (!field.reportValidity())
+          throw new Error(`Choose a text size from ${field.min} to ${field.max} pt.`);
+      },
+    };
   }
   async function checkpointText(edit) {
     // Typing remains one native undo session. Object drags are individual document edits.
@@ -5176,10 +5855,7 @@ export function createEditor({
     const focusedHandle = edit.handles.contains(document.activeElement)
       ? document.activeElement.getAttribute('aria-label')
       : null;
-    const text = drawnText(edit, edit.input.value).replace(/\s/g, '');
-    const anchor = edit.run
-      ? [edit.run.transform[4] + edit.offset[0], edit.run.transform[5] + edit.offset[1]]
-      : [edit.point.x, edit.point.y];
+    const saved = savedTextRun(edit);
     textCheckpoint = edit;
     try {
       await finishTextEdit();
@@ -5192,18 +5868,11 @@ export function createEditor({
         tool !== selectedTool
       )
         return;
-      const candidates = textRuns.filter(
-        (run) => run.editable && run.text.replace(/\s/g, '') === text,
-      );
-      candidates.sort(
-        (a, b) =>
-          Math.hypot(a.transform[4] - anchor[0], a.transform[5] - anchor[1]) -
-          Math.hypot(b.transform[4] - anchor[0], b.transform[5] - anchor[1]),
-      );
-      if (candidates[0]) {
+      const run = saved();
+      if (run) {
         const focus =
           document.activeElement === document.body || document.activeElement === overlay;
-        const restored = await textDialog(null, candidates[0], {
+        const restored = await textDialog(null, run, {
           editing: false,
           reveal: false,
           focus,
@@ -5296,6 +5965,17 @@ export function createEditor({
   }
   // Each run's target, so the keyboard can return to the text it was editing.
   let textTargetOf = new WeakMap();
+  // A finger on text not yet selected scrolls or zooms the page, as it does anywhere else on
+  // it; a tap selects the text (the run is kept here for the click), and a finger then moves
+  // it. Only the selected text's target takes a finger's drag (see .text-movable).
+  function syncTextTouch() {
+    const target =
+      tool === 'select' && textEdit && !textEdit.editing ? textTargetOf.get(textEdit.run) : null;
+    if (target === movableTextTarget) return;
+    movableTextTarget?.classList.remove('text-movable');
+    target?.classList.add('text-movable');
+    movableTextTarget = target;
+  }
   /**
    * Cancel the text draft from the keyboard. Like a picture or shape, the text hands the
    * keyboard back to its own target, so Tab and Enter carry on from there; new text, or text
@@ -5318,6 +5998,7 @@ export function createEditor({
   function renderTextTargets() {
     textTargets.replaceChildren();
     textTargetOf = new WeakMap();
+    movableTextTarget = null;
     textTargets.hidden = !['text', 'select'].includes(tool) || !access().edit;
     textTargets.classList.toggle('select-text-objects', tool === 'select');
     if (!access().edit) return;
@@ -5331,6 +6012,23 @@ export function createEditor({
         'aria-label': `Edit text: ${readingOrder(run.text)?.text ?? run.text}`,
         title: 'Edit text',
         onclick: safe(async (e) => {
+          const tapped = touchedText === run;
+          touchedText = null;
+          if (tool === 'select' && tapped) {
+            // The second tap of a double tap types in the text, even while the first one is
+            // still saving the text selected before.
+            if (textTap?.run === run && e.detail > 1) textTap.editing = e;
+            if (e.detail !== 1) return;
+            const request = (textTap = { run, editing: null });
+            try {
+              const edit = await textDialog(null, run, { editing: false, reveal: false });
+              if (edit && request.editing && textTap === request)
+                setTextEditing(edit, true, request.editing);
+            } finally {
+              if (textTap === request) textTap = null;
+            }
+            return;
+          }
           if (tool !== 'text' && e.detail) return;
           const point = e.detail ? textPointerPoint(e) : null;
           const edit = await textDialog(null, run, {
@@ -5345,7 +6043,14 @@ export function createEditor({
         }),
       });
       textTargetOf.set(run, target);
-      target.addEventListener('pointerdown', (e) => beginTextSelection(e, run));
+      target.addEventListener('pointerdown', (e) => {
+        touchedText = null;
+        if (e.pointerType === 'touch' && tool === 'select' && target !== movableTextTarget) {
+          if (e.isPrimary && e.button === 0) touchedText = run;
+          return;
+        }
+        beginTextSelection(e, run);
+      });
       Object.assign(target.style, {
         left: `${box.x}px`,
         top: `${box.y}px`,
@@ -5355,6 +6060,7 @@ export function createEditor({
       });
       textTargets.append(target);
     }
+    syncTextTouch();
   }
   let finishingForms;
   /** Saves the words typed into the selected comment's Comment field, which saves on change. */
@@ -5384,7 +6090,16 @@ export function createEditor({
     pageForms.draft.base = new Map([...snapshot.base, ...snapshot.changes]);
     finishingForms = (async () => {
       try {
-        await mutate((doc) => fillFields(doc, values), null, 'fill');
+        // Declining to edit a signed PDF leaves the values typed as a draft: not in the PDF,
+        // and not taken for saved either (Undo would then undo the signing instead).
+        if (!(await confirmSignedEdit(Object.keys(values)))) {
+          pageForms.restore(snapshot);
+          updateStatus();
+          return;
+        }
+        await mutate((doc) => fillFields(doc, values), null, 'fill', {
+          fields: Object.keys(values),
+        });
         pageForms.clearError();
       } catch (error) {
         pageForms.restore(snapshot);
@@ -5423,13 +6138,18 @@ export function createEditor({
       if (edit.panel.contains(field) && field.matches('input')) field.blur();
       edit.positionControl.validate();
       edit.widthControl?.validate();
+      edit.sizeControl?.validate();
       if (hasCjkText(edit.input.value)) {
         await loadDraftCjkFaces(edit);
         if (textEdit !== edit) return;
         layoutTextEdit();
       }
     }
-    let value = drawnText(edit, edit.input.value);
+    // New text is saved line by line as it wrapped at the page edge.
+    let value = drawnText(
+      edit,
+      edit.run || !apply ? edit.input.value : wrappedTextareaValue(edit.input),
+    );
     let segments = drawnSegments(edit, edit.input.segments?.());
     const paragraphChanged =
       edit.run?.paragraph &&
@@ -5489,6 +6209,8 @@ export function createEditor({
                       width: edit.width / edit.physicalScale / edit.widthScale,
                       leading: edit.run.paragraph.leading,
                       softBreaks: flow.softBreaks,
+                      indent: edit.run.paragraph.indent,
+                      align: edit.run.paragraph.align,
                     }
                   : undefined,
                 size: edit.size,
@@ -5604,7 +6326,8 @@ export function createEditor({
           'aria-label': run ? 'Edit text' : 'Text to add',
           placeholder: run ? '' : 'Type your text',
           spellcheck: true,
-          wrap: 'off',
+          // New text wraps at the page edge rather than running off the page.
+          wrap: run ? 'off' : 'soft',
         });
     if (reading) {
       // Lay the line out in its own direction, still starting where the PDF's glyphs start.
@@ -5645,7 +6368,7 @@ export function createEditor({
         leaveTextEdit(overlay);
       } else if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
         e.preventDefault();
-        safe(() => finishTextEdit())();
+        safe(finishTextFromKeyboard)();
       }
     });
     const error = el('p', { class: 'text-edit-error', role: 'alert', hidden: true });
@@ -5697,6 +6420,8 @@ export function createEditor({
     const edit = textEdit;
     applyDraftStyle(edit);
     syncStyleButtons();
+    edit.sizeControl = textSizeControl(edit);
+    panel.prepend(edit.sizeControl.root);
     if (run?.paragraph) {
       edit.widthScale =
         Math.hypot(run.transform[0], run.transform[1]) /
@@ -5747,10 +6472,12 @@ export function createEditor({
       if (e.key === 'Escape') {
         e.preventDefault();
         e.stopPropagation();
+        // A move still being saved (arrow keys just pressed) must not select the text again.
+        cancelTextSelection();
         leaveTextEdit(overlay);
       } else if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
         e.preventDefault();
-        safe(() => finishTextEdit())();
+        safe(finishTextFromKeyboard)();
       } else if (
         e.target === edit.positionControl.handle &&
         (e.key === 'Enter' || e.key === 'F2')
@@ -5786,14 +6513,7 @@ export function createEditor({
     startTextPreview(edit);
     if (run) {
       const physicalSize = Number((textEdit.size * textEdit.physicalScale).toFixed(2));
-      if (![...sizeInput.options].some((option) => Number(option.value) === physicalSize)) {
-        const larger = [...sizeInput.options].find((option) => Number(option.value) > physicalSize);
-        sizeInput.insertBefore(
-          el('option', { value: physicalSize }, `${physicalSize} pt`),
-          larger || null,
-        );
-      }
-      sizeInput.value = String(physicalSize);
+      showTextSize(physicalSize);
       textSize = physicalSize;
       colorInput.value = /^#[0-9a-f]{6}$/i.test(textEdit.hex) ? textEdit.hex : '#111111';
       color = colorInput.value;
@@ -5871,6 +6591,9 @@ export function createEditor({
       ),
     );
     const paragraphWidth = edit.run?.paragraph && (edit.width / edit.widthScale) * zoom;
+    // An indented paragraph's first line starts further in than its others.
+    if (edit.run?.paragraph?.indent)
+      edit.input.style.textIndent = `${edit.run.paragraph.indent * edit.physicalScale * zoom}px`;
     edit.widthControl?.sync(Math.max(24, (availableWidth / zoom) * edit.widthScale));
     const characterWidths = new Map();
     const characterWidth = (char) => {
@@ -5907,11 +6630,17 @@ export function createEditor({
           .join(' ') || 'none',
       transform: box.transform,
     });
-    edit.input.updateStyle?.(
-      edit.hex,
-      box.size,
-      styleChanged(edit) ? (run) => draftFace(edit, run) : undefined,
-    );
+    // New text wrapped at the page edge grows a row for each line it wraps onto.
+    if (!edit.run && edit.input.scrollHeight > edit.input.clientHeight)
+      edit.input.style.height = `${edit.input.scrollHeight}px`;
+    const value = styleChanged(edit) ? edit.input.value : null;
+    const fallbacks =
+      edit.input.updateStyle?.(
+        edit.hex,
+        box.size,
+        styleChanged(edit) ? (run) => draftFace(edit, run, value) : undefined,
+      ) || [];
+    loadFallbackFaces(edit, face.variant ? [...fallbacks, face.variant] : fallbacks);
     const richLayout = edit.input.measureLayout?.();
     if (richLayout) {
       const shift = box.size * edit.run.ascent - richLayout.baseline;
@@ -6172,6 +6901,7 @@ export function createEditor({
           entry.ordinal,
           document.activeElement === document.body || document.activeElement === priorFocus,
         );
+      revealPlaced();
     });
     input.click();
   }
@@ -6390,8 +7120,11 @@ export function createEditor({
         title: entry.text.slice(0, 200),
         'aria-pressed': noteEdit?.entry?.id === entry.id,
         'data-note-id': entry.id,
-        onclick: safe(() =>
-          selectionProperties(async () => {
+        onclick: safe(async () => {
+          const keep = keepChosenInView(() =>
+            noteTargets.querySelector(`[data-note-id="${CSS.escape(entry.id)}"]`),
+          );
+          await selectionProperties(async () => {
             if (busy || !pageReady || noteDragged) return;
             if (noteEdit?.entry?.id === entry.id) return;
             const focusFrom = document.activeElement;
@@ -6406,8 +7139,9 @@ export function createEditor({
               entry: notes.find((note) => note.id === entry.id) || notes[ordinal],
               canFocus: () => canFocusSelection(focusFrom),
             });
-          }),
-        ),
+          });
+          keep();
+        }),
       });
       Object.assign(target.style, {
         left: `${left}px`,
@@ -6449,6 +7183,9 @@ export function createEditor({
     renderHighlightTargets();
     const textarea = el('textarea', {
       class: 'input note-text',
+      // Each comment field and comment shown takes its direction from its own words, so
+      // Hebrew or Arabic reads right to left with its punctuation at the right end.
+      dir: 'auto',
       rows: 4,
       maxlength: 5000,
       placeholder: 'Write a note',
@@ -6639,6 +7376,21 @@ export function createEditor({
     if (!remove) toolColors.note = hex;
     returnFocus();
   }
+  /**
+   * A new signature's or stamp's box in PDF units: `share` of the page across, kept between
+   * `least` and `most` points but always well inside a small page, `ratio` as tall as wide.
+   */
+  function placedMarkSize(share, least, most, ratio) {
+    const across = viewport.width / zoom,
+      down = viewport.height / zoom;
+    const width = Math.min(
+      most,
+      Math.max(least, across * share),
+      across * 0.9,
+      (down * 0.9) / ratio,
+    );
+    return { width: width / viewport.userUnit, height: (width * ratio) / viewport.userUnit };
+  }
   /** Ask for a signature and place it in the middle of the page, selected and ready to drag. */
   async function insertSignature() {
     const version = beginDialogRequest();
@@ -6650,9 +7402,7 @@ export function createEditor({
     if (!choice || destroyed || busy || !pageReady) return;
     const { signature, hex, outline } = choice;
     // About a third of the page across, in the middle, upright however the page is rotated.
-    const pointsAcross = viewport.width / (zoom * viewport.userUnit);
-    const width = Math.min(320, Math.max(120, pointsAcross * 0.35)),
-      height = width * 0.4;
+    const { width, height } = placedMarkSize(0.35, 120, 320, 0.4);
     const center = pdfPoint({ x: viewport.width / 2, y: viewport.height / 2 });
     const target = { x: center.x - width / 2, y: center.y - height / 2, width, height };
     const rotation = viewport.rotation,
@@ -6675,8 +7425,8 @@ export function createEditor({
     revealPlaced();
   }
   /**
-   * A signature or stamp lands in the middle of the page, which on a phone can be below what
-   * is in view once the selection's properties dock opens; the view follows it there.
+   * A picture, signature or stamp lands in the middle of the page, which on a phone can be below
+   * what is in view once the selection's properties dock opens; the view follows it there.
    */
   function revealPlaced() {
     const frame = editorRoot.querySelector('.image-move');
@@ -6693,6 +7443,25 @@ export function createEditor({
       height: box.height + 2 * margin,
     });
   }
+  /**
+   * An object selected by a tap or the keyboard, scrolled into view only when part of it is
+   * hidden (behind the phone's properties dock, say), and then only as far as it needs to be.
+   */
+  function revealSelected() {
+    const frame = editorRoot.querySelector('.image-move');
+    if (!frame) return;
+    const box = frame.getBoundingClientRect(),
+      view = workspace.getBoundingClientRect(),
+      margin = 16;
+    const shift = (start, end, low, high) =>
+      start < low
+        ? start - margin - low
+        : end > high
+          ? Math.min(end + margin - high, start - margin - low)
+          : 0;
+    workspace.scrollTop += shift(box.top, box.bottom, view.top, view.bottom);
+    workspace.scrollLeft += shift(box.left, box.right, view.left, view.right);
+  }
   /** A stamp lands centered like a signature and is selected for moving and resizing. */
   async function insertStamp() {
     const version = beginDialogRequest();
@@ -6700,9 +7469,7 @@ export function createEditor({
     if (busy || !pageReady) return;
     await finishDrafts();
     if (!canOpenDialog(version) || busy || !pageReady) return;
-    const pointsAcross = viewport.width / (zoom * viewport.userUnit);
-    const width = Math.min(260, Math.max(110, pointsAcross * 0.32)),
-      height = width * 0.45;
+    const { width, height } = placedMarkSize(0.32, 110, 260, 0.45);
     const choice = await stampDialog({ ...dialogOptions, size: { width, height } });
     if (!choice || destroyed || busy || !pageReady) return;
     const center = pdfPoint({ x: viewport.width / 2, y: viewport.height / 2 });
@@ -6855,6 +7622,7 @@ export function createEditor({
           type: field.multiline ? null : field.password ? 'password' : 'text',
           class: 'input',
           maxlength: field.maxLength,
+          placeholder: field.placeholder,
           disabled: field.readOnly,
           autocomplete: field.password ? 'off' : null,
           spellcheck: String(field.spellcheck),
@@ -6900,11 +7668,16 @@ export function createEditor({
         else values[key] = control.value;
       });
       try {
-        await mutateDialog(d, (doc) => fillFields(doc, values), 'Form saved.', 'fill');
+        await mutateDialog(d, (doc) => fillFields(doc, values), 'Form saved.', 'fill', {
+          fields: Object.keys(values),
+        });
       } catch (error) {
         // A value refused for its field: the message shows, then the field takes the focus.
         const refused = d.open && controls.get(error?.field)?.control;
         if (!refused) throw error;
+        // The message goes under the field it names: at the end of a long form it was out of
+        // sight while the field took the focus.
+        refused.closest('.field, .checkbox-row')?.after(d.querySelector('.dialog-error'));
         toast(error.message, { error: true });
         refused.setAttribute('aria-invalid', 'true');
         refused.addEventListener('input', () => refused.removeAttribute('aria-invalid'), {
@@ -7090,8 +7863,9 @@ export function createEditor({
       } catch (error) {
         // An existing file that cannot be written (shared to view only, its folder gone) need
         // not cost the changes: offer to keep them as a new file in the app's own folder.
-        // Without a connection a new file could not be written either.
-        if (!targetPath || !current() || P.isConnectionFailure(error)) throw saveFailure(error);
+        // Without a connection, or on a full drive, a new file could not be written either.
+        if (!targetPath || !current() || P.isConnectionFailure(error) || P.isStorageFull(error))
+          throw saveFailure(error);
         if (!(await offerCopy(error)) || !current()) return;
         targetPath = null;
         item = await waitFor(() => P.saveFile(targetName, bytes, null), signal).catch((e) => {
@@ -7325,6 +8099,8 @@ export function createEditor({
         group: 'Create & Edit',
         featured: true,
         description: 'Save the PDF, or its pages, in another format.',
+        keywords:
+          'convert word docx excel xlsx spreadsheet powerpoint pptx slides rtf html txt png jpeg jpg',
         sections: () => [
           {
             title: 'Export to',
@@ -7373,6 +8149,7 @@ export function createEditor({
         group: 'Create & Edit',
         featured: true,
         description: 'Change text and images, or add new content to the pages.',
+        keywords: 'link hyperlink url',
         permission: 'edit',
         sections: () => [
           {
@@ -7528,7 +8305,8 @@ export function createEditor({
         label: 'Organize pages',
         group: 'Create & Edit',
         featured: true,
-        keywords: 'rotate delete move reorder insert extract duplicate split pages',
+        keywords:
+          'rotate delete remove move reorder rearrange insert extract duplicate split pages',
         description:
           'Select pages in the grid, then rotate, move, insert, extract, or delete them. Drag pages to reorder.',
         enter: () => openOrganizer(),
@@ -7652,6 +8430,7 @@ export function createEditor({
         group: 'Review',
         featured: true,
         description: 'Leave notes, highlight text, and mark up pages.',
+        keywords: 'annotate markup draw drawing ink freehand strikethrough',
         permission: 'annotate',
         enter: () => {
           showSidebarTab('comments');
@@ -7821,8 +8600,9 @@ export function createEditor({
         featured: true,
         permission: 'edit',
         keywords: 'form fields fillable acroform text field checkbox radio dropdown',
-        description:
+        description: forPointer(
           'Add fillable fields: choose a field type, then drag a box on the page or click to place one. Double-click a field for its properties.',
+        ),
         enter: () => setPreparing(true),
         leave: () => {
           setPreparing(false);
@@ -7883,6 +8663,8 @@ export function createEditor({
               ],
             },
             {
+              // The PDF's own field names are not the tool's commands, for Find text or tools.
+              search: false,
               title: onPage.length
                 ? `Fields on page ${pageIndex + 1} (${formFields.length} in all)`
                 : `No fields on page ${pageIndex + 1}`,
@@ -7996,6 +8778,7 @@ export function createEditor({
         group: 'Protect & Standardize',
         featured: true,
         description: 'Require a password to open the PDF, or limit what others can do with it.',
+        keywords: 'encrypt encryption lock unlock remove password permissions restrict secure',
         sections: () => [
           {
             title: 'Password',
@@ -8118,6 +8901,7 @@ export function createEditor({
         featured: true,
         permission: 'edit',
         description: 'Make the file smaller by shrinking its pictures.',
+        keywords: 'reduce file size optimize',
         run: () => pageDialog(reduceSizeDialog)(),
       },
       {
@@ -8315,6 +9099,7 @@ export function createEditor({
         id: 'document-properties',
         label: 'Document properties',
         group: 'Protect & Standardize',
+        keywords: 'metadata title author subject info details',
         run: () => pageDialog(detailsDialog)(),
       },
     ];
@@ -8439,12 +9224,16 @@ export function createEditor({
     ];
   }
   function editItems() {
+    // Undo waits its turn behind an edit being saved, as its shortcut does: a menu opened
+    // meanwhile (a move just made with the arrow keys saves as the menu takes the focus)
+    // still offers it.
+    const undoQueues = busy && !!(session.past.length || finishingText);
     return [
       {
         label: 'Undo',
         icon: 'Undo2',
         shortcut: 'Mod+Z',
-        disabled: stepOff(undoButton),
+        disabled: stepOff(undoButton) && !undoQueues,
         onSelect: safe(() => history('undo')),
       },
       {
@@ -8527,11 +9316,23 @@ export function createEditor({
           ['single', 'Single page'],
           ['two-continuous', 'Two-page scrolling'],
           ['two', 'Two-page'],
-        ].map(([display, label]) => ({
-          label,
-          checked: pageDisplay() === display,
-          onSelect: () => setPageDisplay(display),
-        })),
+        ]
+          .map(([display, label]) => ({
+            label,
+            checked: pageDisplay() === display,
+            onSelect: () => setPageDisplay(display),
+          }))
+          .concat([
+            { separator: true },
+            {
+              // Side by side, page 1 alone, as a book's cover, so the pages after it face as
+              // printed: 2 and 3, 4 and 5.
+              label: 'Show cover page',
+              checked: stack.cover,
+              disabled: !stack.twoUp,
+              onSelect: () => setCoverPage(!stack.cover),
+            },
+          ]),
       },
       { label: 'Read out loud', icon: 'Volume2', items: readingItems() },
       {
@@ -8973,6 +9774,11 @@ export function createEditor({
         'Remove the password before signing with a certificate. Encrypting the file again would invalidate the signature.',
       );
     await finishDrafts();
+    // What signing would refuse is refused before a digital ID and the details are asked for.
+    if (certify && signatureReports.length)
+      throw new Error('A document can be certified only before anyone has signed it.');
+    if (signatureReports.some((report) => report.certification?.level === 1))
+      throw new Error('This document is certified and allows no changes, so it cannot be signed.');
     const chosen = await chooseDigitalId(digitalIds, dialogOptions);
     if (!chosen || destroyed) return;
     if (!digitalIds.includes(chosen)) digitalIds.unshift(chosen);
@@ -9031,6 +9837,7 @@ export function createEditor({
     await mutate(
       (doc) => {
         deleteDocumentPages(doc, list);
+        if (list.includes(pageIndex)) pageOnViewRemoved = true;
         for (const index of list) if (index < pageIndex) pageIndex--;
         pageIndex = Math.min(pageIndex, doc.getPageCount() - 1);
       },
@@ -9098,6 +9905,7 @@ export function createEditor({
     await mutate(
       (doc) => {
         deletePage(doc, index);
+        if (index === pageIndex) pageOnViewRemoved = true;
         if (index < pageIndex) pageIndex--;
       },
       null,
@@ -9138,7 +9946,8 @@ export function createEditor({
   /** Find words or patterns on every page and mark the chosen matches for redaction. */
   async function findRedactDialog() {
     requireAccess('edit');
-    const { REDACTION_PATTERNS, findTextRects, addRedactionMarks } = await loadRedaction();
+    const { REDACTION_PATTERNS, findTextRects, findAnnotationTextRects, addRedactionMarks } =
+      await loadRedaction();
     const query = el('input', { class: 'input', autocomplete: 'off', maxlength: 200 });
     const whole = el('input', { type: 'checkbox', id: 'redact-whole' });
     const patternBoxes = Object.entries(REDACTION_PATTERNS).map(([key, pattern]) => ({
@@ -9175,11 +9984,11 @@ export function createEditor({
           // Every search of the page reads its glyphs once.
           const cache = new Map();
           for (const q of queries)
-            for (const match of await findTextRects(doc, page, q, {
-              wholeWord: whole.checked,
-              report,
-              cache,
-            })) {
+            for (const match of [
+              ...(await findTextRects(doc, page, q, { wholeWord: whole.checked, report, cache })),
+              // What was typed into form fields and comments is not in the page's own text.
+              ...findAnnotationTextRects(doc, page, q, { wholeWord: whole.checked }),
+            ]) {
               const key = JSON.stringify(match.rects);
               if (seen.has(key)) continue;
               seen.add(key);
@@ -9724,7 +10533,7 @@ export function createEditor({
       class: 'input',
       placeholder: 'e.g. 1-3, 5',
       'aria-label': 'Pages of the other PDF',
-      inputmode: 'numeric',
+      // No number pad: a phone's has no "-" or "," for ranges and lists.
       autocomplete: 'off',
     });
     const choice = (group, value, label, checked) =>
@@ -9820,6 +10629,7 @@ export function createEditor({
       type: 'number',
       class: 'input',
       id: 'go-to-page',
+      inputmode: 'numeric',
       min: 1,
       max: pdf.numPages,
       value: pageIndex + 1,
@@ -9859,7 +10669,7 @@ export function createEditor({
       class: 'input',
       placeholder: 'e.g. 1-3, 5',
       'aria-label': 'Page range',
-      inputmode: 'numeric',
+      // No number pad: a phone's has no "-" or "," for ranges and lists.
       autocomplete: 'off',
     });
     const choice = (value, label, checked) =>
@@ -9877,7 +10687,14 @@ export function createEditor({
       'div',
       { class: 'choice-list', role: 'radiogroup', 'aria-label': 'Pages to include' },
       all && choice('all', `All pages (${count})`, start === 'all'),
-      choice('current', `Current page (${pageIndex + 1})`, start === 'current'),
+      // A labelled page is named by its label first, as the page caption names it.
+      choice(
+        'current',
+        pageLabel(pageIndex)
+          ? `Current page ${pageLabel(pageIndex)} (${pageIndex + 1})`
+          : `Current page (${pageIndex + 1})`,
+        start === 'current',
+      ),
       el('div', { class: 'choice-with-input' }, rangeChoice, rangeInput),
     );
     return {
@@ -9922,6 +10739,7 @@ export function createEditor({
       maxlength: 200,
       autocomplete: 'off',
       required: true,
+      oninput: () => text.removeAttribute('aria-invalid'),
     });
     const layout = selectInput(
       'watermark-layout',
@@ -9937,10 +10755,19 @@ export function createEditor({
       'medium',
     );
     const colorPick = el('input', { type: 'color', value: '#000000' });
-    const opacity = el('input', { type: 'range', min: 5, max: 100, step: 5, value: 25 });
+    // Said as a percentage, as it is shown: a bare "25" meant nothing to a screen reader.
+    const opacity = el('input', {
+      type: 'range',
+      min: 5,
+      max: 100,
+      step: 5,
+      value: 25,
+      'aria-valuetext': '25%',
+    });
     const opacityValue = el('output', { for: 'watermark-opacity' }, '25%');
     opacity.oninput = () => {
       opacityValue.textContent = `${opacity.value}%`;
+      opacity.setAttribute('aria-valuetext', opacityValue.textContent);
     };
     const choices = pageChoices('watermark-pages', pdf.numPages, { all: true });
     const form = el(
@@ -9961,6 +10788,8 @@ export function createEditor({
     const apply = safe(async () => {
       if (!text.value.trim()) {
         toast('Enter the watermark text.', { error: true });
+        // Marked as refused, for screen readers too, until it is typed in.
+        text.setAttribute('aria-invalid', 'true');
         text.focus();
         return;
       }
@@ -10243,14 +11072,17 @@ export function createEditor({
     // The Print button is disabled while the pages are prepared, which drops its focus; it
     // takes the focus back afterwards, as Undo does, unless the focus has moved on.
     const opener = document.activeElement;
-    busy = true;
+    busy = readingOnly = true;
     updateStatus();
     const controller = new AbortController();
     let handing = false;
     const progress = el('p', { class: 'muted', role: 'status' }, 'Preparing pages…');
-    const d = modal('Printing', el('div', { class: 'stack' }, progress), [
-      button('Cancel', null, () => controller.abort()),
-    ]);
+    const d = modal(
+      'Printing',
+      el('div', { class: 'stack' }, progress),
+      [button('Cancel', null, () => controller.abort())],
+      dialogOptions,
+    );
     // Escape and the close button cancel too; the dialog also closes on its own right before
     // the browser's print dialog takes over.
     d.addEventListener('close', () => {
@@ -10274,7 +11106,7 @@ export function createEditor({
       if (!['AbortError', 'RenderingCancelledException'].includes(error?.name)) throw error;
     } finally {
       if (d.open) d.close();
-      busy = false;
+      busy = readingOnly = false;
       updateStatus();
       if (
         opener?.isConnected &&
@@ -10546,13 +11378,16 @@ export function createEditor({
     // Overlapping ranges describe the same picture. Render each page once, retaining
     // the requested order and avoiding duplicate filenames inside the archive.
     indices = [...new Set(indices)];
-    busy = true;
+    busy = readingOnly = true;
     updateStatus();
     const controller = new AbortController();
     const progress = el('p', { class: 'muted', role: 'status' }, 'Preparing pages…');
-    const d = modal('Downloading pages as images', el('div', { class: 'stack' }, progress), [
-      button('Cancel', null, () => controller.abort()),
-    ]);
+    const d = modal(
+      'Downloading pages as images',
+      el('div', { class: 'stack' }, progress),
+      [button('Cancel', null, () => controller.abort())],
+      dialogOptions,
+    );
     // Escape and the close button cancel too; the dialog closes on its own when done.
     let done = false;
     d.addEventListener('close', () => {
@@ -10563,17 +11398,34 @@ export function createEditor({
       base = safeName(name).replace(/\.pdf$/i, '');
     try {
       const files = [];
-      let picture;
+      let picture,
+        total = 0;
       for (const [k, index] of indices.entries()) {
         controller.signal.throwIfAborted();
         progress.textContent = `Rendering page ${k + 1} of ${indices.length}…`;
-        const blob = await pageImage(thisPdf, index, { dpi, type, signal: controller.signal });
+        // Layers turned off in the Layers panel are left out, as they are on screen.
+        const blob = await pageImage(thisPdf, index, {
+          dpi,
+          type,
+          signal: controller.signal,
+          layers: documentLayers || undefined,
+        });
         if (destroyed) return;
         // Limit the base before adding the page number so long names cannot collide in a ZIP.
         const fileName = `${base} page ${index + 1}.${extension}`;
         // A single image can download directly; only a ZIP needs a copy of its bytes.
         if (indices.length === 1) picture = { name: fileName, blob };
-        else files.push({ name: fileName, bytes: new Uint8Array(await blob.arrayBuffer()) });
+        else {
+          // The ZIP is held in memory until it downloads. Many large pictures (a long scan at
+          // 300 dpi) stop here, with a way out, rather than once every page has been drawn, or
+          // by running the tab out of memory.
+          total += blob.size;
+          if (total > MAX_SPLIT_BYTES)
+            throw new Error(
+              'These pictures would add up to more than 1 GB. Choose fewer pages, a lower resolution, or JPEG.',
+            );
+          files.push({ name: fileName, bytes: new Uint8Array(await blob.arrayBuffer()) });
+        }
       }
       controller.signal.throwIfAborted();
       done = true;
@@ -10590,7 +11442,7 @@ export function createEditor({
     } finally {
       done = true;
       if (d.open) d.close();
-      busy = false;
+      busy = readingOnly = false;
       updateStatus();
     }
   }
@@ -10602,7 +11454,7 @@ export function createEditor({
    */
   function commentTextDialog(title, add) {
     return new Promise((resolve) => {
-      const area = el('textarea', { class: 'input', rows: 4, maxlength: 20000 });
+      const area = el('textarea', { class: 'input', dir: 'auto', rows: 4, maxlength: 20000 });
       const done = safe(async () => {
         // An empty box would be a frame with nothing to read, left on the page.
         if (!area.value.trim()) {
@@ -10870,6 +11722,7 @@ export function createEditor({
     );
     const replyText = el('textarea', {
       class: 'input',
+      dir: 'auto',
       rows: 2,
       placeholder: 'Write a reply',
       'aria-label': 'Reply text',
@@ -10898,6 +11751,14 @@ export function createEditor({
     });
     const when = (date) =>
       date ? date.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' }) : '';
+    const replySnippet = (item) => {
+      const words = [
+        ...String(item.contents || '')
+          .trim()
+          .replace(/\s+/g, ' '),
+      ];
+      return words.length ? `: ${words.slice(0, 40).join('')}${words.length > 40 ? '…' : ''}` : '';
+    };
     // Replies to a reply sit beneath it, as in the thread they belong to.
     const replyItems = (items) =>
       items.map((item) =>
@@ -10905,11 +11766,33 @@ export function createEditor({
           'li',
           {},
           el(
-            'span',
-            { class: 'reply-meta muted' },
-            [item.author, when(item.modified)].filter(Boolean).join(' · '),
+            'div',
+            { class: 'reply-head' },
+            el(
+              'span',
+              { class: 'reply-meta muted' },
+              [item.author, when(item.modified)].filter(Boolean).join(' · '),
+            ),
+            // A reply sent by mistake, or no longer wanted, can be taken back as in other
+            // PDF editors; replies to it go with it. Named with its first words too: one
+            // reviewer's replies all read "Delete reply from Grace" to a screen reader.
+            iconButton(
+              `Delete reply${item.author ? ` from ${item.author}` : ''}${replySnippet(item)}`,
+              'Trash2',
+              safe(() =>
+                run(
+                  (doc) => deleteAnnotation(doc, pageIndex, item.id),
+                  'Reply deleted.',
+                  'Reply text',
+                ),
+              ),
+              {
+                class: 'icon-btn reply-delete',
+                disabled: !access().annotate || item.locked || item.readOnly,
+              },
+            ),
           ),
-          el('span', { class: 'reply-text' }, item.contents || ''),
+          el('span', { class: 'reply-text', dir: 'auto' }, item.contents || ''),
           item.replies?.length > 0 &&
             el('ul', { class: 'annotation-replies' }, ...replyItems(item.replies)),
         ),
@@ -10946,6 +11829,7 @@ export function createEditor({
       );
     const text = el('textarea', {
       class: 'input',
+      dir: 'auto',
       rows: 3,
       maxlength: 20000,
       'aria-label': entry.subtype === 'FreeText' ? 'Text' : 'Comment',
@@ -11016,9 +11900,56 @@ export function createEditor({
       step: 5,
       value: Math.round((entry.opacity ?? 1) * 100),
       'aria-label': 'Opacity',
+      // Said as a percentage: a bare "100" meant nothing to a screen reader.
+      'aria-valuetext': `${Math.round((entry.opacity ?? 1) * 100)}%`,
+      oninput: (e) => e.target.setAttribute('aria-valuetext', `${e.target.value}%`),
       disabled: !accepts('opacity'),
-      onchange: () => apply({ opacity: Number(opacity.value) / 100 }),
+      // Held arrow keys step on until they are let go; a click or drag ends at once.
+      onchange: () => !opacityHeld && restOpacity(),
+      onkeydown: (e) => {
+        if (!e.key.startsWith('Arrow') && !['Home', 'End', 'PageUp', 'PageDown'].includes(e.key))
+          return;
+        opacityHeld = true;
+        clearTimeout(opacityTimer);
+      },
+      onkeyup: () => {
+        if (!opacityHeld) return;
+        opacityHeld = false;
+        restOpacity();
+      },
+      // Saved once the keys rest, not on leaving: a save started by a press on Download
+      // would turn Download off before its click, and a save takes the opacity along anyway.
+      onblur: () => {
+        if (!opacityHeld) return;
+        opacityHeld = false;
+        restOpacity();
+      },
     });
+    // Each arrow key press steps the opacity. Saved press by press, the panel was drawn again
+    // while the next was pressed, and that press was lost: six presses made one step. The
+    // steps are saved as one change once the keys rest, as a comment's nudges are.
+    let opacityHeld = false,
+      opacityTimer = 0,
+      savedOpacity = Math.round((entry.opacity ?? 1) * 100);
+    const saveOpacity = () => {
+      clearTimeout(opacityTimer);
+      opacityTimer = 0;
+      const value = Number(opacity.value);
+      if (opacity.disabled || !opacity.isConnected || value === savedOpacity) return;
+      // Another edit being applied would turn this one away: it waits for that one.
+      if (busy) return void restOpacity();
+      savedOpacity = value;
+      return apply({ opacity: value / 100 });
+    };
+    const restOpacity = () => {
+      clearTimeout(opacityTimer);
+      opacityTimer = setTimeout(saveOpacity, 250);
+    };
+    // A save or download meanwhile takes the opacity along, as it does the typed comment.
+    annotationTextDraft = async () => {
+      await saveText();
+      await saveOpacity();
+    };
     const fontSize =
       entry.subtype === 'FreeText' &&
       el('input', {
@@ -11035,6 +11966,105 @@ export function createEditor({
           if (fontSize.reportValidity()) apply({ fontSize: Number(fontSize.value) / pagePt });
         },
       });
+    // The size as the page shows it, in points: the keyboard's way to resize a comment (or a
+    // callout's text box), as dragging a corner does. The top left corner stays where it is.
+    const sizing = editable && resizeBox(entry);
+    const shownBox = (box) => {
+      const [x1, y1] = viewport.convertToViewportPoint(box.x, box.y),
+        [x2, y2] = viewport.convertToViewportPoint(box.x + box.width, box.y + box.height);
+      const unit = screenUnit() / pagePt;
+      return {
+        x: Math.min(x1, x2),
+        y: Math.min(y1, y2),
+        size: [Math.abs(x2 - x1) / unit, Math.abs(y2 - y1) / unit],
+      };
+    };
+    const sizeFields = sizing
+      ? [0, 1].map((axis) =>
+          el('input', {
+            type: 'number',
+            min: 1,
+            max: 14400,
+            step: 'any',
+            required: true,
+            value: Number(shownBox(sizing.box).size[axis].toFixed(2)),
+            'aria-label': `${entry.kind} ${axis ? 'height' : 'width'} in points`,
+            onchange: (e) => {
+              if (!e.target.reportValidity()) return;
+              const shown = shownBox(sizing.box);
+              // As a dragged corner stops at the page's edge, the size stops where the comment
+              // would leave the page, as it is shown (turned or not); one already past the edge
+              // may keep its size.
+              const room =
+                ((axis ? viewport.height - shown.y : viewport.width - shown.x) * pagePt) /
+                screenUnit();
+              const limit = Math.max(1, room, shown.size[axis]);
+              if (Number(e.target.value) > limit) e.target.value = Number(limit.toFixed(2));
+              const size = shown.size.map((value, i) =>
+                i === axis ? Math.min(Number(e.target.value), limit) : value,
+              );
+              if (Math.abs(size[axis] - shown.size[axis]) < 0.005) return;
+              apply({ [sizing.key]: readerRect(shown, size[0] / pagePt, size[1] / pagePt) });
+            },
+          }),
+        )
+      : [];
+    // A line's or arrow's length and angle as the page shows it: the keyboard's way to move its
+    // end, as dragging that end does. The start stays where it is (an arrow's tail).
+    const line =
+      editable && reshapable(entry) && entry.subtype === 'Line' && entry.points?.length === 2;
+    const lineShape = () => {
+      const [[x1, y1], [x2, y2]] = entry.points.map((p) =>
+        viewport.convertToViewportPoint(p.x, p.y),
+      );
+      const unit = screenUnit() / pagePt;
+      const angle = (Math.atan2(y1 - y2, x2 - x1) * 180) / Math.PI;
+      return {
+        start: { x: x1, y: y1 },
+        length: Math.hypot(x2 - x1, y2 - y1) / unit,
+        angle: (angle + 360) % 360,
+      };
+    };
+    const lineFields = line
+      ? [
+          ['length', 'Length', 'length in points', { min: 1, max: 14400 }],
+          ['angle', 'Angle', 'angle in degrees', { min: -360, max: 360 }],
+        ].map(([key, shown, spoken, range]) =>
+          el(
+            'label',
+            key === 'length' ? { class: 'annotation-pair' } : {},
+            el('span', {}, shown),
+            // An angle is shown in degrees, with its sign, as an object's angle is.
+            el(
+              'span',
+              { class: 'annotation-field' },
+              el('input', {
+                type: 'number',
+                ...range,
+                step: 'any',
+                required: true,
+                value: Number(lineShape()[key].toFixed(key === 'angle' ? 1 : 2)),
+                'aria-label': `${entry.kind} ${spoken}`,
+                onchange: (e) => {
+                  if (!e.target.reportValidity()) return;
+                  const now = lineShape();
+                  const next = { ...now, [key]: Number(e.target.value) };
+                  if (Math.abs(next[key] - now[key]) < (key === 'angle' ? 0.05 : 0.005)) return;
+                  const reach = (next.length / pagePt) * screenUnit(),
+                    turn = (next.angle * Math.PI) / 180;
+                  const end = pdfPoint({
+                    x: now.start.x + reach * Math.cos(turn),
+                    y: now.start.y - reach * Math.sin(turn),
+                  });
+                  const [start] = entry.points;
+                  apply({ points: [{ x: start.x, y: start.y }, end] });
+                },
+              }),
+              key === 'angle' && el('span', { 'aria-hidden': 'true' }, '°'),
+            ),
+          ),
+        )
+      : [];
     const when = (date) =>
       date ? date.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' }) : '';
     const thread = commentThread(entry, async (operation, message, control) => {
@@ -11056,6 +12086,19 @@ export function createEditor({
         [entry.author, when(entry.modified)].filter(Boolean).join(' · ') || entry.kind,
       ),
       text,
+      // A paperclip's file is saved from the paperclip itself, as well as from Attachments.
+      entry.fileName &&
+        button(
+          `Save ${entry.fileName}`,
+          'Download',
+          safe(async () => {
+            const doc = await PDFDocument.load(session.bytes, { updateMetadata: false });
+            const file = commentFile(doc, pageIndex, entry.id);
+            if (!file) throw new Error('This attachment could not be read.');
+            download(file.bytes, file.name, 'application/octet-stream');
+          }),
+          'btn',
+        ),
       el(
         'div',
         { class: 'annotation-style' },
@@ -11069,6 +12112,15 @@ export function createEditor({
           el('label', {}, el('span', {}, 'Width'), width),
         el('label', {}, el('span', {}, 'Opacity'), opacity),
         fontSize && el('label', {}, el('span', {}, 'Font size'), fontSize),
+        ...lineFields,
+        ...sizeFields.map((field, axis) =>
+          el(
+            'label',
+            axis ? {} : { class: 'annotation-pair' },
+            el('span', {}, axis ? 'H' : 'W'),
+            field,
+          ),
+        ),
       ),
       thread.status,
       thread.replies,
@@ -11102,6 +12154,13 @@ export function createEditor({
         reply: reply.startsWith(sent) ? reply.slice(sent.length) : reply,
       };
     };
+    // A number a field refused (0 for a width, or nothing) went on showing once the field was
+    // left, while the comment kept the value it had: left, the field shows that value again.
+    panel.addEventListener('focusout', (e) => {
+      const field = e.target;
+      if (field instanceof HTMLInputElement && field.type === 'number' && !field.checkValidity())
+        field.value = field.defaultValue;
+    });
     // Escape lets go of the comment from its settings too, as from the comment itself; words
     // typed into its text are kept.
     panel.addEventListener('keydown', (e) => {
@@ -11158,13 +12217,17 @@ export function createEditor({
   }
   function importComments() {
     requireAccess('annotate');
-    const input = el('input', { type: 'file', accept: '.xfdf,application/vnd.adobe.xfdf,.xml' });
+    const input = el('input', {
+      type: 'file',
+      accept: '.xfdf,application/vnd.adobe.xfdf,.xml,.fdf,application/vnd.fdf',
+    });
     input.onchange = safe(async () => {
       const file = input.files?.[0];
       if (!file) return;
       // Reading a file that cannot be imported anyway would only hold up the tab.
       if (file.size > MAX_XFDF_SIZE) throw new Error('This comments file is too large to import.');
-      const xfdf = await file.text();
+      // As bytes: the file names its own encoding, which may not be UTF-8.
+      const xfdf = new Uint8Array(await file.arrayBuffer());
       let result = null;
       await mutate(
         async (doc) => {
@@ -11281,7 +12344,8 @@ export function createEditor({
   }
   /** Name, tooltip, flags, and the settings of the field's type. */
   async function fieldPropertiesDialog(field, { created = false } = {}) {
-    const { BUTTON_STYLES, listFormFields, moveFormWidget, updateFormField } = await loadForms();
+    const { BUTTON_STYLES, cleanFieldName, listFormFields, moveFormWidget, updateFormField } =
+      await loadForms();
     const props = field.props || {};
     const checkbox = (id, label, checked) => {
       const box = el('input', { type: 'checkbox', id, checked: !!checked });
@@ -11440,10 +12504,14 @@ export function createEditor({
       // Nothing changed: no edit to record, and the document stays as it was saved.
       if (!resized && Object.keys(next).every((key) => key === 'widgetIndex')) return d.close();
       const rect = resized ? designer.resizedRect(field, sizeOf()) : null;
-      await mutateDialog(
+      // A name another field has is made unique (Name_2); the field took another name unsaid.
+      let otherName = null;
+      const saved = await mutateDialog(
         d,
         async (doc) => {
           const renamed = await updateFormField(doc, field.name, next);
+          otherName =
+            next.name !== undefined && renamed !== cleanFieldName(next.name) ? renamed : null;
           let widgetIndex = field.widgetIndex;
           if (renamed !== field.name) {
             // A radio button named after another group joined it, after that group's buttons.
@@ -11467,6 +12535,10 @@ export function createEditor({
         null,
         'edit',
       );
+      if (saved && otherName && !destroyed)
+        toast(
+          `Another field is named “${cleanFieldName(next.name)}”, so this one is named “${otherName}”.`,
+        );
     });
     const remove = safe(async () => {
       designer.deleting(field);
@@ -11511,7 +12583,7 @@ export function createEditor({
   /** Find fields on a flat form and create the chosen ones, as automatic detection does. */
   async function detectFieldsDialog(version = dialogVersion()) {
     requireAccess('edit');
-    const { addFormField, detectFormFields } = await loadForms();
+    const { detectFormFields } = await loadForms();
     // A newer request, another dialog, or an edit meanwhile makes these findings stale.
     const revision = session.revision;
     const current = () => canOpenDialog(version) && session.revision === revision;
@@ -11555,15 +12627,17 @@ export function createEditor({
       if (!chosen.length) throw new Error('Choose at least one field to create.');
       await mutateDialog(
         d,
-        async (doc) => {
-          for (const field of chosen)
-            await addFormField(doc, field.page, {
+        async (doc) =>
+          (await loadForms()).addFormFields(
+            doc,
+            chosen.map((field) => ({
+              page: field.page,
               type: field.type,
               rect: field.rect,
               name: field.name || undefined,
               multiline: field.multiline || undefined,
-            });
-        },
+            })),
+          ),
         `${chosen.length} ${chosen.length === 1 ? 'field' : 'fields'} created.`,
         'edit',
       );
@@ -11612,7 +12686,13 @@ export function createEditor({
     try {
       const doc = await PDFDocument.load(session.bytes, { updateMetadata: false });
       if (destroyed) return;
-      accessibilityReport.show(checkAccessibility(doc, { access: access() }));
+      const report = checkAccessibility(doc, { access: access() });
+      // Every fix but changing the protection edits the PDF; a PDF that does not allow
+      // editing gets no button that would only end in a refusal (or lose typed alt text).
+      if (!access().edit)
+        for (const rule of report.categories.flatMap((category) => category.rules))
+          if (rule.fix !== 'protection') delete rule.fix;
+      accessibilityReport.show(report);
       accessibilityChecked = true;
       sidebarTabs.querySelector('[data-tab="accessibility"]').hidden = false;
       if (open) {
@@ -11677,6 +12757,7 @@ export function createEditor({
         await run(
           (d) => autotagDocument(d, { lang: navigator.language || undefined }),
           'Tags added. Review the reading order and alternate text.',
+          'Autotag found nothing left to tag.',
         );
         break;
       case 'tag-annotations':
@@ -11993,7 +13074,8 @@ export function createEditor({
     const { compareDocuments } = await import('./core/compare.js');
     const { createCompareView, pageFingerprint } = await import('./compare-view.js');
     closeComparison();
-    busy = true;
+    // Comparing only reads this PDF, as printing does: no unsaved change while it runs.
+    busy = readingOnly = true;
     updateStatus();
     const controller = new AbortController();
     const bar = el('progress', { max: 1, value: 0, 'aria-label': 'Comparison progress' });
@@ -12018,7 +13100,10 @@ export function createEditor({
         signal: controller.signal,
         renderPage: pageFingerprint,
         onProgress: ({ phase, done: finished, total }) => {
-          bar.value = total ? (phase === 'read' ? 0.9 : 1) * (finished / total) : 0;
+          // Reading both files is the first nine tenths; comparing them, the last tenth.
+          if (total)
+            bar.value =
+              phase === 'read' ? 0.9 * (finished / total) : 0.9 + 0.1 * (finished / total);
           progress.textContent =
             phase === 'read' ? `Reading pages (${finished} of ${total})…` : 'Comparing…';
         },
@@ -12049,7 +13134,7 @@ export function createEditor({
     } finally {
       done = true;
       if (d.open) d.close();
-      busy = false;
+      busy = readingOnly = false;
       updateStatus();
     }
   }
@@ -12255,7 +13340,8 @@ export function createEditor({
   async function runBatchSteps(inputs, steps) {
     if (busy || destroyed) return;
     const { runBatch } = await import('./core/batch.js');
-    busy = true;
+    // The files are processed into downloads; this PDF is only read, as printing reads it.
+    busy = readingOnly = true;
     updateStatus();
     const controller = new AbortController();
     const progress = el('p', { class: 'muted', role: 'status' }, 'Starting…');
@@ -12357,7 +13443,7 @@ export function createEditor({
       done = true;
       if (d.open) d.close();
       for (const task of opened.values()) task.destroy().catch(() => {});
-      busy = false;
+      busy = readingOnly = false;
       updateStatus();
     }
   }
@@ -12365,6 +13451,17 @@ export function createEditor({
   // The browser's own speech voices read the page text, page after page when asked.
   let reading = null; // { generation, toEnd }
   const canSpeak = () => !!globalThis.speechSynthesis && access().accessibility;
+  const editingPage = () =>
+    !!(
+      textEdit ||
+      textPointer ||
+      noteEdit ||
+      gesture ||
+      cropDraft ||
+      pageImages.active ||
+      pageImages.dirty ||
+      pageForms.draft.dirty
+    );
   async function pageWords(index) {
     const page = await pdf.getPage(index + 1);
     return pageSpeechText((await page.getTextContent()).items);
@@ -12388,7 +13485,9 @@ export function createEditor({
     for (let index = pageIndex; index < pageCount; index++) {
       const text = await pageWords(index);
       if (reading?.generation !== generation || destroyed) return;
-      if (index !== pageIndex) await navigate(index);
+      // The page follows the voice, except while something on it is being edited: turning
+      // the page would save and close the words being typed as they are heard.
+      if (index !== pageIndex && !editingPage()) await navigate(index);
       for (const chunk of speechChunks(text, { lang })) {
         if (reading?.generation !== generation || destroyed) return;
         spoken = true;
@@ -12512,6 +13611,9 @@ export function createEditor({
       const { createOcrEngine } = await import('./ocr-engine.js');
       const { pageNeedsOcr, addOcrTextLayer } = await import('./core/ocr.js');
       ocrEngine ??= createOcrEngine();
+      // Pages that have text are passed over; a long document of them showed no progress at
+      // all while they were looked through.
+      if (skipText) progress.textContent = 'Looking for pages without text…';
       for (const [k, index] of pages.entries()) {
         controller.signal.throwIfAborted();
         const page = await thisPdf.getPage(index + 1);
@@ -12519,6 +13621,7 @@ export function createEditor({
           const content = await page.getTextContent({ includeMarkedContent: true });
           if (!pageNeedsOcr(content, userArea(page))) {
             skipped++;
+            bar.value = (k + 1) / pages.length;
             continue;
           }
         }
@@ -12556,7 +13659,9 @@ export function createEditor({
       busy = false;
       await mutate(
         async (doc) => {
-          for (const { index, result } of results) await addOcrTextLayer(doc, index, result);
+          // Recognized again on purpose, a page keeps one text layer: the new one.
+          for (const { index, result } of results)
+            await addOcrTextLayer(doc, index, result, { replaceInvisible: !skipText });
         },
         `Recognized ${words.toLocaleString()} ${words === 1 ? 'word' : 'words'} on ${results.length} ${results.length === 1 ? 'page' : 'pages'}. The text can now be searched and selected.`,
       );
@@ -12652,26 +13757,50 @@ export function createEditor({
   async function runOfficeExport(format, pages, { slideBackgrounds, singleSheet, label }) {
     requireAccess('copy');
     if (busy || destroyed || !pdf) return;
-    busy = true;
+    busy = readingOnly = true;
     updateStatus();
     const controller = new AbortController();
     const bar = el('progress', { max: 1, value: 0, 'aria-label': 'Export progress' });
     const progress = el('p', { class: 'muted', role: 'status' }, 'Reading the pages…');
-    const d = modal(`Exporting to ${label}`, el('div', { class: 'stack' }, progress, bar), [
-      button('Cancel', null, () => controller.abort()),
-    ]);
+    const d = modal(
+      `Exporting to ${label}`,
+      el('div', { class: 'stack' }, progress, bar),
+      [button('Cancel', null, () => controller.abort())],
+      dialogOptions,
+    );
     let done = false;
     d.addEventListener('close', () => {
       if (!done) controller.abort();
     });
     const thisPdf = pdf;
+    // Slide backgrounds are drawn without the text the slides show as text boxes, from one
+    // text-free copy of the pages made when the first one is needed.
+    let textFree = null,
+      textFreeTask = null;
+    const textFreePdf = (source) =>
+      (textFree ??= (async () => {
+        try {
+          const { textFreePages } = await import('./core/slide-backgrounds.js');
+          const bytes = await textFreePages(source, pages, { signal: controller.signal });
+          textFreeTask = loadPdf(bytes);
+          const doc = await textFreeTask.promise;
+          const layers = doc.getOptionalContentConfig({ intent: 'display' }).then((config) => {
+            for (const [id, visible] of layerChoices)
+              if (config.getGroup(id)) config.setVisibility(id, visible);
+            return config;
+          });
+          return { doc, layers };
+        } catch (error) {
+          // Without the copy, the pages are drawn as they are, text and all.
+          if (controller.signal.aborted) throw error;
+          return null;
+        }
+      })());
     try {
       const { exportDocument } = await import('./core/export-office.js');
       const { documentDetails } = await import('./core/details.js');
-      const details = documentDetails(
-        await PDFDocument.load(session.bytes, { updateMetadata: false }),
-        session.bytes,
-      );
+      const source = await PDFDocument.load(session.bytes, { updateMetadata: false });
+      const details = documentDetails(source, session.bytes);
       const result = await exportDocument(thisPdf, session.bytes, format, {
         // Layers turned off in the Layers panel are left out, as they are on screen.
         layers: documentLayers || undefined,
@@ -12692,16 +13821,19 @@ export function createEditor({
                 ? `Drawing slide ${finished - count + 1} of ${count}…`
                 : 'Writing the file…';
         },
-        renderPage: async (index, scale = 2) =>
-          new Uint8Array(
-            await (
-              await pageImage(thisPdf, index, {
-                dpi: 72 * scale,
-                type: 'image/png',
-                signal: controller.signal,
-              })
-            ).arrayBuffer(),
-          ),
+        renderPage: async (index, scale = 2, { text = true, areas, rotation } = {}) => {
+          const free = text ? null : await textFreePdf(source);
+          const picture = await pageImage(free?.doc || thisPdf, index, {
+            areas,
+            rotation,
+            dpi: 72 * scale,
+            type: 'image/png',
+            signal: controller.signal,
+            layers: free ? free.layers : documentLayers || undefined,
+          });
+          const bytes = async (blob) => blob && new Uint8Array(await blob.arrayBuffer());
+          return areas ? Promise.all(picture.map(bytes)) : bytes(picture);
+        },
       });
       controller.signal.throwIfAborted();
       if (destroyed) return;
@@ -12717,8 +13849,9 @@ export function createEditor({
       if (!['AbortError', 'RenderingCancelledException'].includes(error?.name)) throw error;
     } finally {
       done = true;
+      textFreeTask?.destroy().catch(() => {});
       if (d.open) d.close();
-      busy = false;
+      busy = readingOnly = false;
       updateStatus();
     }
   }
@@ -12745,7 +13878,7 @@ export function createEditor({
       class: 'input',
       placeholder: 'e.g. 3, 7',
       'aria-label': 'Pages where new parts begin',
-      inputmode: 'numeric',
+      // No number pad: a phone's has no "-" or "," for ranges and lists.
       autocomplete: 'off',
     });
     const choice = (value, label, checked, control) =>
@@ -13066,11 +14199,17 @@ export function createEditor({
     );
   }
   function openSearch() {
-    // The Find bar belongs to the page view, which Organize pages stands in for.
+    // The Find bar belongs to the page view, which Organize pages and Compare files stand in
+    // for; opened under either, it could not be seen, and took the typing out of sight. A
+    // comparison, which may have taken a while, is closed only by asking for Find in so many
+    // words, and says so.
     closeOrganizer();
+    const compared = !!comparison;
+    closeComparison();
     searchBar.hidden = false;
     searchInput.focus();
     searchInput.select();
+    if (compared) toast('Comparison closed. Choose Compare files to compare again.');
   }
   function resetSearch() {
     clearTimeout(searchTimer);
@@ -13091,7 +14230,16 @@ export function createEditor({
     updateStatus();
     return navigationGeneration;
   }
-  function scheduleSearch(delay = 0, takeNavigation = false) {
+  /** The match Find is on, by page and place there, while its query is still the one typed. */
+  const currentMatch = () =>
+    activeMatch >= 0 && matchedQuery === searchQuery(searchInput.value)
+      ? locateMatch(activeMatch)
+      : null;
+  /**
+   * `kept` is the match to stay on: a refresh after an edit (a rotated page, a comment, changed
+   * words) keeps the reader on the match they were on rather than the page's first one.
+   */
+  function scheduleSearch(delay = 0, takeNavigation = false, kept = null) {
     resetSearch();
     const query = searchQuery(searchInput.value);
     if (!query || !pdf) return;
@@ -13100,6 +14248,7 @@ export function createEditor({
       query,
       direction: 1,
       navigation: takeNavigation ? claimSearchNavigation() : navigationGeneration,
+      kept,
     };
     // A refresh after committing an edit must not inherit the pending page choice's
     // permission to navigate. An explicit search action can claim it again later.
@@ -13127,17 +14276,34 @@ export function createEditor({
           if (!isCurrent()) return;
           const text = await page.getTextContent();
           if (!isCurrent()) return;
-          haystack = indexPageText(text.items).text;
+          const { text: pageText, joins } = indexPageText(text.items);
+          haystack = { text: pageText, joins };
           searchTextCache.set(i, haystack);
         }
-        const count = countMatches(haystack, query);
+        const count = findMatches(haystack, query).length;
         if (count) results.push({ page: i, count });
       }
       if (!isCurrent()) return;
       pendingSearch = null;
       matchedQuery = query;
       searchResults = results;
-      if (totalMatches()) {
+      let kept = -1;
+      if (request.kept) {
+        let offset = 0;
+        for (const { page, count } of results) {
+          if (page === request.kept.page) {
+            if (request.kept.ordinal < count) kept = offset + request.kept.ordinal;
+            break;
+          }
+          offset += count;
+        }
+      }
+      // Only while the refresh still owns navigation: a page or comment chosen since, or Next
+      // pressed while it ran, decides where Find goes instead.
+      if (kept >= 0 && request.navigation === navigationGeneration) {
+        activeMatch = kept;
+        showActiveMatch();
+      } else if (totalMatches()) {
         if (request.navigation === navigationGeneration) jumpMatch(request.direction);
         else {
           // Keep the results available, but a newer page choice owns navigation.
@@ -13156,17 +14322,6 @@ export function createEditor({
       }
     }
   }
-  /** Non-overlapping occurrences of `query` in folded page text, as markSearch finds them. */
-  function countMatches(haystack, query) {
-    let count = 0;
-    for (
-      let at = haystack.indexOf(query);
-      at !== -1;
-      at = haystack.indexOf(query, at + query.length)
-    )
-      count++;
-    return count;
-  }
   const totalMatches = () => searchResults.reduce((sum, result) => sum + result.count, 0);
   /** The page holding match `index` across the document, and its ordinal on that page. */
   function locateMatch(index) {
@@ -13181,6 +14336,7 @@ export function createEditor({
     if (pendingSearch) {
       pendingSearch.direction = direction;
       pendingSearch.navigation = claimSearchNavigation();
+      pendingSearch.kept = null;
       if (searchTimer !== null) findText(pendingSearch);
       return;
     }
@@ -13201,7 +14357,11 @@ export function createEditor({
       }
       activeMatch = start;
     } else activeMatch = (activeMatch + direction + total) % total;
-    searchCount.textContent = `${activeMatch + 1} of ${total}`;
+    showActiveMatch();
+  }
+  /** Count, mark and go to the active match. */
+  function showActiveMatch() {
+    searchCount.textContent = `${activeMatch + 1} of ${totalMatches()}`;
     const { page } = locateMatch(activeMatch);
     // A same-page match is still a navigation choice when an older request is pending.
     if (page === pageIndex && !pendingNavigation) markSearch();
@@ -13210,11 +14370,8 @@ export function createEditor({
   function markSearch() {
     if (!pageReady || !pageTextIndex) return;
     const q = matchedQuery;
-    const { text, ranges, origins } = pageTextIndex;
-    const matches = [];
-    if (q)
-      for (let at = text.indexOf(q); at !== -1; at = text.indexOf(q, at + q.length))
-        matches.push([at, at + q.length]);
+    const { ranges, origins } = pageTextIndex;
+    const matches = findMatches(pageTextIndex, q);
     const current = locateMatch(activeMatch);
     const currentOrdinal = current?.page === pageIndex ? current.ordinal : -1;
     let next = 0;
@@ -13239,6 +14396,30 @@ export function createEditor({
     const box = mark.getBoundingClientRect();
     if (!box.width && !box.height) return;
     revealBox(box);
+    // The scroll is Find's, not the reader's: a match near the top of the page, centered,
+    // can leave the page above under the middle of the view, and that page is not chosen.
+    stack.quiet();
+  }
+  /**
+   * On a phone, a chosen comment's settings open below the page and take the lower part of its
+   * view. Whether the comment (the target `find` gives, which a redraw can replace) is in full
+   * view is noted now; the function returned keeps it in view above the settings once they are
+   * shown. Elsewhere the view keeps its size and nothing moves.
+   */
+  function keepChosenInView(find) {
+    const box = find()?.getBoundingClientRect();
+    const view = workspace.getBoundingClientRect();
+    const shown = !!box && box.top >= view.top && box.bottom <= view.bottom;
+    return () => {
+      const now = shown && !destroyed && find()?.getBoundingClientRect();
+      const visible = workspace.getBoundingClientRect();
+      if (!now || now.bottom <= visible.bottom) return;
+      workspace.scrollTop += Math.max(
+        0,
+        Math.min(now.bottom - visible.bottom + 8, now.top - visible.top - 8),
+      );
+      stack.quiet();
+    };
   }
   /** Scroll the workspace to center a box (client coordinates) that is not fully in view. */
   function revealBox(box) {
@@ -13294,6 +14475,12 @@ export function createEditor({
       ? e.code.slice(3).toLowerCase()
       : e.key.toLowerCase();
   /**
+   * The digit a key stands for. A French (AZERTY) keyboard types à, &, é on the digit keys
+   * without Shift, so the key's place names the digit then, as browsers' own zoom keys do.
+   */
+  const zoomDigit = (e) =>
+    /^Digit[0-9]$/.test(e.code) && !/^[0-9]$/.test(e.key) ? e.code.slice(5) : e.key;
+  /**
    * Whether Alt with Ctrl or ⌘ goes with G. Option changes the letter a Mac reports (⌥G is "©"),
    * so the key's place names it then; AltGr, which Windows reports as Ctrl and Alt, types instead.
    */
@@ -13305,6 +14492,9 @@ export function createEditor({
     if (e.isComposing || document.querySelector('dialog[open]')) return;
     // So does puter.js's user menu: keys from its shadow root arrive as the element's.
     if (e.target.closest?.('puter-user-menu')) return;
+    // On a Mac ⌃D, ⌃F, ⌃P and the like edit the text in a field (ui.js); they used to open
+    // Document details, the Find bar, and Print over it.
+    if (fieldEditingKey(e)) return;
     if (e.key === 'Escape' && closeOverlaidPanel(e.target)) {
       e.preventDefault();
       return;
@@ -13394,6 +14584,9 @@ export function createEditor({
       if (e.shiftKey) safe(P.launchedByPuter() ? saveAs : downloadPdf)();
       else safe(() => save())();
     } else if (modifier && key === 'f') {
+      // While comparing, the browser's own Find searches the comparison and its list of
+      // changes; the comparison stays open.
+      if (comparison) return;
       e.preventDefault();
       openSearch();
     } else if (!claimed && ((modifier && !e.altKey && key === 'g') || e.key === 'F3')) {
@@ -13408,10 +14601,10 @@ export function createEditor({
       // The application zooms the page where a browser would zoom the whole interface.
       e.preventDefault();
       safe(() => setZoom(zoomStep(e.key === '-' || e.key === '_' ? -1 : 1)))();
-    } else if (modifier && !e.altKey && !e.shiftKey && ['0', '1', '2'].includes(e.key)) {
+    } else if (modifier && !e.altKey && !e.shiftKey && ['0', '1', '2'].includes(zoomDigit(e))) {
       // Fit page, actual size, and fit width, as desktop PDF editors bind them.
       e.preventDefault();
-      safe(() => setZoom({ 0: 'page', 1: '1', 2: 'fit' }[e.key]))();
+      safe(() => setZoom({ 0: 'page', 1: '1', 2: 'fit' }[zoomDigit(e)]))();
     } else if (
       (modifier && e.shiftKey && !e.altKey && key === 'n') ||
       (modifier && e.altKey && !e.shiftKey && goToPageKey(e))
@@ -13438,8 +14631,34 @@ export function createEditor({
       e.preventDefault();
       if (e.shiftKey) toggleToolsPanel();
       else safe(() => toggleSidebar())();
+    } else if (
+      !modifier &&
+      !e.altKey &&
+      !typing &&
+      !claimed &&
+      pdf &&
+      !stack.continuous &&
+      !organizer.visible &&
+      (e.key === 'PageDown' || e.key === 'PageUp') &&
+      !e.target.closest?.('.page-sidebar, .tools-pane, .menu, .compare-view')
+    ) {
+      // Shown a page (or a pair) at a time, Page Down and Page Up scroll the page on view as
+      // far as it goes and then turn to the next or previous one, as PDF readers do.
+      const down = e.key === 'PageDown';
+      const { scrollTop, scrollHeight, clientHeight } = workspace;
+      if (down ? scrollTop + clientHeight < scrollHeight - 1 : scrollTop > 0) return;
+      e.preventDefault();
+      // Paging back shows the end of the page before, as paging on showed its start, so no
+      // part of a page taller than the view is passed over either way.
+      Promise.resolve(navigateBy(down ? 1 : -1)).then((moved) => {
+        if (!moved || down || destroyed || stack.continuous) return;
+        workspace.scrollTop = workspace.scrollHeight;
+        stack.quiet();
+      });
     } else if (!modifier && !e.altKey && !typing && (e.key === 'Home' || e.key === 'End')) {
-      if (!pdf || claimed || e.target.closest?.('.page-sidebar, .tools-pane, .menu')) return;
+      // In Compare files they scroll the comparison to its first or last pages instead.
+      if (!pdf || claimed || e.target.closest?.('.page-sidebar, .tools-pane, .menu, .compare-view'))
+        return;
       e.preventDefault();
       navigate(e.key === 'Home' ? 0 : pageCount - 1);
     } else if (
@@ -13554,12 +14773,23 @@ export function createEditor({
   // fingers move and drawn afresh at the new zoom once they lift.
   let pinch = null;
   const touchSpan = ([a, b]) => Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY);
-  // Where a finger rests on something that takes touches itself (a drawing tool's surface, an
-  // object being moved), the browser never zoomed either, so neither does the page.
+  // Where a finger rests on something that takes touches itself (a drawing tool's surface, say),
+  // the browser never zoomed either, so neither does the page. A selected object's frame and
+  // handles are the exception: two fingers there zoom, and take back the move one began.
   const takesTouch = (node) => {
+    if (pageImages.controls.contains(node)) return false;
     for (let at = node; at && at !== workspace; at = at.parentElement)
       if (getComputedStyle(at).touchAction === 'none') return true;
     return false;
+  };
+  /** Whether a finger is on the page view. Selecting an object replaces the frame a finger went
+   * down on, which then counts by where the finger is. */
+  const inWorkspace = ({ target, clientX, clientY }) => {
+    if (target.isConnected) return workspace.contains(target);
+    const box = workspace.getBoundingClientRect();
+    return (
+      clientX >= box.left && clientX <= box.right && clientY >= box.top && clientY <= box.bottom
+    );
   };
   /** The pages' stretch from a pinch, kept after the fingers lift until the zoom is drawn. */
   function clearPinchScale() {
@@ -13581,12 +14811,7 @@ export function createEditor({
     (e) => {
       if (e.touches.length !== 2) return endPinch(false);
       const touches = [...e.touches];
-      if (
-        !pdf ||
-        busy ||
-        touches.some((t) => !workspace.contains(t.target) || takesTouch(t.target))
-      )
-        return;
+      if (!pdf || busy || touches.some((t) => !inWorkspace(t) || takesTouch(t.target))) return;
       panning = null;
       editorRoot.classList.remove('panning');
       // A pinch started while the last one is still being drawn starts from the pages as laid out.
@@ -13706,6 +14931,8 @@ export function createEditor({
       if (title) shownTitle = title;
     }
     if (view.layout !== 'default') setPageDisplay(view.layout, { remember: false });
+    // TwoPageRight and TwoColumnRight put page 1 alone, as a cover.
+    if (view.cover != null && stack.twoUp) setCoverPage(view.cover, { remember: false });
     const panel = {
       bookmarks: 'outline',
       pages: 'pages',
@@ -13723,6 +14950,9 @@ export function createEditor({
         ? Math.min(ZOOM_LEVELS.at(-1), Math.max(ZOOM_LEVELS[0], view.zoom))
         : view.zoom;
     if (asked !== 'default') await setZoom(String(asked));
+    // As for a bookmark, a place on the page (an XYZ destination's top) comes to the view's top.
+    if ((view.left != null || view.top != null) && view.page < pageCount && !destroyed)
+      await showDestination({ page: view.page, left: view.left, top: view.top });
     updateStatus();
   }
   return {
@@ -13732,7 +14962,7 @@ export function createEditor({
         session.dirty ||
         protectionDirty ||
         saving ||
-        (busy && !initializing) ||
+        (busy && !initializing && !readingOnly) ||
         pendingTextEdit() ||
         pendingNoteEdit() ||
         pageForms.draft.dirty ||

@@ -7,10 +7,11 @@
 //
 // Compare: base = revised document, other = original (other-only text is deleted text).
 // Combine: base = original document, other = a revised copy (other-only text is inserted text).
-import { trackFormatChanges } from './revisions.js';
+import { trackFormatChanges, revisionTimes } from './revisions.js';
 import { documentBlocks } from './tables.js';
 import { readCoreProperties } from './docx-core-properties.js';
 import { hasNumberingDefinition, hasListLevel } from './numbering.js';
+import { wordBreaks } from './dictionary-breaks.js';
 
 const OBJECT = '￼';
 
@@ -25,7 +26,15 @@ export function tokenize(text, granularity = 'word') {
     for (const segment of segments) { out.push({ text: segment, start: at, end: at + segment.length }); at += segment.length; }
     return out;
   }
-  return [...text.matchAll(WORD)].map(m => ({ text: m[0], start: m.index, end: m.index + m[0].length }));
+  // Chinese, Japanese, Thai, Lao, Khmer and Myanmar put no spaces between words: a run of their letters is split
+  // where the dictionary finds words (dictionary-breaks.js, as Ctrl+Arrow steps), or a changed word in a sentence
+  // marked the whole sentence deleted and inserted again.
+  return [...text.matchAll(WORD)].flatMap(m => {
+    const breaks = wordBreaks(m[0]);
+    if (!breaks) return [{ text: m[0], start: m.index, end: m.index + m[0].length }];
+    const cuts = [0, ...[...breaks].sort((a, b) => a - b), m[0].length];
+    return cuts.slice(1).map((end, i) => ({ text: m[0].slice(cuts[i], end), start: m.index + cuts[i], end: m.index + end }));
+  });
 }
 
 /**
@@ -240,8 +249,13 @@ function mergePair(base, other, { granularity, equals, otherIsNew, revision, sty
   // Deleted runs after the last visible character.
   for (const piece of pieces) if (piece.hidden && piece.at >= baseText.length) runs.push({ ...piece.run });
   const out = { ...base, runs: mergeRuns(runs) };
-  const moved = offset => offset + shifts.filter(s => s.at < offset).reduce((n, s) => n + s.length, 0);
-  if (out.bookmarks) out.bookmarks = out.bookmarks.map(m => ({ ...m, offset: moved(m.offset) }));
+  // Text copied in where a range starts goes before it, and where one ends after it: a comment on a replaced word
+  // stays on that word rather than taking in the copied text beside it. A range that is a point stays one.
+  const moved = (offset, starts = false) => offset + shifts.filter(s => s.at < offset || starts && s.at === offset).reduce((n, s) => n + s.length, 0);
+  if (out.bookmarks) {
+    const points = new Set(out.bookmarks.filter(m => m.edge === 'end').map(m => `${m.id}\u0000${m.offset}`));
+    out.bookmarks = out.bookmarks.map(m => ({ ...m, offset: moved(m.offset, m.edge === 'start' && !points.has(`${m.id}\u0000${m.offset}`)) }));
+  }
   if (out.fieldMarkers) out.fieldMarkers = out.fieldMarkers.map(m => ({ ...m, offset: moved(m.offset) }));
   return out;
 }
@@ -304,9 +318,11 @@ function alignBlocks(baseBlocks, otherBlocks, otherFirst) {
  * Compare or combine two documents' paragraph sequences.
  * base/other: { paragraphs, tables }. Returns { paragraphs, tables, stats } for the base structure.
  */
-export function mergeDocuments(base, other, { mode = 'compare', author = 'Author', date = new Date().toISOString().replace(/\.\d+Z$/, 'Z'), granularity = 'word', caseChanges = true, whiteSpace = true, formatting = true, tables: compareTables = true, styleIds = new Set(), numbering = null } = {}) {
+export function mergeDocuments(base, other, { mode = 'compare', author = 'Author', date, dateUtc, granularity = 'word', caseChanges = true, whiteSpace = true, formatting = true, tables: compareTables = true, styleIds = new Set(), numbering = null } = {}) {
   const otherIsNew = mode === 'combine';
-  const revision = { author, date };
+  // Changes found now record the time as Word does: local w:date and its UTC companion (revisionTimes).
+  if (date === undefined) { const now = revisionTimes(); date = now.date; dateUtc ??= now.dateUtc; }
+  const revision = { author, date, ...(dateUtc ? { dateUtc } : {}) };
   const normalize = text => { let t = text; if (!caseChanges) t = t.toLowerCase(); if (!whiteSpace && /^\s+$/.test(t)) t = ' '; return t; };
   const equals = (x, y) => normalize(x.text) === normalize(y.text);
   const options = { granularity, equals, otherIsNew, revision, styleIds };
@@ -374,6 +390,14 @@ export function mergeDocuments(base, other, { mode = 'compare', author = 'Author
         if (markAll || !pair.other || !otherCell || !otherCell.content.length) { for (const entry of cell.content) entry.type === 'table' ? walkTable(entry, null, markAll || (otherIsNew ? 'del' : 'ins')) : emitBaseOnly({ type: 'paragraph', paragraph: entry.paragraph }); return; }
         walkScope(asBlocks(cell.content), asBlocks(otherCell.content), cell.id);
       });
+      // Cells only the other row has (a column added or removed) have no cell here: their text goes at the end of the
+      // row's last cell, marked, as rows only the other table has follow the table. Left out, a removed column's
+      // text vanished from a comparison that then reported no change.
+      const last = [...pair.base.cells].reverse().find(cell => cell.content.length);
+      if (!markAll && last && pair.other && pair.other.cells.length > pair.base.cells.length) {
+        const template = flatten({ rows: [{ cells: [last] }] }).at(-1);
+        for (const cell of pair.other.cells.slice(pair.base.cells.length)) for (const entry of cell.content) emitOtherOnly(entry.type === 'table' ? entry : { type: 'paragraph', paragraph: entry.paragraph }, last.id, template);
+      }
     }
     return orphans;
   };

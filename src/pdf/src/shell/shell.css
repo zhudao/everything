@@ -569,6 +569,21 @@
 .editor .find-bar[hidden] {
   display: none;
 }
+/* On the smallest phones the find box was squeezed to its least and the count ("No matches")
+   onto two lines: the magnifier, which only decorates, gives its room, the controls sit closer,
+   and the count keeps to one line. */
+.editor .find-bar .search-count {
+  white-space: nowrap;
+}
+@media (max-width: 380px) {
+  .editor .find-bar {
+    gap: 4px;
+    padding-left: 8px;
+  }
+  .editor .find-bar > svg {
+    display: none;
+  }
+}
 
 /* Quick tools: a floating column at the left edge of the document. */
 .editor .quick-tools {
@@ -590,6 +605,16 @@
   max-height: calc(100% - 24px);
   overflow-y: auto;
   scrollbar-width: none;
+  /* With no scroll bar, a shade at an end the tools continue past says there are more: the
+     column ended at a divider, and Image, Sign and Fill forms below it looked absent. Covers that
+     scroll with the tools hide each shade at the end reached. */
+  --tools-shade: color-mix(in srgb, var(--ink) 22%, transparent);
+  background:
+    linear-gradient(var(--surface) 40%, transparent) top / 100% 24px no-repeat local,
+    linear-gradient(transparent, var(--surface) 60%) bottom / 100% 24px no-repeat local,
+    linear-gradient(var(--tools-shade), transparent) top / 100% 10px no-repeat scroll,
+    linear-gradient(transparent, var(--tools-shade)) bottom / 100% 10px no-repeat scroll,
+    var(--surface);
 }
 .editor .quick-tools .tool-btn:focus-visible {
   /* Inside the column's padding, which now clips. */
@@ -761,6 +786,10 @@
     width: 32px;
     min-width: 32px;
   }
+  /* The narrower rail leaves 4 px beside a tab: the comments count stood past the screen's edge. */
+  .right-rail .tab-count {
+    right: -3px;
+  }
   .editor .quick-tools {
     position: static;
     flex-direction: row;
@@ -769,6 +798,13 @@
     border-bottom: 1px solid var(--chrome-line);
     padding: 3px 6px;
     overflow-x: auto;
+    /* The row scrolls sideways where it runs short (a small phone turned sideways). */
+    background:
+      linear-gradient(to right, var(--surface) 40%, transparent) left / 24px 100% no-repeat local,
+      linear-gradient(to left, var(--surface) 40%, transparent) right / 24px 100% no-repeat local,
+      linear-gradient(to right, var(--tools-shade), transparent) left / 10px 100% no-repeat scroll,
+      linear-gradient(to left, var(--tools-shade), transparent) right / 10px 100% no-repeat scroll,
+      var(--surface);
   }
   .editor .quick-tools .tool-group {
     flex-direction: row;
@@ -860,6 +896,39 @@
     margin-right: 2px;
   }
 }
+/* 360px phones, the commonest Android width, keep the quick tools on one line. Narrower ones
+   wrap the second group onto a line of its own, where its divider would only stand at the
+   line's start. */
+@media (max-width: 360px) {
+  .editor .quick-tools {
+    padding-inline: 3px;
+  }
+  .editor .quick-tools .tool-group + .tool-group {
+    margin-left: 2px;
+    padding-left: 4px;
+  }
+}
+@media (max-width: 359.98px) {
+  .editor .quick-tools .tool-group + .tool-group {
+    margin-left: 0;
+    padding-left: 0;
+    border-left: 0;
+  }
+}
+/* With the 16px text fields take on touch phones (style.css), the page number still shows four
+   digits. */
+@media (pointer: coarse) and (max-width: 760px), (pointer: coarse) and (max-height: 500px) {
+  .editor .page-controls .page-input {
+    width: 46px;
+  }
+}
+/* The smallest phones keep the page number and the zoom on one line. */
+@media (pointer: coarse) and (max-width: 360px) {
+  .editor .page-controls .page-input {
+    width: 40px;
+    padding-inline: 1px;
+  }
+}
 /* A phone turned sideways has little height: the quick tools and the page controls share one
    row above the page instead of taking a row each, which left the page under a third of the
    screen. The tools scroll sideways if the row runs short. */
@@ -877,6 +946,8 @@
     grid-column: 1;
     grid-row: 1;
     max-height: none;
+    /* The phone toolbar wraps; here a second line would take back the height this row saves. */
+    flex-wrap: nowrap;
   }
   .editor .document-view > .page-controls {
     grid-column: 2;
@@ -896,6 +967,11 @@
   .page-slot,
   .organize-thumb canvas {
     outline: 1px solid CanvasText;
+  }
+  /* Drawn as a background, which forced colors paint over with the canvas. */
+  .appbar-sep,
+  .organize-sep {
+    background: CanvasText;
   }
 }
 @media print {
@@ -1252,6 +1328,14 @@
 }
 .organize-label {
   font-size: 12px;
+  max-width: 100%;
+  text-align: center;
+  overflow-wrap: anywhere;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  overflow: hidden;
 }
 .organize-tile-actions {
   position: absolute;
@@ -1793,6 +1877,10 @@
 .editor .page-stack.two-up > .page-caption {
   grid-column: 1 / -1;
 }
+/* With a cover, the first page stands alone on the right, so later pages face as in a book. */
+.editor .page-stack.two-up.cover > .page-slot[data-page='0'] {
+  grid-column: 2;
+}
 
 /* Document details: initial view and fonts */
 .detail-section {
@@ -1879,6 +1967,54 @@
   outline: 2px solid var(--select);
   outline-offset: 2px;
 }
+/* The chosen comment's corners: dragging one resizes it. */
+.annotation-handle {
+  position: absolute;
+  width: 10px;
+  height: 10px;
+  box-sizing: border-box;
+  background: #fff;
+  border: 1.5px solid var(--select);
+  border-radius: 2px;
+  transform: translate(-50%, -50%);
+  pointer-events: auto;
+  touch-action: none;
+}
+@media (pointer: coarse) {
+  .annotation-handle {
+    width: 22px;
+    height: 22px;
+  }
+}
+/* While a corner is dragged, the frame shows the new size. */
+.annotation-target.is-resizing .annotation-handle {
+  opacity: 0;
+}
+/* The ends of a line or arrow, and the point of a callout: dragging one moves it. */
+.annotation-handle.is-point {
+  border-radius: 50%;
+}
+/* Where a line will run while one of its points is dragged. */
+.annotation-resize-line {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 1px;
+  height: 1px;
+  overflow: visible;
+  pointer-events: none;
+}
+.annotation-resize-line line {
+  stroke: var(--select);
+  stroke-width: 1.5;
+  stroke-dasharray: 4 3;
+}
+/* A callout's text box as it is resized. */
+.annotation-resize-box {
+  position: absolute;
+  border: 1.5px dashed var(--select);
+  pointer-events: none;
+}
 .annotation-props {
   display: flex;
   flex-direction: column;
@@ -1897,7 +2033,9 @@
 }
 .annotation-style {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  /* Two equal columns that stay within the panel: a wide control shrinks rather than pushing its
+     column past the panel's edge. */
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 8px;
 }
 .annotation-style label,
@@ -1910,6 +2048,21 @@
 .annotation-style .annotation-check {
   justify-content: flex-start;
 }
+/* A field's name stays on one line ("Font size"); the field gives way instead. */
+.annotation-style label > span {
+  white-space: nowrap;
+}
+/* A field with its unit (an angle's °) beside it. */
+.annotation-style .annotation-field {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  min-width: 0;
+}
+/* A width and its height, or a line's length and its angle, read as a pair on one row. */
+.annotation-style .annotation-pair {
+  grid-column-start: 1;
+}
 .annotation-style input[type='color'] {
   width: 28px;
   height: 24px;
@@ -1920,8 +2073,19 @@
 .annotation-style input[type='range'] {
   width: 70px;
 }
+.annotation-style select {
+  min-width: 0;
+}
+/* Wide enough for a length such as 206.16 to show whole, and drawn as the text's and objects'
+   number fields are, not as the browser's own (grey in dark mode). */
 .annotation-style input[type='number'] {
-  width: 56px;
+  width: 64px;
+  min-width: 0;
+  padding: 4px;
+  color: var(--ink);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 4px;
 }
 .annotation-replies {
   list-style: none;
@@ -1936,8 +2100,21 @@
   display: flex;
   flex-direction: column;
 }
+.reply-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 4px;
+}
 .reply-meta {
   font-size: 11px;
+}
+.reply-head .icon-btn {
+  width: 28px;
+  min-width: 28px;
+  min-height: 28px;
+  flex: none;
+  color: var(--muted);
 }
 /* A reply keeps its line breaks, and a long link wraps instead of running out of the panel. */
 .reply-text {

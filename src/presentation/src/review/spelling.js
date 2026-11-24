@@ -1,5 +1,6 @@
 // The Spelling pane: walks the deck's text from the current slide on (the
-// runs of every text box and shape, table cells, and speaker notes), stops
+// runs of every text box and shape, table cells, SmartArt graphics' items
+// and speaker notes), stops
 // at each word the dictionary does not know, and offers Ignore, Ignore All,
 // Add to Dictionary, Change and Change All. A change edits the run the word
 // is in, so its formatting stays.
@@ -11,6 +12,15 @@ const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 const wholeWord = (word) =>
   new RegExp(`(?<![\\p{L}\\p{N}'’])${escapeRe(word)}(?![\\p{L}\\p{N}])`, "gu");
 const english = (lang) => !lang || /^en(-|$)/i.test(lang);
+// A SmartArt graphic's items, or null for any other object.
+function smartArtItems(shape) {
+  try {
+    if (!P.isDiagramShape(shape)) return null;
+    return P.getShapeSmartArt(shape)?.items ?? null;
+  } catch {
+    return null;
+  }
+}
 
 export function createSpelling(env, host) {
   const state = {
@@ -59,6 +69,21 @@ export function createSpelling(env, host) {
             }
           continue;
         }
+        // A SmartArt graphic's text is its items, as the Text Pane shows them.
+        const items = smartArtItems(shape);
+        if (items) {
+          for (const [k, item] of items.entries())
+            yield {
+              kind: "smartart",
+              index: i,
+              slide,
+              part,
+              id,
+              item: k,
+              text: item.text || "",
+            };
+          continue;
+        }
         let paragraphs = 0;
         try {
           paragraphs = P.getShapeParagraphCount(shape);
@@ -92,9 +117,13 @@ export function createSpelling(env, host) {
     }
   }
   const unitKey = (u) =>
-    [u.part, u.kind, u.id ?? "", u.p ?? u.row ?? "", u.r ?? u.col ?? ""].join(
-      ":",
-    );
+    [
+      u.part,
+      u.kind,
+      u.id ?? "",
+      u.p ?? u.row ?? u.item ?? "",
+      u.r ?? u.col ?? "",
+    ].join(":");
 
   function findNext(from = env.index()) {
     state.skippedOther = false;
@@ -150,6 +179,21 @@ export function createSpelling(env, host) {
     if (u.id != null) env.showObjects(u.part, [u.id]);
   }
 
+  // Words changed in the notes leave the rest of the notes' formatting as it
+  // was; `ranges` are in the order of the text.
+  function replaceInNotes(slide, text, ranges) {
+    const edits = [...ranges].reverse();
+    const next = edits.reduce(
+      (value, edit) =>
+        value.slice(0, edit.start) + edit.text + value.slice(edit.end),
+      text,
+    );
+    try {
+      P.editSlideNotes(slide, edits, next);
+    } catch {
+      P.setSlideNotes(slide, next);
+    }
+  }
   // Replaces the issue's word in its own piece of text.
   function changeOne(issue, replacement) {
     const u = issue.unit;
@@ -161,14 +205,30 @@ export function createSpelling(env, host) {
           u.text.slice(issue.start, issue.end)
         )
           return env.SKIP;
-        P.setSlideNotes(
-          slide,
-          text.slice(0, issue.start) + replacement + text.slice(issue.end),
-        );
+        replaceInNotes(slide, text, [
+          { start: issue.start, end: issue.end, text: replacement },
+        ]);
         return;
       }
       const shape = P.findShapeById(slide, u.id);
       if (!shape) return env.SKIP;
+      if (u.kind === "smartart") {
+        // The occurrence to change, counted through the graphic's items.
+        const items = smartArtItems(shape) || [];
+        const text = items[u.item]?.text || "";
+        if (text !== u.text) return env.SKIP;
+        const re = wholeWord(issue.word);
+        const before =
+          items
+            .slice(0, u.item)
+            .reduce(
+              (n, it) => n + [...(it.text || "").matchAll(re)].length,
+              0,
+            ) + [...text.slice(0, issue.start).matchAll(re)].length;
+        return env.replaceInSmartArt(shape, re, replacement, before)
+          ? undefined
+          : env.SKIP;
+      }
       if (u.kind === "cell") {
         const cell = P.getTableCell(shape, u.row, u.col);
         const text = P.getTableCellText(cell) || "";
@@ -212,6 +272,10 @@ export function createSpelling(env, host) {
                 if (env.replaceInCell(cell, re, replacement)) changed = true;
             continue;
           }
+          if (smartArtItems(shape)) {
+            if (env.replaceInSmartArt(shape, re, replacement)) changed = true;
+            continue;
+          }
           try {
             if (
               P.getShapeParagraphCount(shape) &&
@@ -223,7 +287,15 @@ export function createSpelling(env, host) {
         const notes = P.getSlideNotes(slide);
         if (notes && re.test(notes)) {
           re.lastIndex = 0;
-          P.setSlideNotes(slide, notes.replace(re, replacement));
+          replaceInNotes(
+            slide,
+            notes,
+            [...notes.matchAll(re)].map((hit) => ({
+              start: hit.index,
+              end: hit.index + hit[0].length,
+              text: replacement,
+            })),
+          );
           changed = true;
         }
         re.lastIndex = 0;

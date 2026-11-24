@@ -15,7 +15,7 @@ import { flatLineContains, flatLineRect } from './flat-drawing-lines.js';
 import { canvasFontFamily, fontSlot, textFontStyle } from './font-families.js';
 import { pageGeometry, readingPageGeometry } from './page-settings.js';
 import { layoutParagraphBorders } from './paragraph-border-layout.js';
-import { layoutTableBorders, tableRowBorderWidths, tableBorderWidth, cellBorderLayoutWidth, tableHorizontalInsets } from './table-border-layout.js';
+import { cachedTableBorders, layoutTableBorders, tableRowBorderWidths, tableBorderWidth, cellBorderLayoutWidth, tableHorizontalInsets } from './table-border-layout.js';
 import { cellWritingTopBorder, rowTableBorder } from './cell-borders.js';
 import { justificationRange, justifiedStyle, justifiedLineEnd } from './justification.js';
 import { contractionMetrics, fitContractedWord } from './justification-contraction.js';
@@ -154,11 +154,11 @@ function layoutDocumentContent(paragraphs, measureBase, page, numbering, tables,
     const flow = () => notes
       ? layoutWithFootnotes(notes, noteReserve => layoutWithWrap(paragraphs, measureBase, page, numbering, tables, pageStories, { ...storyOptions, ...storyScope, ...counts, storyHeights, storyHeightCache, paragraphKeys, noteReserve }), measureBase, numbering, { ...storyOptions, ...storyScope }, flowContext())
       : layoutWithWrap(paragraphs, measureBase, page, numbering, tables, pageStories, { ...storyOptions, ...storyScope, ...counts, storyHeights, storyHeightCache, paragraphKeys });
-    placed = flow();
+    placed = withBorders(flow(), cache);
     // Footnotes numbered per page (§17.11.19 eachPage) need their pages first; renumber once and lay out again.
     if (notes?.restart === 'eachPage') {
       const renumbered = pageRestartedNumbers(notes, source, placed);
-      if ([...renumbered].some(([id, display]) => notes.numbers.get(id) !== display)) { notes.numbers = renumbered; paragraphs = numberNotes(); placed = flow(); }
+      if ([...renumbered].some(([id, display]) => notes.numbers.get(id) !== display)) { notes.numbers = renumbered; paragraphs = numberNotes(); placed = withBorders(flow(), cache); }
     }
     if (endnotes) placed = placeEndnotes(endnotes, placed, measureBase, numbering, { ...storyOptions, ...storyScope });
     const aligned = () => {
@@ -231,7 +231,18 @@ function layoutPass(paragraphs, measureBase, page, numbering, tables, pageStorie
   let flowNames = paragraphCache && storyOptions.noteReserve !== undefined ? [] : null;
   // Where each page's footnote area ends: the bottom of its text area before notes (layoutWithFootnotes).
   const noteBottoms = [];
-  const pageKey = geometry => { let key = pageKeys.get(geometry); if (key === undefined) pageKeys.set(geometry, key = paragraphCache.intern(JSON.stringify(geometry))); return key; };
+  // A table cell's page is its table's page with the cell's geometry over it (cellPages): naming it by those
+  // two keeps a table of thousands of cells from serializing the whole page again for each cell on each keystroke.
+  const cellPages = new WeakMap();
+  const pageKey = geometry => {
+    let key = pageKeys.get(geometry);
+    if (key === undefined) {
+      const cell = cellPages.get(geometry);
+      key = paragraphCache.intern(cell ? `${pageKey(cell.page)}+${JSON.stringify(cell.geometry)}` : JSON.stringify(geometry));
+      pageKeys.set(geometry, key);
+    }
+    return key;
+  };
   // A screen view (web, draft, read) lays every section out on its own display geometry.
   const viewPage = storyOptions.viewGeometry || (geometry => geometry);
   page = viewPage(page);
@@ -471,6 +482,7 @@ function layoutPass(paragraphs, measureBase, page, numbering, tables, pageStorie
           const clipOverflow = flexibleCounts[rowIndex] === flexibleCounts[rowIndex + cell.rowSpan];
           const cellGeometry = { tableDepth: box.depth, allowOverflowIndents: true, clipOverflow, left: box.x + margins.left / 15, right: page.width - x + margins.right / 15, top: page.top + margins.top / 15, bottom: page.bottom + margins.bottom / 15 };
           const cellPage = { ...page, ...cellGeometry };
+          if (paragraphCache) cellPages.set(cellPage, { page, geometry: cellGeometry });
           if (flowNames) paragraphCache.cellPage(cellPage, pageKey(page), cellGeometry);
           if (cellPage.left >= page.width - cellPage.right) throw new Error('Cell margins leave no writing space.');
           const nestedFloats = [];
@@ -799,10 +811,18 @@ function layoutPass(paragraphs, measureBase, page, numbering, tables, pageStorie
   }
   resolveDrawingCollisions(placed.floatingObjects, placed.pages);
   placed.floatingObjects.sort((a, b) => a.image.anchor.order - b.image.anchor.order);
-  const paragraphBorders = layoutParagraphBorders(placed);
   let offset = 0;
   const pageOffsets = placed.pages.map(p => { const start = offset; offset += p.height; return start; });
-  return { ...placed, page, pageOffsets, tableWidths, paragraphBorders, tableBorders: layoutTableBorders(placed.cells), ...(hasRotatedCells ? { hasRotatedCells: true } : {}), ...(flowNames ? { flowSignature: flowNames.join(' ') } : {}), ...(storyOptions.noteReserve ? { noteBottoms } : {}) };
+  // Border ink is placed once the layout is settled (withBorders): settling footnotes lays a long document out
+  // several times, and only the last pass is shown.
+  return { ...placed, page, pageOffsets, tableWidths, paragraphBorders: undefined, tableBorders: undefined, ...(hasRotatedCells ? { hasRotatedCells: true } : {}), ...(flowNames ? { flowSignature: flowNames.join(' ') } : {}), ...(storyOptions.noteReserve ? { noteBottoms } : {}) };
+}
+
+/** `placed` (a settled layoutPass result) with the ink of its paragraph and table borders. */
+function withBorders(placed, cache) {
+  placed.paragraphBorders = layoutParagraphBorders(placed);
+  placed.tableBorders = cache ? cachedTableBorders(placed.cells, cache.tableBorders, cache.generation) : layoutTableBorders(placed.cells);
+  return placed;
 }
 
 // Give pagination all rows connected by vertical spans, without keeping them on a page.
@@ -1427,8 +1447,20 @@ export function nearestStop(line, x, y) {
     const stop = nearestStop(line.cellText.line, local.x);
     return { ...stop, ...cellTextPoint(line.cellText.matrix, stop.x, line.cellText.line.baseline) };
   }
-  return line.stops.reduce((best, s) => Math.abs(s.x - x) < Math.abs(best.x - x) || s.hanging && s.x === best.x ? s : best, line.stops[0]);
+  return line.stops.reduce((best, s) => {
+    const d = Math.abs(s.x - x), bestD = Math.abs(best.x - x);
+    if (s.hanging && s.x === best.x) return s;
+    // Where text changes direction, two offsets share one place: the one ending the run the pointer
+    // is over is that letter's own edge. Typing there continues that word, not the run beyond it.
+    if (Math.abs(d - bestD) <= 1e-6 && (s.bidiSide || best.bidiSide)) {
+      const over = stop => stop.bidiSide && stop.bidiSide === pointerSide(stop, x);
+      if (over(s) !== over(best)) return over(s) ? s : best;
+    }
+    return d < bestD ? s : best;
+  }, line.stops[0]);
 }
+// The side of its run a stop must be on for the pointer at `x` to be over that run.
+const pointerSide = (stop, x) => x < stop.x ? 'right' : x > stop.x ? 'left' : null;
 // `rotationOf(image)`: a drawing's own rotation that its image does not carry (drawingOwnRotation), so a
 // turned shape is found where it shows.
 export function imageAtPoint(layout, page, x, y, { includeBehindText = false, rotationOf = null } = {}) {

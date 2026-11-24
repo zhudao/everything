@@ -2,7 +2,7 @@
 // playback settings say, zooms jump to their slide or section and come
 // back, and action settings follow clicks and pointer-overs with jumps,
 // sounds and highlights.
-import { el } from "../ui.js";
+import { el, toast } from "../ui.js";
 import {
   groupParents,
   slideBounds,
@@ -14,10 +14,12 @@ import { bytesUrl } from "./util.js";
 export function createShowExtras(ctx, show) {
   const { P } = ctx;
   const { pres, all, frame, size } = show;
-  const urls = [];
-  const url = (bytes, type) => {
-    const u = bytesUrl(bytes, type);
-    urls.push(u);
+  // One address per media file for the whole show: a slide shown again (a
+  // loop, a kiosk running all day) plays from the same copy of its bytes.
+  const urls = new Map();
+  const url = (bytes, type, key = bytes) => {
+    let u = urls.get(key);
+    if (!u) urls.set(key, (u = bytesUrl(bytes, type)));
     return u;
   };
   const partOf = (s) => P.getSlidePartName(s);
@@ -102,11 +104,18 @@ export function createShowExtras(ctx, show) {
     return !!a.hover || ownAction(a.click);
   }
 
-  function playSound(action) {
-    if (!action?.sound) return;
+  // "Stop previous sound" (a slide's transition or an action) also ends
+  // sounds playing across slides, which wait for just that.
+  function stopSounds() {
     sound?.pause();
     sound = null;
-    if (action.sound === "stop") return;
+    for (const p of [...playing]) if (p.across) p.stop();
+  }
+  function playSound(action) {
+    if (!action?.sound) return;
+    if (action.sound === "stop") return stopSounds();
+    sound?.pause();
+    sound = null;
     sound = new Audio(url(action.sound.data, "audio/wav"));
     sound.play().catch(() => {});
   }
@@ -132,8 +141,10 @@ export function createShowExtras(ctx, show) {
       case "endShow":
         return show.close();
       case "slide": {
+        // As a link to it does: a slide left out of the show says so.
         const i = indexOfPart(partOf(j.slide));
-        return i >= 0 ? go(i) : undefined;
+        if (i >= 0) return go(i);
+        return toast("That slide is hidden or was removed.");
       }
       case "url":
         if (/^(https?:|mailto:)/i.test(j.url))
@@ -219,7 +230,7 @@ export function createShowExtras(ctx, show) {
     const element = document.createElement(
       media.kind === "video" ? "video" : "audio",
     );
-    element.src = url(media.data, media.contentType);
+    element.src = url(media.data, media.contentType, media.partName);
     element.preload = "auto";
     element.playsInline = true;
     element.setAttribute(
@@ -231,6 +242,14 @@ export function createShowExtras(ctx, show) {
     const startAt = o.trimStart / 1000;
     const endAt = () =>
       ((durationMs || element.duration * 1000 || Infinity) - o.trimEnd) / 1000;
+    // The trimmed clip, in seconds of the file, for the show's media
+    // controls (src/show/session.js).
+    node.dataset.start = String(startAt);
+    const markEnd = () => {
+      if (Number.isFinite(endAt())) node.dataset.end = String(endAt());
+    };
+    markEnd();
+    element.addEventListener("loadedmetadata", markEnd);
     const volume = o.muted ? 0 : o.volume;
     element.volume = volume;
     let fading = 0;
@@ -256,6 +275,8 @@ export function createShowExtras(ctx, show) {
       kind: media.kind,
       options: o,
       across: media.kind === "audio" && o.playAcrossSlides,
+      // Slides still to play across, its own included.
+      slidesLeft: o.acrossSlideCount ?? Infinity,
       started: false,
       play() {
         player.started = true;
@@ -294,16 +315,15 @@ export function createShowExtras(ctx, show) {
       }
       element.pause();
       node.classList.remove("full-screen");
-      if (o.rewind) {
-        element.currentTime = startAt;
-        node.classList.remove("playing");
-      }
+      if (o.rewind) element.currentTime = startAt;
+      // Rewound, or hidden while not playing, it shows as before it began.
+      if (o.rewind || o.hideWhileNotPlaying) node.classList.remove("playing");
     });
     element.addEventListener("ended", () => {
       if (o.loop) player.play();
       else {
         node.classList.remove("full-screen");
-        if (o.rewind) node.classList.remove("playing");
+        if (o.rewind || o.hideWhileNotPlaying) node.classList.remove("playing");
       }
     });
     element.addEventListener("pause", () => cancelAnimationFrame(fading));
@@ -332,6 +352,22 @@ export function createShowExtras(ctx, show) {
   }
 
   // ---- Slide lifecycle ----------------------------------------------------
+  // The slide's media stops and leaves the page, whether it played or not
+  // (a sound sits on the frame, outside the slide's layer). Only a sound
+  // playing across slides goes on.
+  function leaveMedia() {
+    for (const p of new Set([...playing, ...slideMedia.values()]))
+      if (!(p.across && playing.has(p)) || --p.slidesLeft <= 0) p.stop();
+    pendingMedia = [];
+    slideMedia = new Map();
+  }
+  /** The show reached its end screen: the last slide's media stops there,
+   * as it would on the way to another slide. */
+  function ended() {
+    leaveMedia();
+    layer?.remove();
+    layer = null;
+  }
   function slideShown(slide, i) {
     index = i;
     if (viewed[viewed.length - 1] !== i) viewed.push(i);
@@ -340,9 +376,7 @@ export function createShowExtras(ctx, show) {
     layer?.remove();
     if (hadFocus)
       frame.querySelector(".presenter-slide:not(.presenter-leaving)")?.focus();
-    for (const p of [...playing]) if (!p.across) p.stop();
-    pendingMedia = [];
-    slideMedia = new Map();
+    leaveMedia();
     layer = el("div", { class: "presenter-objects" });
     frame.append(layer);
     const parents = groupParents(slide);
@@ -351,8 +385,20 @@ export function createShowExtras(ctx, show) {
       if (P.getShapeMediaKind(shape)) {
         // Narrations stay silent when the show is set to play without them.
         if (show.skipMedia?.(shape)) continue;
+        const key = `${partOf(slide)}#${P.getShapeId(shape)}`;
+        // A sound still playing across slides from an earlier visit (a loop
+        // coming round again) carries on, rather than starting over beside
+        // itself.
+        const carried = [...playing].find((p) => p.across && p.key === key);
+        if (carried && !carried.element.paused) {
+          layer.append(carried.node);
+          slideMedia.set(String(P.getShapeId(shape)), carried);
+          continue;
+        }
+        carried?.stop();
         const player = mediaPlayer(shape, parents);
         if (!player) continue;
+        player.key = key;
         layer.append(player.node);
         slideMedia.set(String(P.getShapeId(shape)), player);
         if (player.options.start === "automatically") autoplay.push(player);
@@ -424,6 +470,38 @@ export function createShowExtras(ctx, show) {
     else player.play();
   }
 
+  /** Moves the slide's media to its next (1) or previous (-1) bookmark:
+   * the focused media, else the one playing, else the one started. Returns
+   * whether there was a bookmark to go to. */
+  function bookmark(direction) {
+    const marked = [...slideMedia.values()].filter(
+      (p) => p.options.bookmarks?.length,
+    );
+    const player =
+      marked.find((p) => p.node.contains(document.activeElement)) ??
+      marked.find((p) => !p.element.paused) ??
+      marked.find((p) => p.started) ??
+      marked[0];
+    if (!player) return false;
+    const { element, node } = player;
+    const from = Number(node.dataset.start) || 0;
+    const to = Number(node.dataset.end) || Infinity;
+    const times = player.options.bookmarks
+      .map((b) => b.time / 1000)
+      .filter((t) => t >= from && t < to)
+      .sort((a, b) => a - b);
+    const now = element.currentTime;
+    // Going back from just after a bookmark skips it, so presses step on.
+    const target =
+      direction > 0
+        ? times.find((t) => t > now + 0.05)
+        : times.findLast((t) => t < now - 0.25);
+    if (target === undefined) return false;
+    element.currentTime = target;
+    if (!player.started) player.play();
+    return true;
+  }
+
   /** The slide to go to instead of `i`; null when the step was used up.
    * `step` is "click" or "auto" (the show's timer) for a plain advance and
    * unset for a jump to a slide. */
@@ -453,15 +531,19 @@ export function createShowExtras(ctx, show) {
     layer?.remove();
     layer = null;
     urls.forEach((u) => URL.revokeObjectURL(u));
+    urls.clear();
   }
 
   return {
     prepare,
     imageFor,
     slideShown,
+    ended,
     mediaStep,
+    bookmark,
     navigate,
     claims,
+    stopSounds,
     dispose,
   };
 }

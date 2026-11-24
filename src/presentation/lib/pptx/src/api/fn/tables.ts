@@ -10,6 +10,7 @@ import {
   clearFill as clearFillImpl,
   setSolidFill,
   setTextBody,
+  textBodyText,
   type TextFormat,
   type ParagraphAlignment,
 } from "../../internal/drawingml/index.ts";
@@ -21,6 +22,7 @@ import {
 import {
   NS,
   type XmlElement,
+  type XmlNode,
   allChildElements,
   attr,
   elem,
@@ -51,6 +53,10 @@ import {
   normalizeGuid,
 } from "../../internal/bounds.ts";
 import { commitSlideData, refreshSlideData } from "./_helpers.ts";
+import {
+  editTextBodyRange,
+  type TextBodyEdit,
+} from "../../internal/drawingml/text-body-edit.ts";
 import {
   type ShapeParagraphElement,
   readParagraphElements,
@@ -553,6 +559,43 @@ export const setTableCellText = (
 ): void => {
   const txBody = ensureCellTxBody(cell);
   setTextBody(txBody, text, options.fields);
+  commitTableCell(cell);
+};
+
+/** Applies sequential range edits in the cell's visible text (as an editing
+ * history records them, see `TextBodyEdit`), keeping the runs, fields and
+ * paragraph properties outside the edited ranges. `text` is the text the
+ * edits end at. Throws, leaving the cell as it was, when the edits do not
+ * start from the cell's own text or do not end at `text`. */
+export const editTableCellText = (
+  cell: TableCellData,
+  edits: readonly TextBodyEdit[],
+  text: string,
+): void => {
+  const tc = cell[CELL_ELEMENT];
+  const existing = firstChildElement(tc, NAME_A_TX_BODY_TBL);
+  const body = existing
+    ? structuredClone(existing)
+    : elem(NAME_A_TX_BODY_TBL, {
+        children: [
+          elem(qname("a", "bodyPr", NS.dml)),
+          elem(qname("a", "lstStyle", NS.dml)),
+        ],
+      });
+  for (const edit of edits) editTextBodyRange(body, edit);
+  if (textBodyText(body) !== text)
+    throw new Error("table cell edits do not match the cell's text");
+  if (existing) tc.children[tc.children.indexOf(existing)] = body;
+  else {
+    // Before <a:tcPr>, per the schema.
+    const at = tc.children.findIndex(
+      (c) =>
+        c.kind === "element" &&
+        c.name.namespaceURI === NS.dml &&
+        c.name.localName === "tcPr",
+    );
+    tc.children.splice(at < 0 ? tc.children.length : at, 0, body);
+  }
   commitTableCell(cell);
 };
 
@@ -1388,6 +1431,105 @@ const swapCells = (
   trB.children[ib] = a;
 };
 
+/** The cell a row or column inserted beside (row, col) takes its look from:
+ * a cell a merge covers gives the merge's anchor. */
+const formatSource = (
+  grid: ReadonlyArray<ReadonlyArray<XmlElement>>,
+  row: number,
+  col: number,
+): XmlElement | null => {
+  for (let guard = grid.length + (grid[0]?.length ?? 0); guard > 0; guard--) {
+    const tc = grid[row]?.[col];
+    if (!tc) return null;
+    if (mergeFlag(tc, ATTR_H_MERGE) && col > 0) col--;
+    else if (mergeFlag(tc, ATTR_V_MERGE) && row > 0) row--;
+    else return tc;
+  }
+  return grid[row]?.[col] ?? null;
+};
+
+const isDml = (node: XmlNode, local: string): boolean =>
+  node.kind === "element" &&
+  node.name.namespaceURI === NS.dml &&
+  node.name.localName === local;
+const childDml = (
+  parent: XmlElement,
+  ...locals: string[]
+): XmlElement | undefined =>
+  parent.children.find(
+    (c): c is XmlElement =>
+      c.kind === "element" &&
+      c.name.namespaceURI === NS.dml &&
+      locals.includes(c.name.localName),
+  );
+const LINK_PROPS = new Set(["hlinkClick", "hlinkMouseOver"]);
+
+/** A new cell holding `value` that looks like `source`: its cell properties
+ * (fill, borders, margins, anchor), its text body's properties, and the
+ * paragraph and character formatting its text begins with. A link stays
+ * behind. */
+const cellLike = (source: XmlElement, value: string): XmlElement => {
+  const cell = buildTableCell(value);
+  const tcPr = firstChildElement(source, NAME_A_TC_PR);
+  if (tcPr)
+    cell.children = cell.children.map((c) =>
+      isDml(c, "tcPr") ? structuredClone(tcPr) : c,
+    );
+  const from = firstChildElement(source, NAME_A_TX_BODY_TBL);
+  const body = firstChildElement(cell, NAME_A_TX_BODY_TBL);
+  if (!from || !body) return cell;
+  const p = childDml(from, "p");
+  const pPr = p && childDml(p, "pPr");
+  const run = p && childDml(p, "r", "fld");
+  const runProps =
+    (run && childDml(run, "rPr")) || (p && childDml(p, "endParaRPr"));
+  let rPr: XmlElement | null = null;
+  if (runProps) {
+    const copy = structuredClone(runProps);
+    rPr = {
+      ...copy,
+      name: qname("a", "rPr", NS.dml),
+      children: copy.children.filter(
+        (c) => c.kind !== "element" || !LINK_PROPS.has(c.name.localName),
+      ),
+    };
+  }
+  const bodyPr = childDml(from, "bodyPr");
+  const lstStyle = childDml(from, "lstStyle");
+  body.children = body.children.map((c) => {
+    if (isDml(c, "bodyPr")) return bodyPr ? structuredClone(bodyPr) : c;
+    if (isDml(c, "lstStyle")) return lstStyle ? structuredClone(lstStyle) : c;
+    if (!isDml(c, "p")) return c;
+    const paragraph = c as XmlElement;
+    return {
+      ...paragraph,
+      children: [
+        ...paragraph.children.map((part): XmlNode => {
+          if (isDml(part, "pPr")) return pPr ? structuredClone(pPr) : part;
+          if (!isDml(part, "r") || !rPr) return part;
+          const r = part as XmlElement;
+          return {
+            ...r,
+            children: r.children.map((x) =>
+              isDml(x, "rPr") ? structuredClone(rPr) : x,
+            ),
+          };
+        }),
+        // What is typed into the empty cell takes the same look.
+        ...(rPr
+          ? [
+              {
+                ...structuredClone(rPr),
+                name: qname("a", "endParaRPr", NS.dml),
+              },
+            ]
+          : []),
+      ],
+    };
+  });
+  return cell;
+};
+
 const rowDefaultHeight = (tbl: XmlElement): number => {
   // Use the average height of existing rows, or 370000 (≈ 0.4in) as a
   // sane default when the table has no rows yet.
@@ -1408,24 +1550,50 @@ const rowDefaultHeight = (tbl: XmlElement): number => {
   return count > 0 ? Math.round(sum / count) : 370000;
 };
 
+/** How a row or column is inserted: `like` names the existing row or
+ * column (before the insertion) whose height and cell formatting it takes,
+ * as a desktop editor's Insert Above/Below/Left/Right does. */
+export interface TableInsertOptions {
+  readonly like?: number;
+}
+
 /**
  * Inserts a row into the table. `atIndex` is 0-based; `undefined`
  * appends at the end. `cells` supplies cell values; missing cells
  * become blank, extras are dropped. The row's height matches the
- * average of existing rows (or a 0.4in default for empty tables).
+ * average of existing rows (or a 0.4in default for empty tables), or
+ * the `like` row's, whose cells the new ones copy the look of.
  */
 export const insertTableRow = (
   table: SlideShapeData,
   atIndex?: number,
   cells: ReadonlyArray<string> = [],
+  options: TableInsertOptions = {},
 ): void => {
   const tbl = requireTbl(table);
   const colCount = tableColumnCount(tbl);
   const padded: string[] = [];
   for (let i = 0; i < colCount; i++) padded.push(cells[i] ?? "");
-  const row = buildTableRow(padded, rowDefaultHeight(tbl));
-
   const rows = tableRows(tbl);
+  const like = options.like === undefined ? undefined : rows[options.like];
+  const likeHeight = like
+    ? Number.parseInt(getAttrValue(like, ATTR_H_TBL) ?? "", 10)
+    : Number.NaN;
+  const row = buildTableRow(
+    padded,
+    Number.isFinite(likeHeight) && likeHeight > 0
+      ? likeHeight
+      : rowDefaultHeight(tbl),
+  );
+  if (like) {
+    const grid = rows.map(rowCells);
+    row.children = row.children.map((tc, c) => {
+      const source =
+        tc.kind === "element" ? formatSource(grid, options.like!, c) : null;
+      return source ? cellLike(source, padded[c] ?? "") : tc;
+    });
+  }
+
   const insertAt =
     atIndex !== undefined
       ? Math.max(0, Math.min(atIndex, rows.length))
@@ -1496,6 +1664,7 @@ export const insertTableColumn = (
   table: SlideShapeData,
   atIndex?: number,
   widthEmu?: number,
+  options: TableInsertOptions = {},
 ): void => {
   const tbl = requireTbl(table);
   const grid = firstChildElement(tbl, qname("a", "tblGrid", NS.dml));
@@ -1537,10 +1706,16 @@ export const insertTableColumn = (
   // A column inserted inside a horizontal merge joins it: the merge grows
   // and the new cells under it are covered.
   const merges = tableMerges(tbl);
-  // Add a blank <a:tc> at the same column index in every row.
+  const cellGrid = tableRows(tbl).map(rowCells);
+  // Add a blank <a:tc> at the same column index in every row, looking like
+  // the `like` column's cell in that row when one is named.
   tableRows(tbl).forEach((tr, rowIdx) => {
     const tcs = rowCells(tr);
-    const newCell = buildTableCell("");
+    const source =
+      options.like === undefined
+        ? null
+        : formatSource(cellGrid, rowIdx, options.like);
+    const newCell = source ? cellLike(source, "") : buildTableCell("");
     for (const m of merges) {
       if (insertAt <= m.col || insertAt >= m.col + m.colSpan) continue;
       if (rowIdx < m.row || rowIdx >= m.row + m.rowSpan) continue;

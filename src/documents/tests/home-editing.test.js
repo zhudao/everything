@@ -76,6 +76,25 @@ describe('Change Case', () => {
     changeCase(doc, 'sentence');
     expect(texts(doc)).toEqual(['First one. Second one']);
   });
+  it('capitalizes each word that starts in the document, not a selection that starts inside a word', async () => {
+    const { doc } = await styledDocument(['plain text here']);
+    doc.select(2, 10);
+    expect(changeCase(doc, 'title')).toBe(true);
+    expect(texts(doc)).toEqual(['plain Text here']);
+    expect(convertCase("ain't so", 'title', true, { before: 'x' })).toBe("ain't So");
+  });
+  it('ends a sentence at a period only with white space after it', async () => {
+    expect(convertCase('SEE INDEX.HTML NOW. PI IS 3.14... NEXT', 'sentence')).toBe('See index.html now. Pi is 3.14... Next');
+    expect(convertCase('he said "stop." then left', 'sentence')).toBe('He said "stop." Then left');
+    // A selection that starts in a file name, or just after a period with no space, is not a sentence's start.
+    const { doc } = await styledDocument(['open index.HTML now. AND then']);
+    doc.select(11, 15);
+    changeCase(doc, 'sentence');
+    expect(texts(doc)).toEqual(['open index.html now. AND then']);
+    doc.select(21, 29);
+    changeCase(doc, 'sentence');
+    expect(texts(doc)).toEqual(['open index.html now. And then']);
+  });
 });
 
 describe('Format Painter', () => {
@@ -98,12 +117,33 @@ describe('Format Painter', () => {
     const { doc } = await styledDocument(['Heading here', 'plain words']);
     doc.select(0); doc.setParagraphStyle('Heading2'); doc.setParagraphFormat({ alignment: 'center' });
     const captured = captureFormat(doc);
-    expect(captured.paragraph).toEqual({ styleId: 'Heading2', format: { alignment: 'center' } });
+    expect(captured.paragraph).toEqual({ styleId: 'Heading2', format: { alignment: 'center' }, list: null });
     doc.select(15);
     applyFormat(doc, captured);
     expect(doc.paragraphs[1].styleId).toBe('Heading2');
     expect(doc.paragraphs[1].format.alignment).toBe('center');
     expect(doc.range).toEqual([13, 18]);
+  });
+  it('paints a list item\'s list onto other paragraphs, and a plain paragraph\'s plainness onto list items', async () => {
+    const { pkg, doc } = await styledDocument(['one', 'two', 'plain a', 'plain b', 'plain c']);
+    doc.select(0, 7); doc.toggleList('number'); doc.select(4); doc.changeListLevel(1);
+    const list = doc.paragraphs[1].list;
+    // From the second item's caret onto the next two paragraphs: items of the same list at its level.
+    doc.select(5); const item = captureFormat(doc);
+    expect(item.paragraph.list).toEqual({ numId: list.numId, level: 1 });
+    doc.select(8, 23); expect(applyFormat(doc, item)).toBe(true);
+    expect(doc.paragraphs.map(p => p.list && [p.list.numId, p.list.level])).toEqual([[list.numId, 0], [list.numId, 1], [list.numId, 1], [list.numId, 1], null]);
+    // From the plain paragraph onto the first item: it is a list item no longer.
+    doc.select(25); const plain = captureFormat(doc);
+    expect(plain.paragraph.list).toBeNull();
+    doc.select(1); applyFormat(doc, plain);
+    expect(doc.paragraphs[0].list).toBeNull();
+    const reopened = await roundTrip(pkg, doc);
+    expect(reopened.paragraphs.map(p => p.list ? p.list.level : null)).toEqual([null, 1, 1, 1, null]);
+    // Copied in another document, a list this one does not have is left alone.
+    const other = await styledDocument(['x']); other.doc.select(0);
+    applyFormat(other.doc, { ...item, paragraph: { ...item.paragraph, list: { numId: '999', level: 0 } } });
+    expect(other.doc.paragraphs[0].list).toBeFalsy();
   });
   it('removes direct formatting the source does not have', async () => {
     const { doc } = await styledDocument(['plain', 'bold']);

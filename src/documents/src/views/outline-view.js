@@ -114,7 +114,9 @@ export function createOutlineView({ editor, readOnly, error, onState = () => {} 
     const style = row.table ? {} : textStyle(p), placeholder = !value && level < BODY_LEVEL ? 'Heading' : '';
     // A row drawn from the same values keeps its attributes and styles: typing redraws the outline after
     // every keystroke, and writing them again for every row of a long document took most of that.
-    const drawn = JSON.stringify([indent, level, !!isCollapsed, !!row.table, !!row.parent, label, mode, style, placeholder]);
+    // A right-to-left paragraph (§17.3.1.6 bidi) is typed and read right-to-left here too.
+    const rtl = !row.table && !!p?.format?.bidi;
+    const drawn = JSON.stringify([indent, level, !!isCollapsed, !!row.table, !!row.parent, label, mode, style, placeholder, rtl]);
     if (item.drawn !== drawn) {
       item.drawn = drawn;
       item.style.setProperty('--outline-indent', `${indent}px`);
@@ -132,6 +134,7 @@ export function createOutlineView({ editor, readOnly, error, onState = () => {} 
       text.setAttribute('aria-label', `${LEVEL_NAMES[Math.min(level, BODY_LEVEL) - 1]}: ${label}`);
       Object.assign(text.style, { fontFamily: '', fontSize: '', fontWeight: '', fontStyle: '', color: '' }, style);
       text.dataset.placeholder = placeholder;
+      if (rtl) text.dir = 'rtl'; else text.removeAttribute('dir');
     }
     if (text.textContent !== value && !(document.activeElement === text && composing)) {
       const restore = document.activeElement === text ? caretOffset(text) : null;
@@ -300,7 +303,11 @@ export function createOutlineView({ editor, readOnly, error, onState = () => {} 
     if (isComposing(e) || typesCharacter(e)) return;
     const mod = e.ctrlKey || e.metaKey;
     const handled = () => { e.preventDefault(); e.stopPropagation(); };
-    if (e.altKey && e.shiftKey && !mod) {
+    // Alt+Shift with the arrows, + and −, a digit or A; on a Mac Control+Shift, as in Word for Mac, since Option+Shift
+    // with − (an em dash), = or a digit types a character there and never reached these (Option+Shift with an arrow,
+    // which types nothing, still works).
+    const outlineChord = e.shiftKey && !e.metaKey && (MOD_KEY === 'Cmd' ? e.ctrlKey !== e.altKey : e.altKey && !e.ctrlKey);
+    if (outlineChord && (!e.altKey || MOD_KEY !== 'Cmd' || e.key.startsWith('Arrow'))) {
       if (e.key === 'ArrowUp' || e.key === 'ArrowDown') { handled(); move(e.key === 'ArrowUp' ? -1 : 1); return; }
       if (e.key === 'ArrowLeft') { handled(); changeLevel(promotedLevel); return; }
       if (e.key === 'ArrowRight') { handled(); changeLevel(demotedLevel); return; }
@@ -372,6 +379,6 @@ export function createOutlineView({ editor, readOnly, error, onState = () => {} 
     currentLevel: () => (focusedId ? levelAt(focusedId) : null),
     canMove: () => !!focusedId && editable(),
     levelNames: LEVEL_NAMES,
-    shortcutHint: `${MOD_KEY === 'Cmd' ? 'Option' : 'Alt'}+Shift`,
+    shortcutHint: MOD_KEY === 'Cmd' ? 'Ctrl+Shift' : 'Alt+Shift',
   };
 }

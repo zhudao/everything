@@ -71,6 +71,16 @@ export type ShapeEffectAny =
       readonly blurEmu: number;
       readonly distEmu: number;
       readonly angleDeg: number;
+      /** `rotWithShape="0"`: the offset stays fixed on the page when the
+       *  shape turns or flips. Omitted when the shadow turns with it. */
+      readonly fixedToPage?: true;
+      /** `sx`/`sy` (unit fractions, signed) and `kx`/`ky` (degrees), about
+       *  the `algn` point of the shape's box. Omitted at their defaults. */
+      readonly scaleX?: number;
+      readonly scaleY?: number;
+      readonly skewXDeg?: number;
+      readonly skewYDeg?: number;
+      readonly align?: string;
     }
   | {
       readonly kind: "innerShdw";
@@ -178,6 +188,98 @@ export const getShapeEffect = (shape: SlideShapeData): ShapeEffect | null => {
  * helper. `getShapeEffects` is what renderers want because effects
  * compose into a single filter (shadow + glow, etc.).
  */
+// The colour a preset shadow's second, lighter copy takes (measured).
+const lighterShadow = (hex: string): string => {
+  const m = /^#?([0-9a-f]{6})$/i.exec(hex);
+  if (!m) return hex;
+  const n = Number.parseInt(m[1]!, 16);
+  return `#${[16, 8, 0]
+    .map((shift) => {
+      const c = (n >> shift) & 255;
+      return Math.round(c + (255 - c) * 0.53)
+        .toString(16)
+        .padStart(2, "0");
+    })
+    .join("")
+    .toUpperCase()}`;
+};
+
+// The slant of a preset perspective shadow: its far edge leans by 0.866 of
+// the shape's height (the skew the desktop app's own perspective shadows
+// use, 2453606 sixty-thousandths of a degree).
+const PERSPECTIVE_SKEW = 2453606 / 60000;
+
+// A preset shadow (`<a:prstShdw prst="shdwN">`, ECMA-376 §20.1.8.49) as the
+// outer shadows that draw it, offset by its `dist`/`dir`, as the desktop app
+// draws each preset: plain drop shadows, perspective shadows laid back from
+// or forward of the bottom edge, a larger one behind the shape, and double
+// shadows whose second, lighter copy lies under the first (an earlier
+// shadow paints over a later one).
+const presetShadows = (
+  preset: string | null,
+  base: {
+    readonly color: string;
+    readonly opacity?: number;
+    readonly distEmu: number;
+    readonly angleDeg: number;
+  },
+): ShapeEffectAny[] => {
+  const shadow = (
+    extra: {
+      scaleX?: number;
+      scaleY?: number;
+      skewXDeg?: number;
+      align?: string;
+      distEmu?: number;
+      angleDeg?: number;
+      color?: string;
+    } = {},
+  ): ShapeEffectAny => ({
+    kind: "outerShdw",
+    blurEmu: 0,
+    // Laid out on the page, however the shape is turned.
+    fixedToPage: true,
+    ...base,
+    ...extra,
+  });
+  const light = lighterShadow(base.color);
+  switch (preset) {
+    case "shdw9":
+      // Drawn wholly behind the shape.
+      return [];
+    case "shdw10":
+      return [shadow({ scaleX: 1.25, scaleY: 1.25, align: "br" })];
+    case "shdw13":
+      return [shadow(), shadow({ distEmu: base.distEmu * 2, color: light })];
+    case "shdw17":
+    case "shdw18":
+      return [
+        shadow(),
+        shadow({ angleDeg: (base.angleDeg + 180) % 360, color: light }),
+      ];
+    case "shdw19":
+      return [shadow({ scaleY: 0.5, align: "b" })];
+    case "shdw20":
+      return [shadow({ scaleY: -1, align: "b" })];
+    case "shdw3":
+    case "shdw11":
+      return [shadow({ scaleY: 0.5, skewXDeg: PERSPECTIVE_SKEW, align: "b" })];
+    case "shdw4":
+    case "shdw12":
+      return [shadow({ scaleY: 0.5, skewXDeg: -PERSPECTIVE_SKEW, align: "b" })];
+    case "shdw7":
+    case "shdw15":
+      return [shadow({ scaleY: -0.5, skewXDeg: PERSPECTIVE_SKEW, align: "b" })];
+    case "shdw8":
+    case "shdw16":
+      return [
+        shadow({ scaleY: -0.5, skewXDeg: -PERSPECTIVE_SKEW, align: "b" }),
+      ];
+    default:
+      return [shadow()];
+  }
+};
+
 // Parses an `<a:effectLst>` element into the typed effect union.
 // Pulled out of `getShapeEffects` so the cascade-aware variant can
 // reuse it.
@@ -239,14 +341,56 @@ const parseEffectLst = (
         Number.parseInt(getAttrValue(child, qname("", "dir", "")) ?? "0", 10) ||
         0;
       const c = readEffectColor(child);
-      out.push({
-        kind: local,
+      const base = {
         color: c.color,
         blurEmu: blur,
         distEmu: dist,
         angleDeg: dir / 60000,
         ...(c.opacity !== undefined ? { opacity: c.opacity } : {}),
+      };
+      if (local === "innerShdw") {
+        out.push({ kind: local, ...base });
+        continue;
+      }
+      const intAttr = (name: string, fallback: number): number => {
+        const n = Number.parseInt(
+          getAttrValue(child, qname("", name, "")) ?? "",
+          10,
+        );
+        return Number.isFinite(n) ? n : fallback;
+      };
+      const rot = getAttrValue(child, qname("", "rotWithShape", ""));
+      const sx = intAttr("sx", 100000) / 100000,
+        sy = intAttr("sy", 100000) / 100000;
+      const kx = intAttr("kx", 0) / 60000,
+        ky = intAttr("ky", 0) / 60000;
+      const algn = getAttrValue(child, qname("", "algn", ""));
+      out.push({
+        kind: local,
+        ...base,
+        ...(rot === "0" || rot === "false"
+          ? { fixedToPage: true as const }
+          : {}),
+        ...(sx !== 1 ? { scaleX: sx } : {}),
+        ...(sy !== 1 ? { scaleY: sy } : {}),
+        ...(kx ? { skewXDeg: kx } : {}),
+        ...(ky ? { skewYDeg: ky } : {}),
+        ...(algn ? { align: algn } : {}),
       });
+    } else if (local === "prstShdw") {
+      const int = (name: string) =>
+        Number.parseInt(getAttrValue(child, qname("", name, "")) ?? "0", 10) ||
+        0;
+      const c = readEffectColor(child);
+      out.push(
+        ...presetShadows(getAttrValue(child, qname("", "prst", "")), {
+          // The schema's default colour is black.
+          color: c.color || "#000000",
+          ...(c.opacity !== undefined ? { opacity: c.opacity } : {}),
+          distEmu: int("dist"),
+          angleDeg: int("dir") / 60000,
+        }),
+      );
     } else if (local === "glow") {
       const rad =
         Number.parseInt(getAttrValue(child, qname("", "rad", "")) ?? "0", 10) ||

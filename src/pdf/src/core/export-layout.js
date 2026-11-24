@@ -19,10 +19,12 @@
  *     column?: { x0, x1 }, band?: { id, count, index, gap } }
  *   { type: 'table', x, y, w, h, columns: number[] (boundaries), ruled, rows: Row[] }
  *   { type: 'image', x, y, w, h, picture, wrap: 'inline' | 'square' | 'behind' }
- * Run = { text, font, size, bold, italic, underline, strike, color: 'RRGGBB', script?, tab? }
+ * Run = { text, font, size, bold, italic, underline, strike, color: 'RRGGBB', script?, tab?,
+ *         link? (a web address the run links to) }
  * Row = { y, h, header, cells: Cell[] } ; Cell = { col, span, rowSpan?, merged?, align,
  *         fill?, paragraphs: { runs: Run[], align }[] }
  */
+import { charWidth } from './compare.js';
 
 // PDF.js operator codes (pdfjs-dist 6.x; the test checks them against the installed build).
 export const OPS = {
@@ -498,8 +500,47 @@ function addPath(args, state, view, rules, fills, vectors) {
           stroke: state.stroke,
           outline: true,
         });
+      // Straight lines that run neither across nor down (a chart's data line, an arrow) are
+      // drawing.
+      if (
+        (box.w > 3 || box.h > 3) &&
+        pts.some(
+          (p, k) =>
+            k > 0 && Math.abs(p[0] - pts[k - 1][0]) >= 0.5 && Math.abs(p[1] - pts[k - 1][1]) >= 0.5,
+        )
+      )
+        vectors.push(box);
     } else if (stroked && path.curved && box.w > 3 && box.h > 3) vectors.push(box);
   }
+}
+
+/** The quarter turn (0, 90, 180 or 270) in which most of a page's text reads upright. */
+export function readingRotation(page, content) {
+  const own = page.rotate;
+  const upright = (rotation) => {
+    const { transform } = page.getViewport({ scale: 1, rotation });
+    let count = 0;
+    for (const item of content.items) {
+      if (typeof item.str !== 'string' || !item.str.trim() || !item.transform) continue;
+      const m = mul(transform, item.transform);
+      const scale = Math.hypot(m[0], m[1]);
+      if (Math.abs(m[1]) < 0.02 * scale && m[0] > 0 && m[3] < 0) count += item.str.trim().length;
+    }
+    return count;
+  };
+  const shown = upright(own);
+  let best = own,
+    most = shown;
+  for (const rotation of [0, 90, 180, 270]) {
+    if (rotation === own) continue;
+    const count = upright(rotation);
+    if (count > most) {
+      best = rotation;
+      most = count;
+    }
+  }
+  // Only when the page as shown has little upright text and another turn has much more.
+  return most >= 2 * shown + 20 ? best : own;
 }
 
 /**
@@ -507,9 +548,37 @@ function addPath(args, state, view, rules, fills, vectors) {
  * boxes and image placements (with their pictures).
  */
 export async function readPage(pdf, page, { images, signal, layers } = {}) {
-  const viewport = page.getViewport({ scale: 1 });
-  const view = viewport.transform;
   const content = await page.getTextContent();
+  signal?.throwIfAborted();
+  // A page turned so that its text runs sideways (a portrait page shown on its side) is read
+  // the way its text is written, as one would turn the paper to read it: line by line from
+  // the top, rather than across the lines.
+  const viewport = page.getViewport({ scale: 1, rotation: readingRotation(page, content) });
+  const view = viewport.transform;
+  // Web links stay links in the exported text; links within the PDF and scripts do not.
+  let links = [];
+  try {
+    links = (await page.getAnnotations({ intent: 'display' }))
+      .filter(
+        (a) =>
+          a.subtype === 'Link' &&
+          /^(?:https?|mailto|ftp|tel):/i.test(a.url ?? '') &&
+          a.rect?.length === 4,
+      )
+      .map((a) => {
+        const [x0, y0] = viewport.convertToViewportPoint(a.rect[0], a.rect[1]);
+        const [x1, y1] = viewport.convertToViewportPoint(a.rect[2], a.rect[3]);
+        return {
+          url: a.url,
+          x0: Math.min(x0, x1),
+          x1: Math.max(x0, x1),
+          top: Math.min(y0, y1),
+          bottom: Math.max(y0, y1),
+        };
+      });
+  } catch {
+    links = [];
+  }
   signal?.throwIfAborted();
   const list = await page.getOperatorList();
   signal?.throwIfAborted();
@@ -567,8 +636,9 @@ export async function readPage(pdf, page, { images, signal, layers } = {}) {
     }
     if (!item.str.trim() || run?.hidden) continue;
     const m = mul(view, item.transform);
-    const size = Math.hypot(m[2], m[3]),
-      scaleX = Math.hypot(m[0], m[1]);
+    // The size is the glyphs' height across the baseline, which a slant leaves unchanged.
+    const scaleX = Math.hypot(m[0], m[1]),
+      size = Math.abs(m[0] * m[3] - m[1] * m[2]) / scaleX;
     if (!(size > 0.5) || !(scaleX > 0)) continue;
     const font = fontFor(item.fontName);
     const ascent =
@@ -580,15 +650,18 @@ export async function readPage(pdf, page, { images, signal, layers } = {}) {
         ? Math.min(0.4, -font.style.descent)
         : 0.2;
     const width = item.width;
+    // A level baseline is upright text even when slanted: writers make an italic for a font
+    // that has none by leaning its glyphs forward (m[2] > 0 with y down) about 12 to 20 degrees.
     const upright =
-      Math.abs(m[1]) < 0.02 * scaleX && Math.abs(m[2]) < 0.02 * size && m[0] > 0 && m[3] < 0;
+      Math.abs(m[1]) < 0.02 * scaleX && Math.abs(m[2]) < 0.6 * -m[3] && m[0] > 0 && m[3] < 0;
+    const slanted = upright && m[2] > 0.1 * -m[3];
     const mode = run?.mode ?? 0;
     const span = {
       text: item.str,
       size,
       font: font.family,
       bold: font.bold || mode === 2 || mode === 6,
-      italic: font.italic,
+      italic: font.italic || slanted,
       symbolic: font.symbolic,
       color: (mode === 1 || mode === 5 ? run?.stroke : run?.fill) || '000000',
       invisible: mode === 3 || mode === 7,
@@ -621,7 +694,8 @@ export async function readPage(pdf, page, { images, signal, layers } = {}) {
       span.baseline = span.bottom;
       span.rotated = true;
     }
-    spans.push(splitWideSpaces(span));
+    for (const piece of links.length ? linkSpan(span, links) : [span])
+      spans.push(splitWideSpaces(piece));
   }
 
   // Pictures: resolve each painted image to file bytes once.
@@ -643,6 +717,7 @@ export async function readPage(pdf, page, { images, signal, layers } = {}) {
   }
   return {
     index: page._pageIndex ?? page.pageNumber - 1,
+    rotation: viewport.rotation,
     width: viewport.width,
     height: viewport.height,
     spans: spans.flat(),
@@ -654,9 +729,210 @@ export async function readPage(pdf, page, { images, signal, layers } = {}) {
 }
 
 /**
+ * Areas of a text page drawn with vector art (charts, diagrams, drawn logos) that an editable
+ * document can only keep as pictures. Each area takes the boxes and lines its drawing touches
+ * and the short labels set against it; an area holding lines of prose, or larger type than the
+ * page's labels (a banner behind a heading), is left as it was: its text stays editable.
+ * Returns [{ x, y, w, h, spans }] in page coordinates, `spans` being the text inside the area.
+ */
+export function figureRegions(scan) {
+  const { vectors = [], rules = [], fills = [], spans = [], width, height } = scan;
+  if (!vectors.length || !spans.length || spans.every((s) => s.invisible)) return [];
+  const pageArea = width * height;
+  const visible = spans.filter((s) => !s.invisible);
+  const sizes = visible.map((s) => s.size).sort((a, b) => a - b);
+  const bodySize = sizes[Math.floor(sizes.length / 2)] || 10;
+  // Shapes the size of the page are frames or backgrounds, not figures.
+  const seeds = vectors.filter((v) => v.w < width * 0.6 || v.h < height * 0.4);
+  const boxes = [
+    ...seeds.map((v) => ({ x0: v.x, y0: v.y, x1: v.x + v.w, y1: v.y + v.h, seed: true })),
+    ...fills
+      .filter((f) => f.w * f.h < pageArea * 0.25)
+      .map((f) => ({ x0: f.x, y0: f.y, x1: f.x + f.w, y1: f.y + f.h })),
+    ...rules.map((r) =>
+      r.horizontal
+        ? { x0: r.x0, x1: r.x1, y0: r.y - r.weight / 2, y1: r.y + r.weight / 2 }
+        : { x0: r.x - r.weight / 2, x1: r.x + r.weight / 2, y0: r.y0, y1: r.y1 },
+    ),
+  ];
+  if (boxes.length > 5000) return [];
+  // Join everything that touches, starting from the drawing's own shapes.
+  const near = (a, b, gap) =>
+    a.x0 - gap <= b.x1 && b.x0 - gap <= a.x1 && a.y0 - gap <= b.y1 && b.y0 - gap <= a.y1;
+  const used = new Array(boxes.length).fill(false);
+  const regions = [];
+  for (let i = 0; i < boxes.length; i++) {
+    if (used[i] || !boxes[i].seed) continue;
+    used[i] = true;
+    const region = { ...boxes[i] };
+    for (let grew = true; grew;) {
+      grew = false;
+      for (let k = 0; k < boxes.length; k++) {
+        if (used[k] || !near(region, boxes[k], 2)) continue;
+        used[k] = true;
+        grew = true;
+        region.x0 = Math.min(region.x0, boxes[k].x0);
+        region.y0 = Math.min(region.y0, boxes[k].y0);
+        region.x1 = Math.max(region.x1, boxes[k].x1);
+        region.y1 = Math.max(region.y1, boxes[k].y1);
+      }
+    }
+    regions.push(region);
+  }
+  const inside = (r, s) => {
+    const cx = (s.x0 + s.x1) / 2,
+      cy = (s.top + s.bottom) / 2;
+    return cx >= r.x0 && cx <= r.x1 && cy >= r.y0 && cy <= r.y1;
+  };
+  const candidates = [];
+  for (const region of regions) {
+    if (region.x1 - region.x0 < 36 || region.y1 - region.y0 < 36) continue;
+    // Labels just outside the drawing (axis values, legends) belong to it, unless they are
+    // part of a line or a paragraph of text that reaches beyond it.
+    const area = { ...region },
+      labels = new Set();
+    // A label set against another (a column of axis values) belongs too.
+    for (let pass = 0, grew = true; grew && pass < 4; pass++) {
+      grew = false;
+      for (const s of visible) {
+        if (labels.has(s) || inside(region, s) || s.text.trim().length > 24) continue;
+        const pad = Math.min(12, s.size * 1.25);
+        const box = { x0: s.x0, x1: s.x1, y0: s.top, y1: s.bottom };
+        if (!near(area, box, pad)) continue;
+        const prose = visible.some(
+          (o) =>
+            o !== s &&
+            !inside(region, o) &&
+            !near(region, { x0: o.x0, x1: o.x1, y0: o.top, y1: o.bottom }, pad) &&
+            (Math.abs(o.baseline - s.baseline) < s.size * 0.3 ||
+              (o.x0 < s.x1 &&
+                s.x0 < o.x1 &&
+                Math.min(Math.abs(o.top - s.bottom), Math.abs(s.top - o.bottom)) < s.size * 0.8)),
+        );
+        if (prose) continue;
+        labels.add(s);
+        grew = true;
+        area.x0 = Math.min(area.x0, s.x0);
+        area.x1 = Math.max(area.x1, s.x1);
+        area.y0 = Math.min(area.y0, s.top);
+        area.y1 = Math.max(area.y1, s.bottom);
+      }
+    }
+    // Labels that would take in other text with them are not the drawing's.
+    if (visible.some((s) => inside(area, s) && !inside(region, s) && !labels.has(s)))
+      Object.assign(area, region);
+    candidates.push(area);
+  }
+  // Drawings whose areas overlap make one picture, so that no part shows twice.
+  for (let merged = true; merged;) {
+    merged = false;
+    for (let i = 0; i < candidates.length; i++)
+      for (let k = candidates.length - 1; k > i; k--) {
+        const a = candidates[i],
+          b = candidates[k];
+        if (!near(a, b, -0.5)) continue;
+        a.x0 = Math.min(a.x0, b.x0);
+        a.y0 = Math.min(a.y0, b.y0);
+        a.x1 = Math.max(a.x1, b.x1);
+        a.y1 = Math.max(a.y1, b.y1);
+        candidates.splice(k, 1);
+        merged = true;
+      }
+  }
+  const out = [];
+  for (const area of candidates) {
+    if ((area.x1 - area.x0) * (area.y1 - area.y0) > pageArea * 0.6) continue;
+    const within = spans.filter((s) => inside(area, s));
+    const shown = within.filter((s) => !s.invisible);
+    const ink = shown.reduce((sum, s) => sum + (s.x1 - s.x0) * (s.bottom - s.top), 0);
+    const w = area.x1 - area.x0,
+      h = area.y1 - area.y0;
+    // Lines of prose make it a box of text, not a figure.
+    if (ink > w * h * 0.15 || shown.some((s) => s.text.trim().length > 40)) continue;
+    if (shown.some((s) => s.size > bodySize * 1.25 && s.size > 12)) continue;
+    out.push({ x: area.x0, y: area.y0, w, h, spans: within });
+  }
+  return out;
+}
+
+/**
  * Split a text item where it spaces columns apart with runs of three or more spaces, or where
  * leader dots run to a page number ("Overview ........ 4").
  */
+/**
+ * The web links over a span: the span whole when one covers it, else cut where a link begins
+ * and ends, at the word boundary nearest to the link's edge, so "Visit example.com today"
+ * links only "example.com". `links` are { url, x0, x1, top, bottom } in the page's view.
+ */
+function linkSpan(span, links) {
+  const middle = (span.top + span.bottom) / 2;
+  const over = links.filter(
+    (link) => middle >= link.top && middle <= link.bottom && link.x1 > span.x0 && link.x0 < span.x1,
+  );
+  if (!over.length) return [span];
+  if (span.rotated) return [{ ...span, link: over[0].url }];
+  const { text } = span,
+    width = span.x1 - span.x0;
+  // Where each character ends along the span, by typical letter widths (an "i" is narrower
+  // than an "m"), so a link's edges land on the right letters.
+  const ends = [0];
+  for (let k = 0; k < text.length; k++) ends.push(ends[k] + charWidth(text.charCodeAt(k)));
+  const scale = width / (ends[text.length] || 1);
+  // A character belongs to the link when the link covers most of it: links reach a little
+  // past their words, over the bracket or the stop beside them. The place found is then moved
+  // to the nearest word boundary.
+  const boundary = (x, end) => {
+    const along = (x - span.x0) / scale;
+    let at = 0;
+    if (end)
+      while (at < text.length && ends[at + 1] - 0.25 * (ends[at + 1] - ends[at]) <= along) at++;
+    else while (at < text.length && ends[at] + 0.25 * (ends[at + 1] - ends[at]) < along) at++;
+    // Between words, or between a word and the brackets, quotes or punctuation around it.
+    const edge = (k) =>
+      k <= 0 ||
+      k >= text.length ||
+      /[\s([{<"'“‘]/.test(text[k - 1]) ||
+      /[\s)\]}>"'”’,;:!?]/.test(text[k]);
+    let best = at;
+    for (let d = 0; d <= 3; d++) {
+      if (edge(at - d)) {
+        best = at - d;
+        break;
+      }
+      if (edge(at + d)) {
+        best = at + d;
+        break;
+      }
+    }
+    return Math.max(0, Math.min(text.length, best));
+  };
+  const cuts = [];
+  for (const link of [...over].sort((a, b) => a.x0 - b.x0)) {
+    const from = Math.max(boundary(link.x0, false), cuts.at(-1)?.to ?? 0),
+      to = boundary(link.x1, true);
+    if (to > from) cuts.push({ from, to, url: link.url });
+  }
+  const pieces = [];
+  const piece = (from, to, link) => {
+    if (to > from)
+      pieces.push({
+        ...span,
+        text: text.slice(from, to),
+        x0: span.x0 + ends[from] * scale,
+        x1: span.x0 + ends[to] * scale,
+        ...(link && { link }),
+      });
+  };
+  let at = 0;
+  for (const cut of cuts) {
+    piece(at, cut.from);
+    piece(cut.from, cut.to, cut.url);
+    at = cut.to;
+  }
+  piece(at, text.length);
+  return pieces.length ? pieces : [span];
+}
+
 function splitWideSpaces(span) {
   if (span.rotated || !/\S\s{3,}\S|(?:\.\s?){4,}|…{2,}|_{4,}/.test(span.text)) return [span];
   const parts = [];
@@ -875,6 +1151,7 @@ function finishChunk(chunk) {
       strike: span.strike,
       color: span.color,
       script,
+      link: span.link || null,
     };
     const last = runs.at(-1);
     if (last && sameStyle(last, style)) last.text += piece;
@@ -915,7 +1192,34 @@ const sameStyle = (a, b) =>
   a.underline === b.underline &&
   a.strike === b.strike &&
   a.color === b.color &&
-  a.script === b.script;
+  a.script === b.script &&
+  (a.link || null) === (b.link || null);
+
+/**
+ * Runs gathered into the stretches a writer makes links of: { link, runs } in order, `link`
+ * null between links. Spaces at a link's ends, as a line break leaves after one, stay outside it.
+ */
+export function linkStretches(runs) {
+  const out = [];
+  for (const run of runs) {
+    const link = run.tab ? null : run.link || null;
+    let pieces = [run];
+    // Spaces at either end of a linked run stay outside the link.
+    const [, lead, body, trail] = /^(\s*)([\s\S]*?)(\s*)$/.exec(run.text || '');
+    if (link && body && (lead || trail))
+      pieces = [
+        lead && { ...run, text: lead, link: null },
+        { ...run, text: body },
+        trail && { ...run, text: trail, link: null },
+      ].filter(Boolean);
+    for (const piece of pieces) {
+      const own = piece.tab ? null : piece.link || null;
+      if (out.at(-1)?.link === own) out.at(-1).runs.push(piece);
+      else out.push({ link: own, runs: [piece] });
+    }
+  }
+  return out;
+}
 
 /** Thin horizontal rules hugging a span's baseline are underlines (or strike-throughs). */
 function markDecorations(spans, rules) {
@@ -2057,6 +2361,7 @@ function layoutPage(scan, context) {
   const contentBottom = elements.length ? Math.max(...elements.map((e) => e.bottom)) : height - 72;
   return {
     index: scan.index,
+    rotation: scan.rotation,
     width,
     height,
     margins: {

@@ -1,9 +1,12 @@
-import { safeName } from '../core/document.js';
+import { safeName } from '../core/file-limits.js';
 export const FOLDER = 'PDF Editor';
 const sdk = () => {
-  if (!globalThis.puter)
-    throw new Error('Puter is unavailable. You can still open and download PDFs on this device.');
-  return globalThis.puter;
+  if (globalThis.puter) return globalThis.puter;
+  // The SDK script is async, and the page has its load event once it has arrived or failed.
+  // Before then it is on its way (a slow connection), not unavailable.
+  if (globalThis.document && globalThis.document.readyState !== 'complete')
+    throw new Error('Puter is still loading. Try again in a moment.');
+  throw new Error('Puter is unavailable. You can still open and download PDFs on this device.');
 };
 /** In a Puter desktop window, which always has a session and owns the window chrome. */
 export const isApp = () => globalThis.puter?.env === 'app';
@@ -68,6 +71,12 @@ const LOST_CONNECTION =
 export const isConnectionFailure = (error) =>
   error?.code === 'connection-failed' ||
   LOST_CONNECTION.test(String(error?.message || error?.error?.message || '').trim());
+/** Whether an SDK error means the drive is full: a new file would be refused as well. */
+export const isStorageFull = (error) =>
+  [error?.code, error?.error?.code].includes('storage_limit_reached') ||
+  /storage (capacity|limit|quota)|quota exceeded/i.test(
+    String(error?.message || error?.error?.message || ''),
+  );
 /** Rethrow a lost connection as a message saying what could not be done, and what to do. */
 const overConnection =
   (done, subject = 'The PDF') =>

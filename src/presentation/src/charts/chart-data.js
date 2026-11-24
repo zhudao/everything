@@ -169,7 +169,7 @@ export const CHART_TYPES = [
     family: "pie",
     label: "Doughnut",
     apply: (spec) => ({
-      ...single({ ...spec, kind: "doughnut" }, true),
+      ...single({ ...spec, kind: "doughnut" }),
       holeSizePct: spec.holeSizePct ?? 50,
     }),
   },
@@ -401,17 +401,17 @@ function withKinds(spec, choices) {
     }),
   };
 }
-const single = (spec, keepAll = false) => {
+// A pie plots its first series and a doughnut rings them all. A pie keeps
+// the others, unplotted, so a change back plots them again.
+const single = (spec) => {
   const cat = toCategories(spec);
   const stripped = stripFor(cat, spec.kind);
-  const series = cat.series.map((s) =>
-    withoutLineOnlyFields(stripSeries(s, spec.kind)),
-  );
   return {
     ...stripped,
     kind: spec.kind,
-    // A pie shows one series; a doughnut may ring several.
-    series: keepAll ? series : series.slice(0, 1),
+    series: cat.series.map((s) =>
+      withoutLineOnlyFields(stripSeries(s, spec.kind)),
+    ),
   };
 };
 
@@ -758,13 +758,19 @@ export function specToGrid(spec) {
 }
 // A cell's number: blank is a gap; anything that isn't a number is too.
 export function parseNumber(text) {
-  const t = String(text ?? "")
-    .trim()
+  let t = String(text ?? "").trim();
+  // Amounts copied from a spreadsheet keep their currency sign, and an
+  // accounting format shows negatives in brackets: ($1,200.00).
+  const bracketed = /^\((.*)\)$/.exec(t);
+  if (bracketed) t = bracketed[1].trim();
+  t = t
+    .replace(/^([-+]?)\s*\p{Sc}\s*/u, "$1")
+    .replace(/\s*\p{Sc}$/u, "")
     .replace(/[\s,](?=\d{3}\b)/g, "")
     .replace(/%$/, "");
-  if (t === "") return null;
+  if (t === "" || (bracketed && /^[-+]/.test(t))) return null;
   const n = Number(t);
-  return Number.isFinite(n) ? n : null;
+  return Number.isFinite(n) ? (bracketed ? -n : n) : null;
 }
 // The chart definition with the grid's data. Series keep their formatting
 // by position; new series take the automatic colours.
@@ -780,7 +786,7 @@ export function gridToSpec(grid, spec) {
     );
     const series = [];
     for (let c = 0; c < count; c++) {
-      const prior = spec.series[c] || {};
+      const prior = spec.series[c] || plotOf(spec.series.at(-1));
       series.push({
         ...prior,
         name: names[c] || `Series ${c + 1}`,
@@ -797,8 +803,6 @@ export function gridToSpec(grid, spec) {
             .slice(0, 1)
             .map((s) => ({ ...s, values: categories.map(() => null) })),
     };
-    // A pie shows its first series only.
-    if (spec.kind === "pie") out.series = out.series.slice(0, 1);
     if (
       out.categoryNumberFormat !== undefined &&
       !categories.every((c) => c.trim() === "" || Number.isFinite(Number(c)))
@@ -1055,13 +1059,21 @@ export function deleteColumn(grid, at) {
 // the definition returned with the grid lines the other series' formatting
 // up with their columns again, as gridToSpec pairs them by position.
 const seriesStep = (spec) => (gridLayout(spec) === "bubble" ? 2 : 1);
+// A series added to a combination chart is plotted as the series beside it
+// is (its kind and axis). The file keeps each kind's series together, so a
+// column series typed in after the line series would read back before it,
+// and the data sheet's columns would swap under the typing.
+const plotOf = (series) => ({
+  ...(series?.chartKind ? { chartKind: series.chartKind } : {}),
+  ...(series?.secondaryAxis ? { secondaryAxis: true } : {}),
+});
 export function insertSeriesColumn(grid, spec, at) {
   const step = seriesStep(spec);
   const index = Math.floor((Math.max(1, at) - 1) / step);
   let out = grid;
   for (let k = 0; k < step; k++) out = insertColumn(out, 1 + index * step);
   const series = [...spec.series];
-  if (index < series.length) series.splice(index, 0, {});
+  if (index < series.length) series.splice(index, 0, plotOf(series[index]));
   return { grid: out, spec: { ...spec, series } };
 }
 export function deleteSeriesColumn(grid, spec, at) {

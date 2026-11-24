@@ -10,16 +10,17 @@ import { revisionView } from '../engine/revisions.js';
 /**
  * What Read Aloud says of each paragraph that has words: [{ start, end, text, at }], where `start` and `end` are the
  * paragraph's document positions and `at[i]` is the position of `text[i]`. Text tracked as deleted is left out, as the
- * page strikes it out (in the Original view, the inserted text is, as the page hides it).
+ * page strikes it out (in the Original view, the inserted text is, as the page hides it), and so is hidden text
+ * (w:vanish) while the page does not show it.
  */
-export function speakableParagraphs(paragraphs, view = revisionView.mode) {
+export function speakableParagraphs(paragraphs, view = revisionView.mode, showHidden = revisionView.showHidden) {
   const skip = view === 'original' ? 'ins' : 'del', out = [];
   let position = 0;
   for (const p of paragraphs) {
     const start = position, at = [], spoken = [];
     let text = '';
     for (const run of p.runs) {
-      if (run.revision?.type !== skip && run.text) {
+      if (run.revision?.type !== skip && run.text && !(run.vanish && !showHidden)) {
         text += run.text.replace(/\ufffc/g, ' ');
         for (let i = 0; i < run.text.length; i++) at.push(position + i);
         spoken.push(run);
@@ -155,6 +156,9 @@ export function createReadAloud({ editor, onState = () => {} }) {
       engine.syncInput?.(); engine.paint(); engine.revealCaret?.();
     };
     said.onend = () => { if (said.cancelled || utterance !== said) return; next(); };
+    // A paragraph the voice cannot say (too long for it, a language it lacks) ends with an error and no end: reading
+    // stopped there with the player still showing Pause. It goes on with the next paragraph.
+    said.onerror = e => { if (said.cancelled || utterance !== said || ['interrupted', 'canceled'].includes(e?.error)) return; next(); };
     synth.speak(said);
   }
   /** The paragraphs as they are now, and which of them `current` is (or the first after where it was). */

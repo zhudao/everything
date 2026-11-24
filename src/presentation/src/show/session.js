@@ -23,6 +23,7 @@ import { createRehearsal } from "./rehearse.js";
 import { createRecordingStudio } from "./recorder.js";
 
 const CTRL = IS_MAC ? "Control" : "Ctrl";
+const ALT = IS_MAC ? "Option" : "Alt";
 const IDLE_CURSOR_MS = 3000;
 const ZOOM_STEPS = [1, 2, 3, 4];
 
@@ -37,6 +38,7 @@ export const SHOW_SHORTCUTS = [
   ["Black screen, or back", "B or ."],
   ["White screen, or back", "W or ,"],
   ["Pause or resume automatic advance", "S"],
+  ["Next or previous media bookmark", `${ALT}+End, ${ALT}+Home`],
   ["Laser pointer", `L or ${CTRL}+L`],
   ["Pen", `${CTRL}+P`],
   ["Highlighter", `${CTRL}+I`],
@@ -125,6 +127,43 @@ export function createShowSession(ctx, show) {
   }
   listen(stage, "pointermove", wake);
   wake();
+
+  // ---- Keeping the screen on ----------------------------------------------
+  // A slide can stay up for minutes with nothing moving, so the show asks
+  // the device not to dim or lock its screen, and asks again whenever the
+  // page comes back into view (the browser lets the lock go when it hides).
+  let wakeLock = null;
+  let askingWake = false;
+  let awake = true;
+  async function keepAwake() {
+    const doc = stage.ownerDocument;
+    if (!awake || wakeLock || askingWake || doc.visibilityState !== "visible")
+      return;
+    const wake = doc.defaultView?.navigator?.wakeLock;
+    if (!wake?.request) return;
+    askingWake = true;
+    try {
+      const lock = await wake.request("screen");
+      if (!awake) lock.release().catch(() => {});
+      else {
+        wakeLock = lock;
+        lock.addEventListener?.("release", () => {
+          if (wakeLock === lock) wakeLock = null;
+        });
+      }
+    } catch {
+      // Refused (a battery saver, a policy): the show goes on without it.
+    } finally {
+      askingWake = false;
+    }
+  }
+  listen(stage.ownerDocument, "visibilitychange", keepAwake);
+  keepAwake();
+  cleanups.push(() => {
+    awake = false;
+    wakeLock?.release().catch(() => {});
+    wakeLock = null;
+  });
 
   // ---- Cameras on slides --------------------------------------------------
   const cameras = createCameraSource();
@@ -750,6 +789,7 @@ export function createShowSession(ctx, show) {
       bar.remove();
     });
     syncTimer();
+    let nextTurn = 0;
     function update() {
       const n = show.current();
       const ended = show.isEnded();
@@ -760,23 +800,36 @@ export function createShowSession(ctx, show) {
         ? null
         : n + 1 < all.length
           ? all[n + 1]
-          : setup.loop
+          : show.loop
             ? all[0]
             : null;
-      if (coming) {
+      // The next click builds this slide further: its picture as that step
+      // leaves it, worked out once the step playing now has settled.
+      const steps = ended ? 0 : (show.animationSteps?.() ?? 0);
+      const building = step < steps;
+      const turn = ++nextTurn;
+      const comingLabel = coming
+        ? `Slide ${all.indexOf(coming) + 1}${show.title(coming) ? `: ${show.title(coming)}` : ""}`
+        : "";
+      if (building) {
+        nextImage.hidden = false;
+        Promise.resolve(show.animationPlayed?.()).then(() => {
+          if (turn !== nextTurn) return;
+          const src = show.nextStepPicture?.();
+          if (src) nextImage.src = src;
+        });
+      } else if (coming) {
         nextImage.src = show.picture(coming);
         nextImage.hidden = false;
-        const at = all.indexOf(coming);
-        nextLabel.textContent = `Slide ${at + 1}${show.title(coming) ? `: ${show.title(coming)}` : ""}`;
+        nextLabel.textContent = comingLabel;
       } else {
         nextImage.removeAttribute("src");
         nextImage.hidden = true;
         nextLabel.textContent = "End of slide show";
       }
       // The last slide's builds come before the end, too.
-      const steps = ended ? 0 : (show.animationSteps?.() ?? 0);
-      if (step < steps)
-        nextLabel.textContent = `Next click: animation ${step + 1} of ${steps} on this slide, then ${coming ? nextLabel.textContent : "the end of the slide show"}`;
+      if (building)
+        nextLabel.textContent = `Next click: animation ${step + 1} of ${steps} on this slide, then ${coming ? comingLabel : "the end of the slide show"}`;
       const notes = ended ? "" : P.getSlideNotes(all[n]) || "";
       notesText.textContent = notes || "No notes for this slide.";
       notesText.classList.toggle("empty", !notes);
@@ -797,8 +850,17 @@ export function createShowSession(ctx, show) {
       dispose: () => disposers.forEach((f) => f()),
     };
   }
+  // Its label says what a press does, also once the audience's window has
+  // been closed from that window.
+  let audienceButton = null;
+  function syncAudienceButton() {
+    if (audienceButton)
+      audienceButton.firstChild.textContent = audience
+        ? "One window"
+        : "Audience window";
+  }
   function audienceToggle() {
-    const b = el(
+    audienceButton = el(
       "button",
       {
         type: "button",
@@ -818,14 +880,12 @@ export function createShowSession(ctx, show) {
                 "The browser blocked the audience window. Allow pop-ups for this site to use a second screen.",
               );
           }
-          b.firstChild.textContent = audience
-            ? "One window"
-            : "Audience window";
         },
       },
-      el("span", {}, options.audience ? "One window" : "Audience window"),
+      el("span", {}),
     );
-    return b;
+    syncAudienceButton();
+    return audienceButton;
   }
 
   // The slide moves to the audience's window; the presenter keeps a copy.
@@ -854,9 +914,11 @@ export function createShowSession(ctx, show) {
     win.addEventListener("resize", fit);
     const onKey = (e) => {
       if (handleKey(e)) return;
+      // As in the presenter's window, Escape first puts the laser away.
       if (e.key === "Escape") {
         e.preventDefault();
-        show.close();
+        if (show.laserEnabled()) toggleLaser();
+        else show.close();
         return;
       }
       const copy = new KeyboardEvent("keydown", {
@@ -888,6 +950,7 @@ export function createShowSession(ctx, show) {
     };
     requestAnimationFrame(fit);
     setTimeout(fit, 100);
+    syncAudienceButton();
   }
   function detachAudience({ closing = false } = {}) {
     if (!audience) return;
@@ -899,6 +962,7 @@ export function createShowSession(ctx, show) {
     stage.prepend(slideArea);
     subtitles.moveTo(stage);
     if (!closing) current.dispose();
+    syncAudienceButton();
     applyZoom();
     show.fit();
     requestAnimationFrame(() => show.fit());
@@ -1024,14 +1088,19 @@ export function createShowSession(ctx, show) {
       const bar = el("div", { class: "show-media-bar" }, play, seek, time);
       const fmt = (s) =>
         `${Math.floor((s || 0) / 60)}:${String(Math.floor((s || 0) % 60)).padStart(2, "0")}`;
+      // A trimmed video's bar spans only what is left of it.
+      const start = () => Number(node.dataset.start) || 0;
+      const length = () =>
+        (Number(node.dataset.end) || video.duration) - start();
       const sync = () => {
         play.replaceChildren(lineIcon(video.paused ? "Play" : "Pause", 14));
         play.setAttribute("aria-label", video.paused ? "Play" : "Pause");
-        if (Number.isFinite(video.duration) && video.duration > 0)
+        const at = Math.max(0, video.currentTime - start());
+        if (Number.isFinite(length()) && length() > 0)
           seek.value = String(
-            Math.round((video.currentTime / video.duration) * 1000),
+            Math.min(1000, Math.round((at / length()) * 1000)),
           );
-        time.textContent = fmt(video.currentTime);
+        time.textContent = fmt(at);
       };
       for (const type of ["play", "pause", "timeupdate", "loadedmetadata"])
         video.addEventListener(type, sync);
@@ -1042,8 +1111,8 @@ export function createShowSession(ctx, show) {
       });
       seek.addEventListener("input", (e) => {
         e.stopPropagation();
-        if (Number.isFinite(video.duration))
-          video.currentTime = (Number(seek.value) / 1000) * video.duration;
+        if (Number.isFinite(length()) && length() > 0)
+          video.currentTime = start() + (Number(seek.value) / 1000) * length();
       });
       bar.addEventListener("click", (e) => e.stopPropagation());
       bar.addEventListener("keydown", (e) => e.stopPropagation());
@@ -1066,6 +1135,9 @@ export function createShowSession(ctx, show) {
     };
     for (const type of ["pointermove", "pointerdown", "keydown"])
       listen(stage, type, restart);
+    // As a click, a swipe does not move a kiosk on: only its links,
+    // action buttons and timings do.
+    listen(stage, "touchend", (e) => e.stopPropagation(), true);
     restart();
     kioskActivity = restart;
     cleanups.push(() => clearTimeout(idle));
@@ -1237,6 +1309,7 @@ export function createShowSession(ctx, show) {
         size,
         source: cameras,
         bounds: (shape) => ctx.slideBounds(pres, shape),
+        onFailure: (message) => status(`Live camera: ${message}`),
       });
       setTimeout(addMediaControls, 80);
       kioskActivity();
@@ -1259,6 +1332,9 @@ export function createShowSession(ctx, show) {
     stepped(by) {
       const steps = show.animationSteps?.() ?? 0;
       step = Math.max(0, Math.min(steps, step + by));
+      if (by === 0) step = 0;
+      rehearsal?.stepped(by, step, show.animationPlayed?.());
+      studio?.stepped?.(by, step, show.animationPlayed?.());
       consoleView?.update();
       // The presenter's copy follows the audience's slide once it settles.
       if (mirror)

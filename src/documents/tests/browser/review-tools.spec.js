@@ -200,6 +200,31 @@ test('Check Accessibility finds problems and applies quick fixes', async ({ page
   expect(errors).toEqual([]);
 });
 
+test('a shape without alternative text gets its description in the Alt Text pane from the Accessibility pane', async ({ page }, info) => {
+  const errors = []; page.on('pageerror', e => errors.push(e.message));
+  await page.setViewportSize({ width: 1440, height: 900 });
+  const input = await newDocument(page, 'A page with a shape.');
+  await onTab(page, 'insert');
+  await page.locator('#ribbon-panel-insert').getByRole('button', { name: 'Shapes', exact: true }).click();
+  await page.getByRole('menuitem', { name: 'Oval', exact: true }).press('Enter');
+  await expect(page.locator('#ribbon-tab-shapeFormat')).toBeVisible();
+  await input.focus(); await select(input, 0);
+  await onTab(page, 'review');
+  await (await reviewButton(page, 'Check Accessibility', 'Accessibility')).click();
+  const pane = page.getByRole('complementary', { name: 'Accessibility pane' });
+  const issue = pane.locator('.rv-issue', { hasText: 'Oval' });
+  // A drawing kept whole has its description written into it by the Alt Text pane, so the fix opens that pane on it.
+  await issue.getByRole('button', { name: 'Add description…' }).click();
+  const description = page.getByRole('complementary', { name: 'Alt Text pane' }).getByRole('textbox', { name: 'Description' });
+  await expect(description).toBeFocused();
+  await page.keyboard.type('A blue oval');
+  await page.keyboard.press('ControlOrMeta+Enter');
+  await expect(pane).not.toContainText('Missing alternative text');
+  const { parts } = await exported(page, info, 'shape-alt-text.docx');
+  expect(strFromU8(parts['word/document.xml'])).toMatch(/<wp:docPr [^>]*descr="A blue oval"/);
+  expect(errors).toEqual([]);
+});
+
 test('an accessibility quick fix applies where its issue is now after an edit before it', async ({ page }) => {
   const errors = []; page.on('pageerror', e => errors.push(e.message));
   const input = await newDocument(page, 'Hello    world and text');
@@ -283,7 +308,7 @@ test('tracked formatting shows in the Reviewing Pane and balloons, and rejecting
   await expect(page.locator('.ed-revision-card')).toContainText('Formatted: Bold');
   await page.screenshot({ path: info.outputPath('tracked-formatting.png') });
   const { parts } = await exported(page, info, 'tracked-formatting.docx');
-  expect(strFromU8(parts['word/document.xml'])).toMatch(/<w:rPrChange w:id="\d+" w:author="[^"]*" w:date="[^"]+"><w:rPr\/><\/w:rPrChange>/);
+  expect(strFromU8(parts['word/document.xml'])).toMatch(/<w:rPrChange w:id="\d+" w:author="[^"]*" w:date="[^"]+" w16du:dateUtc="[^"]+Z"><w:rPr\/><\/w:rPrChange>/);
   await select(input, 7);
   await page.locator('#ribbon-panel-review [aria-label="Reject"]').evaluate(button => button.click());
   await expect(pane).not.toContainText('Formatted');
@@ -699,6 +724,25 @@ test('in the app, Translate Document opens a translated copy', async ({ page }) 
   page.on('dialog', d => d.accept());
   await pane.getByRole('button', { name: 'Translate document…' }).click();
   await expect(input).toHaveValue('[Translated] Hello world.\n[Translated] Second line.', { timeout: 20000 });
+  expect(errors).toEqual([]);
+});
+
+// An answer holding an object's placeholder character (U+FFFC) put a stray, object-less character in the translated
+// document; Translate on a selection already took it out.
+test('Translate Document leaves out a stray object character in the translation', async ({ page }) => {
+  const errors = []; page.on('pageerror', e => errors.push(e.message));
+  await page.goto('/mock.html#/new');
+  const input = page.getByRole('textbox', { name: 'Document text' });
+  await expect(page.getByRole('button', { name: 'Bold', exact: true })).toBeEnabled();
+  await input.fill('Hello world.\nSecond line.');
+  await page.evaluate(() => { puter.ai.chat = async prompt => JSON.stringify(Array.from({ length: (String(prompt).match(/\[\d+\]/g) || []).length }, (_, i) => i ? 'Segunda línea.' : 'Hola \ufffcmundo.')); });
+  await onTab(page, 'review');
+  await page.evaluate(() => document.querySelector('#ribbon-panel-review [aria-label="Translate"][aria-haspopup="menu"]')?.click());
+  await page.getByRole('menuitem', { name: 'Translate Document' }).click();
+  const pane = page.getByRole('complementary', { name: 'Translator pane' });
+  page.on('dialog', d => d.accept());
+  await pane.getByRole('button', { name: 'Translate document…' }).click();
+  await expect(input).toHaveValue('Hola mundo.\nSegunda línea.', { timeout: 20000 });
   expect(errors).toEqual([]);
 });
 

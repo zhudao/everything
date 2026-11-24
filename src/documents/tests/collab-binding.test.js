@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import * as Y from 'yjs';
 import { TextDocument, paragraph } from '../src/engine/model.js';
 import { StorySession } from '../src/engine/story-session.js';
@@ -100,6 +100,105 @@ describe('co-editing binding', () => {
     expect(ann.engine.model.text.slice(8, 11)).toBe('def');
   });
 
+  // Typed inside a tracked insertion while someone accepted it, text carried the insertion's mark back after itself
+  // over the rest of the document; Reject All would then have removed it. Rejecting at that moment did the same.
+  for (const accept of [true, false]) it(`keeps a tracked change ${accept ? 'accepted' : 'rejected'} while someone types inside it off the text after it`, async () => {
+    const { hub, people: [ann, bob] } = await room('Alpha beta gamma delta');
+    ann.engine.execute(m => { m.trackChanges = true; m.revisionAuthor = 'Ann'; m.select(5); m.replace(' INSERTED'); m.trackChanges = false; });
+    await settle();
+    ann.binding.undoManager.stopCapturing();
+    hub.pause();
+    ann.engine.execute(m => m.resolveRevisions(accept));
+    bob.engine.execute(m => { m.select(8); m.replace('xx'); });
+    await settle(); hub.resume(); await settle(); await settle();
+    // Rejected, the insertion's text goes and Bob's stays (where the shared text's diff puts the space beside it).
+    const expected = accept ? 'Alpha INxxSERTED beta gamma delta' : 'Alpha xxbeta gamma delta';
+    for (const person of [ann, bob]) {
+      expect(person.engine.model.text).toBe(expected);
+      expect(person.engine.session.body.revisions).toEqual([]);
+    }
+    // Ann's Undo brings her change back as it was.
+    ann.engine.undo();
+    await settle();
+    for (const person of [ann, bob]) expect(person.engine.session.body.revisions.map(r => [r.type, r.author])).toEqual([['ins', 'Ann']]);
+  });
+
+  // The clock stands still, so every change is made in the same second: new tracked text has the very author, kind
+  // and time of the change accepted before it, which is all a tracked change records. It is still not a spill.
+  describe('with every change in the same second', () => {
+    beforeEach(() => { vi.useFakeTimers({ toFake: ['Date'] }); vi.setSystemTime(new Date('2026-11-22T12:00:00Z')); });
+    afterEach(() => vi.useRealTimers());
+    const tracked = (person, at, text) => person.engine.execute(m => { m.trackChanges = true; m.revisionAuthor = 'Bob'; m.select(typeof at === 'function' ? at(m) : at); m.replace(text); m.trackChanges = false; });
+    const changes = person => person.engine.session.body.revisions.map(r => [r.type, r.author, person.engine.model.text.slice(r.start, r.end)]);
+
+    it('keeps tracked text typed after an Accept All has arrived', async () => {
+      const { people: [ann, bob] } = await room('Alpha beta.\nSecond paragraph.');
+      tracked(bob, 5, ' NEW');
+      await settle();
+      ann.engine.execute(m => m.resolveRevisions(true));
+      await settle();
+      expect(changes(bob)).toEqual([]);
+      // Right after the accepted text, and elsewhere.
+      tracked(bob, 9, ' more');
+      tracked(bob, m => m.text.length, ' end');
+      await settle(); await settle();
+      for (const person of [ann, bob]) expect(changes(person)).toEqual([['ins', 'Bob', ' more'], ['ins', 'Bob', ' end']]);
+    });
+
+    it('keeps tracked text typed in another paragraph at the moment of an Accept All', async () => {
+      const { hub, people: [ann, bob] } = await room('Alpha beta.\nSecond paragraph.');
+      tracked(bob, 5, ' NEW');
+      await settle();
+      hub.pause();
+      ann.engine.execute(m => m.resolveRevisions(true));
+      tracked(bob, m => m.text.length, ' end');
+      await settle(); hub.resume(); await settle(); await settle();
+      for (const person of [ann, bob]) expect(changes(person)).toEqual([['ins', 'Bob', ' end']]);
+    });
+
+    it('keeps a new paragraph typed inside the accepted text at that moment tracked, and nothing after it', async () => {
+      const { hub, people: [ann, bob] } = await room('Alpha beta.\nSecond paragraph.');
+      tracked(bob, 5, ' NEW');
+      await settle();
+      hub.pause();
+      ann.engine.execute(m => m.resolveRevisions(true));
+      tracked(bob, 7, 'xx\nyy');
+      await settle(); hub.resume(); await settle(); await settle();
+      for (const person of [ann, bob]) {
+        expect(person.engine.model.text).toBe('Alpha Nxx\nyyEW beta.\nSecond paragraph.');
+        // "xx", typed into Bob's own insertion with its mark, is part of what Ann accepted; the new paragraph is not.
+        // Without the repair, "EW beta." and the paragraph after it came back marked too.
+        expect(changes(person)).toEqual([['ins', 'Bob', '\nyy']]);
+      }
+    });
+  });
+
+  it('shares Track Changes turned on for everyone, but keeps tracking just mine to this person', async () => {
+    const { people: [ann, bob] } = await room('Alpha beta');
+    // For everyone (Review > Track Changes sets it in an unrecorded transaction): it reaches Bob before Ann edits.
+    ann.engine.session.run(() => { ann.engine.session.body.trackChanges = true; }, undefined, { record: false });
+    await settle();
+    expect(bob.engine.session.body.trackChanges).toBe(true);
+    bob.engine.execute(m => { m.select(0); m.replace('B'); });
+    await settle();
+    expect(ann.engine.session.body.trackChanges).toBe(true);
+    expect(bob.engine.session.body.revisions.map(r => r.type)).toEqual(['ins']);
+    // Just mine: Ann's edits no longer turned tracking on for everyone, and Bob turning it off for everyone no longer
+    // turned off what Ann tracks for herself.
+    bob.engine.session.run(() => { bob.engine.session.body.trackChanges = false; }, undefined, { record: false });
+    await settle();
+    expect(ann.engine.session.body.trackChanges).toBe(false);
+    Object.assign(ann.engine.session.body, { trackChangesMode: 'mine', trackChanges: true });
+    ann.engine.execute(m => { m.select(m.text.length); m.replace(' A'); });
+    await settle();
+    expect(bob.engine.session.body.trackChanges).toBe(false);
+    expect(bob.engine.model.text).toBe('BAlpha beta A');
+    bob.engine.execute(m => { m.select(0); m.replace('C'); });
+    await settle();
+    expect(ann.engine.session.body.trackChanges).toBe(true);
+    expect(ann.engine.session.body.revisions.map(r => [r.type, ann.engine.model.text.slice(r.start, r.end)])).toEqual([['ins', 'B'], ['ins', ' A']]);
+  });
+
   it('keeps viewers from changing the document', async () => {
     const { people: [, viewer] } = await room('Read me', ['owner', 'viewer']);
     expect(viewer.engine.viewOnly).toBe(true);
@@ -137,6 +236,57 @@ describe('co-editing binding', () => {
     // Once the session ends, numbering starts from the lowest free id again.
     ann.binding.destroy();
     expect(ann.engine.session.body.commentIdFloor).toBeUndefined();
+  });
+
+  // A thread deleted while someone else resolved or edited it came back for everyone (the edit wrote the comment
+  // again) with no anchor: missing beside the text, but listed and saved without a reference.
+  it.each(['edits', 'resolves'])('a thread deleted while someone %s it goes for everyone, with no unanchored comment left', async action => {
+    const { hub, people: [ann, bob] } = await room('Alpha beta gamma delta');
+    let id;
+    ann.engine.execute(m => { m.select(6, 10); id = m.addComment({ author: 'Ann', text: 'Check beta' }); m.select(17, 22); m.addComment({ author: 'Ann', text: 'Keep' }); });
+    await settle();
+    hub.pause();
+    ann.engine.execute(m => m.deleteComment(id));
+    bob.engine.execute(m => (action === 'edits' ? m.editComment(id, 'Edited') : m.setCommentDone(id, true)));
+    await settle();
+    hub.resume();
+    await settle();
+    for (const person of [ann, bob]) {
+      expect(person.engine.session.body.commentList.map(c => [c.text, c.start])).toEqual([['Keep', 17]]);
+    }
+    expect([...hub.doc.getMap('comments').keys()].filter(key => key !== '$part')).toHaveLength(1);
+  });
+
+  it('a reply written while its thread is deleted goes with the thread', async () => {
+    const { hub, people: [ann, bob] } = await room('Alpha beta gamma delta');
+    let id;
+    ann.engine.execute(m => { m.select(6, 10); id = m.addComment({ author: 'Ann', text: 'Check beta' }); m.select(17, 22); m.addComment({ author: 'Ann', text: 'Keep' }); });
+    await settle();
+    hub.pause();
+    ann.engine.execute(m => m.deleteComment(id));
+    bob.engine.execute(m => m.replyToComment(id, { author: 'Bob', text: 'Agreed' }));
+    await settle();
+    hub.resume();
+    await settle();
+    for (const person of [ann, bob]) expect(person.engine.session.body.commentList.map(c => c.text)).toEqual(['Keep']);
+    expect([...hub.doc.getMap('comments').keys()].filter(key => key !== '$part')).toHaveLength(1);
+  });
+
+  it('drops a comment added on words someone else deleted at the same moment, and keeps an unanchored one it had', async () => {
+    const { hub, people: [ann, bob] } = await room('Alpha beta gamma delta');
+    // A comment without an anchor from the file (as some files have) stays.
+    ann.engine.execute(m => { m.comments = [{ id: '5', author: 'Old', initials: 'O', date: '', text: 'From the file', done: false, parentId: null, paraId: null }]; });
+    await settle();
+    hub.pause();
+    ann.engine.execute(m => { m.select(6, 10); m.addComment({ author: 'Ann', text: 'On beta' }); });
+    bob.engine.execute(m => { m.select(4, 12); m.replace(''); });
+    await settle();
+    hub.resume();
+    await settle();
+    for (const person of [ann, bob]) {
+      expect(person.engine.model.text).toBe('Alphamma delta');
+      expect(person.engine.session.body.comments.map(c => c.text)).toEqual(['From the file']);
+    }
   });
 
   it('refuses text changes from a commenter on the server side', () => {

@@ -212,6 +212,55 @@ test("a kiosk's timed loop plays through before an idle restart", async ({
   await expect(counter(page)).toHaveText("1 / 4");
 });
 
+test("the show opens with the first slide's transition, from black", async ({
+  page,
+}) => {
+  await load(
+    page,
+    deck([
+      { effect: "fade", durationMs: 500, advanceAfterMs: 300 },
+      { effect: "none" },
+    ]),
+  );
+  await expect(transition(page, "fade")).toHaveCount(1);
+  await holdTransition(page);
+  // The first slide's time starts once its transition has played.
+  await page.clock.runFor(2000);
+  await expect(counter(page)).toHaveText("1 / 2");
+  await releaseTransition(page);
+  await expect(anyTransition(page)).toHaveCount(0);
+  await page.clock.runFor(299);
+  await expect(counter(page)).toHaveText("1 / 2");
+  await page.clock.runFor(1);
+  await expect(counter(page)).toHaveText("2 / 2");
+});
+
+test("a kiosk is not moved on by a swipe", async ({ page }) => {
+  const pres = deck([{ effect: "none" }, { effect: "none" }]);
+  P.setSlideShowSetup(pres, { showType: "kiosk" });
+  await load(page, pres);
+  await expect(counter(page)).toHaveText("1 / 2");
+  await page.evaluate(() => {
+    const target = document.querySelector(".presenter-slide");
+    const finger = (clientX) =>
+      new Touch({ identifier: 1, target, clientX, clientY: 150 });
+    const send = (type, touches, changedTouches) =>
+      target.dispatchEvent(
+        new TouchEvent(type, {
+          bubbles: true,
+          touches,
+          targetTouches: touches,
+          changedTouches,
+        }),
+      );
+    send("touchstart", [finger(250)], [finger(250)]);
+    send("touchmove", [finger(120)], [finger(120)]);
+    send("touchend", [], [finger(120)]);
+  });
+  await page.clock.runFor(500);
+  await expect(counter(page)).toHaveText("1 / 2");
+});
+
 test("the advance clock waits for the actual incoming transition to finish", async ({
   page,
 }) => {
@@ -432,7 +481,7 @@ test("timers and slide-number jumps move past click-sequence media", async ({
 });
 
 // A second of silence, looping, set to start with its slide.
-function addLoopingSound(slide) {
+function addLoopingSound(slide, options = {}) {
   const wav = new Uint8Array(44 + 8000);
   const view = new DataView(wav.buffer);
   const tag = (at, s) =>
@@ -454,7 +503,7 @@ function addLoopingSound(slide) {
     slide,
     { kind: "audio", data: wav, contentType: "audio/wav" },
     { x: 914400, y: 914400, w: 914400, h: 914400 },
-    { start: "automatically", loop: true },
+    { start: "automatically", loop: true, ...options },
   );
 }
 // Every media element asked to play, kept after it leaves the page; the
@@ -500,6 +549,185 @@ test("media that starts by itself stays silent once the show has left its slide"
   await expect(page.locator("dialog.presenter")).toHaveCount(0);
   await page.clock.runFor(200);
   expect(await sounding()).toBe(0);
+});
+
+test("a sound playing across slides carries on when a loop comes back to its slide", async ({
+  page,
+}) => {
+  const pres = deck(
+    [{ effect: "none" }, { effect: "none" }, { effect: "none" }],
+    'loop="1"',
+  );
+  addLoopingSound(P.getSlides(pres)[0], { playAcrossSlides: true });
+  const sounding = await trackMedia(page);
+  await load(page, pres);
+  await page.clock.runFor(200);
+  await expect.poll(sounding).toBe(1);
+  for (let pass = 0; pass < 2; pass++) {
+    for (const at of ["2 / 3", "3 / 3", "1 / 3"]) {
+      await page.keyboard.press("ArrowRight");
+      await expect(counter(page)).toHaveText(at);
+      await page.clock.runFor(200);
+    }
+    // Still the one sound, not a second copy beside it.
+    expect(await sounding()).toBe(1);
+  }
+  await page.keyboard.press("Escape");
+  await expect(page.locator("dialog.presenter")).toHaveCount(0);
+  expect(await sounding()).toBe(0);
+});
+
+test("a slide set to stop the previous sound stops a sound playing across slides", async ({
+  page,
+}) => {
+  const pres = deck([
+    { effect: "none" },
+    { effect: "none" },
+    { effect: "none", sound: { kind: "stop" } },
+  ]);
+  addLoopingSound(P.getSlides(pres)[0], { playAcrossSlides: true });
+  const sounding = await trackMedia(page);
+  await load(page, pres);
+  await page.clock.runFor(200);
+  await expect.poll(sounding).toBe(1);
+  await page.keyboard.press("ArrowRight");
+  await expect(counter(page)).toHaveText("2 / 3");
+  await page.clock.runFor(200);
+  expect(await sounding()).toBe(1);
+  await page.keyboard.press("ArrowRight");
+  await expect(counter(page)).toHaveText("3 / 3");
+  await page.clock.runFor(200);
+  expect(await sounding()).toBe(0);
+});
+
+test("a sound set to play across some slides stops after them", async ({
+  page,
+}) => {
+  const pres = deck([
+    { effect: "none" },
+    { effect: "none" },
+    { effect: "none" },
+    { effect: "none" },
+  ]);
+  addLoopingSound(P.getSlides(pres)[0], { playAcrossSlides: true });
+  // As a file written elsewhere says it: across two slides.
+  const part = pres[INTERNAL_PACKAGE].getPart(
+    partName("/ppt/slides/slide1.xml"),
+  );
+  const xml = new TextDecoder().decode(part.data);
+  expect(xml).toContain('numSld="999"');
+  part.data = new TextEncoder().encode(
+    xml.replace('numSld="999"', 'numSld="2"'),
+  );
+  const sounding = await trackMedia(page);
+  await load(page, pres);
+  await page.clock.runFor(200);
+  await expect.poll(sounding).toBe(1);
+  await page.keyboard.press("ArrowRight");
+  await expect(counter(page)).toHaveText("2 / 4");
+  await page.clock.runFor(200);
+  expect(await sounding()).toBe(1);
+  await page.keyboard.press("ArrowRight");
+  await expect(counter(page)).toHaveText("3 / 4");
+  await page.clock.runFor(200);
+  expect(await sounding()).toBe(0);
+});
+
+test("a looping show plays a slide's media from one copy of its bytes", async ({
+  page,
+}) => {
+  const pres = deck([{ effect: "none" }, { effect: "none" }], 'loop="1"');
+  addLoopingSound(P.getSlides(pres)[0]);
+  // The media addresses the page holds, and the bytes behind them.
+  await page.addInitScript(() => {
+    const create = URL.createObjectURL;
+    const revoke = URL.revokeObjectURL;
+    window.held = new Map();
+    URL.createObjectURL = (blob) => {
+      const url = create(blob);
+      if (/^(audio|video)\//.test(blob.type)) window.held.set(url, blob.size);
+      return url;
+    };
+    URL.revokeObjectURL = (url) => {
+      window.held.delete(url);
+      revoke(url);
+    };
+  });
+  await load(page, pres);
+  for (let pass = 0; pass < 6; pass++) {
+    await page.keyboard.press("ArrowRight");
+    await expect(counter(page)).toHaveText("2 / 2");
+    await page.keyboard.press("ArrowRight");
+    await expect(counter(page)).toHaveText("1 / 2");
+  }
+  expect(await page.evaluate(() => window.held.size)).toBe(1);
+  await page.keyboard.press("Escape");
+  await expect(page.locator("dialog.presenter")).toHaveCount(0);
+  expect(await page.evaluate(() => window.held.size)).toBe(0);
+});
+
+test("the last slide's sound stops at the end screen", async ({ page }) => {
+  const pres = deck([{ effect: "none" }, { effect: "none" }]);
+  addLoopingSound(P.getSlides(pres)[1]);
+  const sounding = await trackMedia(page);
+  await load(page, pres);
+  await page.keyboard.press("ArrowRight");
+  await expect(counter(page)).toHaveText("2 / 2");
+  await page.clock.runFor(200);
+  await expect.poll(sounding).toBe(1);
+  await page.keyboard.press("ArrowRight");
+  await expect(page.locator(".presenter-end")).toBeVisible();
+  await page.clock.runFor(200);
+  expect(await sounding()).toBe(0);
+  // Going back plays it again.
+  await page.keyboard.press("ArrowLeft");
+  await expect(counter(page)).toHaveText("2 / 2");
+  await page.clock.runFor(200);
+  await expect.poll(sounding).toBe(1);
+});
+
+test("a sound that was never played leaves with its slide", async ({
+  page,
+}) => {
+  const pres = deck([{ effect: "none" }, { effect: "none" }], 'loop="1"');
+  addLoopingSound(P.getSlides(pres)[0], { start: "whenClicked" });
+  await load(page, pres);
+  const sounds = page.locator(".presenter-frame audio");
+  await expect(sounds).toHaveCount(1);
+  for (let pass = 0; pass < 4; pass++) {
+    await page.keyboard.press("ArrowRight");
+    await expect(counter(page)).toHaveText("2 / 2");
+    await page.keyboard.press("ArrowRight");
+    await expect(counter(page)).toHaveText("1 / 2");
+  }
+  await expect(sounds).toHaveCount(1);
+});
+
+test("Alt+End and Alt+Home move a sound between its bookmarks", async ({
+  page,
+}) => {
+  const pres = deck([{ effect: "none" }]);
+  addLoopingSound(P.getSlides(pres)[0], {
+    start: "whenClicked",
+    bookmarks: [
+      { name: "One", time: 300 },
+      { name: "Two", time: 700 },
+    ],
+  });
+  await load(page, pres);
+  const sound = page.locator(".presenter-frame audio");
+  const at = () => sound.evaluate((a) => a.currentTime);
+  // The first press starts the sound at its first bookmark.
+  await page.keyboard.press("Alt+End");
+  await expect.poll(at).toBeGreaterThanOrEqual(0.3);
+  await sound.evaluate((a) => a.pause());
+  await page.keyboard.press("Alt+End");
+  await expect.poll(at).toBeCloseTo(0.7, 2);
+  await page.keyboard.press("Alt+Home");
+  await expect.poll(at).toBeCloseTo(0.3, 2);
+  // Neither moves the show.
+  await expect(counter(page)).toHaveText("1 / 1");
+  await expect(page.locator(".presenter-end")).toBeHidden();
 });
 
 test("a zoom still growing when the show ends opens nothing", async ({
