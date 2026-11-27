@@ -218,11 +218,6 @@
   display: none;
 }
 
-.app.screen-full {
-  grid-template-rows: 0 0 minmax(0, 1fr);
-  padding: 0;
-}
-
 .screen-full .topbar,
 .screen-full .control-bar,
 .screen-full .toolbar,
@@ -230,12 +225,9 @@
 .screen-full .doc-tabs,
 .screen-full .statusbar,
 .screen-full .isolation-bar,
-.screen-full .pattern-bar {
+.screen-full .pattern-bar,
+.screen-full .float-panels {
   display: none !important;
-}
-
-.screen-full .workspace {
-  grid-template-columns: 0 minmax(0, 1fr) 0;
 }
 
 /* ---- Proofing: the canvas gets the filter in script; paint previews here. ---- */
@@ -344,5 +336,144 @@ dialog.presentation::backdrop {
 
   .canvas-host.arrange-tile {
     grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* ---- Tools panel and panel dock positions (Window > Tools Position, Panels on Left) ---- */
+@media (min-width: 761px) {
+  .app:is(.tools-right, .panels-left, .tools-float) .toolbar {
+    grid-area: tools;
+    width: var(--toolbar-w);
+  }
+
+  .app:is(.tools-right, .panels-left, .tools-float) .doc-area {
+    grid-area: doc;
+  }
+
+  .app:is(.tools-right, .panels-left, .tools-float) .panels-area {
+    grid-area: panels;
+  }
+
+  .app.tools-right .workspace {
+    grid-template-columns: minmax(0, 1fr) auto auto;
+    grid-template-areas: 'doc tools panels';
+  }
+
+  .app.panels-left .workspace {
+    grid-template-columns: auto auto minmax(0, 1fr);
+    grid-template-areas: 'panels tools doc';
+  }
+
+  .app.panels-left.tools-right .workspace {
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    grid-template-areas: 'panels doc tools';
+  }
+
+  .app.tools-float .workspace {
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas: 'doc panels';
+  }
+
+  .app.tools-float.panels-left .workspace {
+    grid-template-columns: auto minmax(0, 1fr);
+    grid-template-areas: 'panels doc';
+  }
+
+  .app.tools-right .toolbar {
+    border-right: 0;
+    border-left: 1px solid var(--border);
+  }
+
+  .app.panels-left:not(.tools-right) .toolbar {
+    border-left: 0;
+  }
+
+  /* A floating Tools panel: over the canvas, as tall as its tools (at most the workspace). */
+  .app.tools-float .toolbar {
+    position: absolute;
+    grid-area: auto;
+    z-index: 45;
+    max-height: calc(100% - 8px);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow-float);
+  }
+
+  .app.tools-float .toolbar-scroll {
+    flex: 0 1 auto;
+  }
+}
+
+/* Where the Tools panel would dock while its grip is dragged. */
+.tools-dock-zone {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  z-index: 46;
+  width: 6px;
+  background: var(--accent);
+  opacity: 0.8;
+  pointer-events: none;
+}
+
+.tools-dragging,
+.tools-dragging * {
+  cursor: grabbing !important;
+}
+
+/* ---- Full Screen Mode layout ----
+   With the bars, the Tools
+   panel and the panels gone, the document area alone fills the screen. The
+   hidden parts leave no grid tracks, so the area must not be placed in a
+   track sized for one of them (it would be zero high or zero wide). */
+.app.screen-full {
+  grid-template-rows: minmax(0, 1fr);
+  padding: 0;
+}
+
+/* Important: it overrides every Tools and panel arrangement (those rules are more specific). */
+.app.screen-full .workspace {
+  grid-template-columns: minmax(0, 1fr) !important;
+  grid-template-rows: minmax(0, 1fr) !important;
+  grid-template-areas: none !important;
+}
+
+.app.screen-full .doc-area {
+  grid-area: auto !important;
+}
+
+/* Leaves Full Screen Mode (touch screens have no Esc or F key). */
+.screen-exit {
+  position: fixed;
+  top: calc(env(safe-area-inset-top) + 10px);
+  right: calc(env(safe-area-inset-right) + 10px);
+  z-index: 70;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  background: var(--bg-elev);
+  color: var(--text);
+  box-shadow: var(--shadow-float);
+  opacity: 0.75;
+}
+
+.screen-exit:hover,
+.screen-exit:focus-visible {
+  opacity: 1;
+}
+
+.screen-exit[hidden] {
+  display: none;
+}
+
+@media (pointer: coarse) {
+  .screen-exit {
+    width: 48px;
+    height: 48px;
   }
 }
