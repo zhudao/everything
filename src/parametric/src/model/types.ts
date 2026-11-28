@@ -5,6 +5,8 @@
 
 import type { Vec2, Vec3, Frame } from '../math/vec';
 import type { BaseFlangeFeature, EdgeFlangeFeature, HemFeature, SketchedBendFeature } from './sheetmetal';
+import type { CamDoc } from './cam';
+import type { StaticStudy } from './fea';
 
 export type Id = string;
 
@@ -598,6 +600,14 @@ export interface MaterialRef {
   name: string;
   /** kg/m^3 */
   density: number;
+  /**
+   * Elastic properties for stress analysis (all four, or none): elastic modulus,
+   * yield and ultimate tensile strength in MPa, and Poisson's ratio.
+   */
+  E?: number;
+  nu?: number;
+  yield?: number;
+  uts?: number;
 }
 
 export interface PartDocument {
@@ -617,6 +627,10 @@ export interface PartDocument {
   blobs: Record<Id, string>;
   /** 2D drawing of the part (sheet with projected views), if created. */
   drawing?: DrawingDoc | null;
+  /** Machining: tools, setups and operations (see model/cam.ts), if any. */
+  cam?: CamDoc | null;
+  /** Static stress analysis: fixtures, loads and mesh setting (see model/fea.ts), if any. */
+  study?: StaticStudy | null;
   nextId: number;
   created: number;
   modified: number;
